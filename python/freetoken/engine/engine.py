@@ -820,7 +820,11 @@ class Engine:
             cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
         else:
             reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
-            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
+            # the draft head's bank layer is resolved over the model's layers alone, so enabling
+            # the head cannot shift which of them decode on the CPU
+            cpu_layer_ids = _resolve_cpu_layers(
+                config, num_moe_layers - config.model_config.num_mtp_moe_layers, reserved=reserved, method=method
+            )
             _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
             requested_residency = None
