@@ -16,7 +16,10 @@ experts into a GPU slot cache. Rules every kernel here follows:
 
 from __future__ import annotations
 
+import functools
+import inspect
 import math
+from typing import Any
 
 import torch
 
@@ -92,6 +95,32 @@ class TritonNvfp4MoEKernel(MoEKernel):
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1)
+def _fused_marlin_moe_entry() -> tuple[Any, bool, Any]:
+    """vLLM's fused Marlin MoE entry point across its module moves and signature drift.
+
+    Returns ``(fn, takes_gating_output, activation_enum)``: the function, whether it
+    still accepts the removed ``gating_output`` keyword, and the ``MoEActivation``
+    enum newer releases expect instead of the activation name string.
+    """
+    try:
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+    except ImportError:
+        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
+    params = inspect.signature(fused_marlin_moe).parameters
+    try:
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    except ImportError:
+        MoEActivation = None
+    return fused_marlin_moe, "gating_output" in params, MoEActivation
+
+
+def _marlin_alpha_dtype() -> torch.dtype:
+    """Global-scale dtype the donor's Marlin MoE kernel checks for: bf16 up to the
+    ``gating_output`` era, float32 since the kernel moved to the stable-libtorch build."""
+    return torch.bfloat16 if _fused_marlin_moe_entry()[1] else torch.float32
+
+
 def _marlin_symbols_ok() -> bool:
     """Probe the exact vLLM symbols the pack/forward paths below use.
 
@@ -101,9 +130,8 @@ def _marlin_symbols_ok() -> bool:
     """
     try:
         from vllm import _custom_ops  # noqa: F401
-        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (  # noqa: F401
-            fused_marlin_moe,
-        )
+
+        _fused_marlin_moe_entry()
         from vllm.model_executor.layers.quantization.utils.marlin_utils import (  # noqa: F401
             marlin_permute_scales,
         )
@@ -169,7 +197,10 @@ def _marlin_pack_proj(
     if isinstance(s, tuple):  # newer vLLM returns (scales, scale_factor)
         s, factor = s
         g_max = g_max / factor
-    g_out = nvfp4_marlin_process_global_scale(g_max.to(torch.bfloat16).reshape(1))
+    if _marlin_alpha_dtype() is torch.bfloat16:
+        g_out = nvfp4_marlin_process_global_scale(g_max.to(torch.bfloat16).reshape(1))
+    else:
+        g_out = nvfp4_marlin_process_global_scale(g_max.reshape(1).to(torch.float32), torch.bfloat16)
     return qweight, s, g_out
 
 
@@ -197,10 +228,13 @@ def marlin_fused_experts(
     vLLM's implementation is device-side only (no host syncs), so the decode call is
     CUDA-graph capturable.
     """
-    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
     from vllm.scalar_type import scalar_types
 
     assert activation == "silu", "Marlin NVFP4 backend supports gated silu only"
+    fused_marlin_moe, takes_gating_output, moe_activation = _fused_marlin_moe_entry()
+    kwargs: dict[str, Any] = {}
+    if takes_gating_output:
+        kwargs["gating_output"] = None
     return fused_marlin_moe(
         hidden_states,
         gate_up_q,
@@ -209,15 +243,15 @@ def marlin_fused_experts(
         None,  # bias2
         gate_up_s,
         down_s,
-        gating_output=None,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_type_id=scalar_types.float4_e2m1f.id,
         apply_router_weight_on_input=apply_router_weight_on_input,
         global_num_experts=gate_up_q.size(0),
-        activation=activation,
+        activation=moe_activation(activation) if moe_activation is not None else activation,
         global_scale1=gate_up_alpha,
         global_scale2=down_alpha,
+        **kwargs,
     )
 
 
@@ -247,8 +281,8 @@ class MarlinNvfp4MoEKernel(MoEKernel):
             "gate_up_scale": BankSpec((h // GROUP, 2 * i), FP8),
             "down": BankSpec((i // GROUP, 2 * h), torch.int32),
             "down_scale": BankSpec((i // GROUP, h), FP8),
-            "gate_up_alpha": BankSpec((), torch.bfloat16, resident=True),
-            "down_alpha": BankSpec((), torch.bfloat16, resident=True),
+            "gate_up_alpha": BankSpec((), _marlin_alpha_dtype(), resident=True),
+            "down_alpha": BankSpec((), _marlin_alpha_dtype(), resident=True),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
@@ -257,8 +291,8 @@ class MarlinNvfp4MoEKernel(MoEKernel):
         gu, gus, gug = fused_piece(pieces, "gate_up"), fused_piece(pieces, "gate_up_scale"), fused_global(pieces, i)
         dn, dns, dng = pieces["down"], pieces["down_scale"], global_rows(pieces["down_global"], h)
         e = gu.shape[0]
-        gate_up_alpha = torch.empty(e, dtype=torch.bfloat16, device=device)
-        down_alpha = torch.empty(e, dtype=torch.bfloat16, device=device)
+        gate_up_alpha = torch.empty(e, dtype=_marlin_alpha_dtype(), device=device)
+        down_alpha = torch.empty(e, dtype=_marlin_alpha_dtype(), device=device)
         for k in range(e):
             qw, sc, al = _marlin_pack_proj(gu[k].to(device), gus[k].to(device), gug[k].to(device), size_k=h, size_n=2 * i)
             out["gate_up"][k].copy_(qw)
