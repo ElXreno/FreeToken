@@ -9,6 +9,7 @@ the matched snapshot straight into that request's live slot.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import mmap
@@ -22,7 +23,24 @@ import torch
 FORMAT_VERSION = 1
 ALIGN = 4096
 STAGE_ROWS = 1024
+WRITEBACK_BYTES = 64 << 20
+SYNC_FILE_RANGE_WRITE = 2
 _BITS_DTYPE = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
+
+
+def _load_sync_file_range():
+    if os.environ.get("FREETOKEN_ARENA_WRITEBACK", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).sync_file_range
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_sync_file_range = _load_sync_file_range()
 META_NAME = "meta.json"
 ARENA_NAME = "arena.bin"
 
@@ -53,6 +71,7 @@ class HostArena:
             for e in self.free_extents:
                 e[1] = min(e[1], self.capacity - e[0])
         self.used = self.capacity - sum(size for _, size in self.free_extents)
+        self._dirty_lo, self._dirty_hi, self._dirty_bytes = self.capacity, 0, 0
 
     def alloc(self, nbytes: int) -> HostRef | None:
         need = _round_up(max(nbytes, 1), ALIGN)
@@ -99,9 +118,27 @@ class HostArena:
         assert n <= ref.nbytes, f"host read {n} > extent {ref.nbytes}"
         dst.copy_(self.view(ref)[:n].view(dst.dtype).view(dst.shape))
 
+    def writeback(self, offset: int, nbytes: int) -> None:
+        """Start asynchronous writeback of a just-written range (no wait, no cache drop).
+
+        Without it every commit's pages stay dirty until memory pressure forces kswapd to
+        write them back while the decode threads are running."""
+        if _sync_file_range is None:
+            return
+        self._dirty_lo = min(self._dirty_lo, offset)
+        self._dirty_hi = max(self._dirty_hi, offset + nbytes)
+        self._dirty_bytes += nbytes
+        if self._dirty_bytes < WRITEBACK_BYTES:
+            return
+        lo = self._dirty_lo - self._dirty_lo % ALIGN
+        _sync_file_range(self.fd, ctypes.c_int64(lo),
+                         ctypes.c_int64(self._dirty_hi - lo), SYNC_FILE_RANGE_WRITE)
+        self._dirty_lo, self._dirty_hi, self._dirty_bytes = self.capacity, 0, 0
+
     def flush(self) -> None:
         self.mm.flush()
         os.fsync(self.fd)
+        self._dirty_lo, self._dirty_hi, self._dirty_bytes = self.capacity, 0, 0
 
     def close(self) -> None:
         self.mm.close()
@@ -191,6 +228,7 @@ class HostTier:
             rows = self._rows[:m]
             rows.copy_(self._gather[:, :, :m].permute(2, 0, 1, 3, 4))
             self.arena.write(piece, rows)
+        self.arena.writeback(ref.offset, ref.nbytes)
         self.dirty = True
         return ref
 
@@ -221,6 +259,7 @@ class HostTier:
             return None
         for seg in self.snap_segments:
             self.arena.write(HostRef(ref.offset + seg.offset, seg.nbytes), seg.tensor[:, slot])
+        self.arena.writeback(ref.offset, ref.nbytes)
         self.dirty = True
         return ref
 
