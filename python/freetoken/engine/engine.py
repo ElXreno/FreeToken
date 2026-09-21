@@ -506,6 +506,9 @@ class Engine:
         self._mtp_pending = 0
         self._mtp_timed = False
         self._last_rows_forwarded = 0
+        self._verify_draft_cpu = torch.zeros(
+            max(config.max_running_req, 1), dtype=torch.int32, pin_memory=True
+        )
         self._mtp_begin = torch.cuda.Event(enable_timing=True)
         self._mtp_end = torch.cuda.Event(enable_timing=True)
         if self.mtp_head is not None:
@@ -558,6 +561,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            capture_verify=config.mtp_verify and config.model_config.mtp_draft,
         )
         if self.mtp_head is not None:
             self._capture_mtp_graphs(config.max_running_req)
@@ -1130,6 +1134,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            capture_verify=config.mtp_verify and config.model_config.mtp_draft,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
@@ -1158,7 +1163,10 @@ class Engine:
         copy_done_event.record(self.stream)
         if self.mtp_head is not None and batch.is_decode and not batch.verify:
             self._stage_mtp_draft(batch, next_tokens_gpu, batch.padded_size if use_graph else batch.size)
-        self._last_rows_forwarded = batch.padded_size if use_graph else batch_logits.shape[0]
+        # rows, not requests: the hidden buffer is keyed by row count and a verify step has two
+        self._last_rows_forwarded = (batch.padded_size if use_graph else batch.size) * (
+            2 if batch.verify else 1
+        )
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def flush_pending_draft(self) -> None:
@@ -1166,17 +1174,25 @@ class Engine:
         if self._mtp_pending:
             self._flush_mtp_draft()
 
-    def pending_drafts(self, slots: list[int]) -> list[int] | None:
-        """Each slot's drafted token, or None where the head has not drafted for it yet.
+    def place_drafts(self, token_pool, slots: list[int], flat_positions: list[int]) -> None:
+        """Put each request's pending draft into the token pool, device side.
 
-        Reads device state, so it belongs to a step that already serialized on the host.
+        The forward reads its rows from the pool, so the draft never has to reach the host;
+        doing that cost two queue-draining syncs per step. The value the accept test needs
+        rides a pinned copy that the step's existing drain already waits on.
         """
         if self.mtp_head is None:
-            return None
+            return
+        n = len(slots)
         idx = torch.tensor(slots, dtype=torch.int64, device=self.device)
-        pred, live = self.mtp_head.drafts(idx)
-        pred_cpu, live_cpu = pred.tolist(), live.tolist()
-        return [int(p) if ok else None for p, ok in zip(pred_cpu, live_cpu)]
+        pred = self.mtp_head.drafts(idx)[0].to(token_pool.dtype)
+        dst = torch.tensor(flat_positions, dtype=torch.int64, device=self.device)
+        token_pool.view(-1).index_copy_(0, dst, pred)
+        self._verify_draft_cpu[:n].copy_(pred, non_blocking=True)
+
+    def drafted_tokens(self, n: int) -> list[int]:
+        """The drafts placed this step; valid once the step's copy_done event has fired."""
+        return self._verify_draft_cpu[:n].tolist()
 
     def stage_verify_draft(self, batch: Batch, next_tokens_gpu: torch.Tensor, pick: list[int]) -> None:
         """Draft from the last row a verify step committed, once the host knows which that is."""

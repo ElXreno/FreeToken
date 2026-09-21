@@ -31,49 +31,66 @@ class GraphCaptureBuffer:
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
 
+    # slots the verify step's second token writes its recurrent state to; None on decode buffers
+    verify_out: torch.Tensor | None = None
+    rows_per_req: int = 1
+
     @classmethod
     def init(
-        cls, bs: int, vocab_size: int, device: torch.device, mrope: bool = False
+        cls, bs: int, vocab_size: int, device: torch.device, mrope: bool = False,
+        rows_per_req: int = 1,
     ) -> GraphCaptureBuffer:
+        rows = bs * rows_per_req
         return GraphCaptureBuffer(
-            input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-            positions=torch.zeros(bs, dtype=torch.int32, device=device),
+            input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
+            positions=torch.zeros(rows, dtype=torch.int32, device=device),
             mrope_positions=(
-                torch.zeros(3, bs, dtype=torch.int32, device=device) if mrope else None
+                torch.zeros(3, rows, dtype=torch.int32, device=device) if mrope else None
             ),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
+            logits=torch.empty(rows, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            verify_out=(
+                torch.zeros(bs, dtype=torch.int32, device=device) if rows_per_req > 1 else None
+            ),
+            rows_per_req=rows_per_req,
         )
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
 
-        _slice = slice(batch.padded_size)
         bs = batch.padded_size
-        batch.input_ids = self.input_ids[_slice]
-        batch.out_loc = self.out_loc[_slice]
-        batch.positions = self.positions[_slice]
+        _slice = slice(bs)
+        _rows = slice(bs * self.rows_per_req)
+        batch.input_ids = self.input_ids[_rows]
+        batch.out_loc = self.out_loc[_rows]
+        batch.positions = self.positions[_rows]
         if self.mrope_positions is not None:
-            batch.mrope_positions = self.mrope_positions[:, _slice]
+            batch.mrope_positions = self.mrope_positions[:, _rows]
         batch.linear_table_idx = self.table_idx[_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
+            cu_seqlens=self.fla_cu_seqlens[: bs + 1],
+            cache_indices=self.table_idx[_slice],
+            verify_out_indices=None if self.verify_out is None else self.verify_out[_slice],
         )
 
     def copy_from(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        self.input_ids[_slice] = batch.input_ids
+        bs = batch.padded_size
+        _slice = slice(bs)
+        _rows = slice(bs * self.rows_per_req)
+        self.input_ids[_rows] = batch.input_ids
         if batch.out_loc is not None:
-            self.out_loc[_slice] = batch.out_loc
-        self.positions[_slice] = batch.positions
+            self.out_loc[_rows] = batch.out_loc
+        self.positions[_rows] = batch.positions
         if self.mrope_positions is not None:
-            self.mrope_positions[:, _slice] = batch.mrope_positions
+            self.mrope_positions[:, _rows] = batch.mrope_positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
+        if self.verify_out is not None and batch.fla_metadata is not None:
+            self.verify_out[_slice] = batch.fla_metadata.verify_out_indices
 
 
 def _determine_cuda_graph_bs(
@@ -117,6 +134,7 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
+        capture_verify: bool = False,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -131,6 +149,9 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
+        self.capture_verify = capture_verify
+        self.verify_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.verify_buffer: GraphCaptureBuffer | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -197,22 +218,66 @@ class GraphRunner:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
         self.pool = pool  # graphs captured later (the MTP draft) share it rather than open a second
+        if self.capture_verify:
+            self._capture_verify_graphs(vocab_size, model, pbar)
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
+    def _capture_verify_graphs(self, vocab_size: int, model: BaseLLMModel, pbar) -> None:
+        """Second graph per size, for the two-rows-per-request shape of a verify step.
+
+        Padding is not available here (a padded request would contribute one row, not two), so
+        only the sizes captured outright can replay; other sizes fall back to eager.
+        """
+        self.verify_buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs, vocab_size, self.device, mrope=self.mrope, rows_per_req=2
+        )
+        dummy_slot = (self.dummy_req.linear_slot_idx
+                      if self.dummy_req.linear_slot_idx is not None
+                      else self.dummy_req.table_idx)
+        # the wrapper plans off extend_len, so the dummy has to present the verify shape
+        saved_device_len = self.dummy_req.device_len
+        self.dummy_req.device_len = self.dummy_req.cached_len + 2
+        for bs in sorted(self.graph_bs_list, reverse=True):
+            pbar.desc = f"Capturing verify graphs: bs = {bs:<3}"
+            pbar.refresh()
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch.verify = True
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_for_capture(batch)
+            self.verify_buffer.set_batch(batch)
+            self.verify_buffer.table_idx[:bs].fill_(dummy_slot)
+            self.verify_buffer.verify_out[:bs].fill_(dummy_slot)
+            with get_global_ctx().forward_batch(batch):
+                self.verify_buffer.logits[: 2 * bs] = model.forward()
+                with torch.cuda.graph(graph, pool=self.pool, stream=self.stream):
+                    self.verify_buffer.logits[: 2 * bs] = model.forward()
+                self._reset_moe_offload_cache()
+            self.verify_graph_map[bs] = graph
+        self.dummy_req.device_len = saved_device_len
+        self._reset_moe_offload_cache()
+        logger.info_rank0(
+            f"Captured verify CUDA graphs for sizes: {sorted(self.verify_graph_map)}"
+        )
+
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        # a verify step carries two rows per request; no graph was captured for that shape
-        return batch.is_decode and not batch.verify and batch.size <= self.max_graph_bs
+        if batch.verify:
+            # two rows per request: a padded request would add one, so only captured sizes run
+            return batch.size in self.verify_graph_map
+        return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
-        self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
+        buffer = self.verify_buffer if batch.verify else self.buffer
+        graphs = self.verify_graph_map if batch.verify else self.graph_map
+        buffer.copy_from(batch)
+        g = graphs[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
-        return self.buffer.logits[: batch.size]
+        return buffer.logits[: batch.size * buffer.rows_per_req]
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size

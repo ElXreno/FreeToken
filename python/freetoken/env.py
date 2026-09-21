@@ -76,6 +76,7 @@ class EnvClassSingleton:
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
     VERIFY_DRY = EnvBool(False)  # verify's host serialization without its second row
+    VERIFY_NOSYNC = EnvBool(False)  # timing probe: verify without the drain-first order, output is wrong
 
     def __new__(cls):
         # single instance

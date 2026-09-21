@@ -169,6 +169,7 @@ class Scheduler(SchedulerIOMixin):
         self._verify_enabled = config.mtp_verify and config.model_config.mtp_draft
         self._verify_hits = 0
         self._verify_steps = 0
+        self._host_ns = [0, 0, 0, 0]
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
@@ -275,11 +276,23 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
-        if self._verify_enabled and last_data is not None:
+        _t0 = time.perf_counter_ns()
+        if self._verify_enabled and not ENV.VERIFY_NOSYNC and last_data is not None:
             # whether the draft held decides the next batch's rows, so the drain comes first
             self._process_last_data(last_data)
             last_data = None
+        _t1 = time.perf_counter_ns()
         forward_input = self._schedule_next_batch()
+        self._host_ns[0] += _t1 - _t0
+        self._host_ns[1] += time.perf_counter_ns() - _t1
+        self._host_ns[2] += 1
+        if self._verify_enabled and self._host_ns[2] % 100 == 0:
+            n = self._host_ns[2]
+            logger.info_rank0(
+                f"host phase: drain {self._host_ns[0] / n / 1e6:.2f} ms, "
+                f"schedule {self._host_ns[1] / n / 1e6:.2f} ms, "
+                f"forward {self._host_ns[3] / n / 1e6:.2f} ms over {n} iters"
+            )
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -288,7 +301,9 @@ class Scheduler(SchedulerIOMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
+                _t2 = time.perf_counter_ns()
                 ongoing_data = (forward_input, self._forward(forward_input))
+                self._host_ns[3] += time.perf_counter_ns() - _t2
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -1048,28 +1063,27 @@ class Scheduler(SchedulerIOMixin):
         reqs = batch.reqs
         if any(r.linear_slot_idx is None or r.remain_len < 2 for r in reqs):
             return
-        # run the staged draft now, on its own stream, and wait: the read below is a D2H copy
-        # on this stream and would otherwise overtake it and return the previous step's guess
+        # mtp_drafted is the host's own count, so "has this request a draft yet" needs no sync
+        if any(r.mtp_drafted == 0 for r in reqs):
+            return
+        if ENV.VERIFY_DRY:
+            return
+        # the draft staged at the last drain runs at the top of the next forward, too late to
+        # ride in this batch; enqueue it here, on the stream it was captured against
         with self.engine_stream_ctx:
             self.engine.stream.wait_stream(self.stream)
             self.engine.flush_pending_draft()
         self.stream.wait_stream(self.engine.stream)
-        drafts = self.engine.pending_drafts([r.table_idx for r in reqs])
-        if drafts is None or any(d is None for d in drafts):
-            return
-        if ENV.VERIFY_DRY:  # pay the serialization, skip the second row: prices one against the other
-            return
         pool = self.engine.linear_state_pool
-        for req, draft in zip(reqs, drafts):
+        width = self.token_pool.shape[1]
+        flat = []
+        for req in reqs:
             if req.verify_slot is None:
                 req.verify_slot = pool.alloc(1)[0]
-            req.verify_draft = draft
-            req.append_host(torch.tensor([draft], dtype=req.input_ids.dtype))
             req.device_len += 1
-            # the forward reads its rows from the device token pool, not from input_ids
-            self.token_pool[req.table_idx, req.device_len - 1 : req.device_len].copy_(
-                req.input_ids[-1:], non_blocking=True
-            )
+            req.grow_host(1)
+            flat.append(req.table_idx * width + req.device_len - 1)
+        self.engine.place_drafts(self.token_pool, [r.table_idx for r in reqs], flat)
         batch.verify = True
 
     def _commit_verify(self, batch: Batch, next_tokens_cpu) -> Tuple[List[Tuple[Req, int]], List[int]]:
@@ -1083,10 +1097,11 @@ class Scheduler(SchedulerIOMixin):
         """
         commits: List[Tuple[Req, int]] = []
         picks: List[int] = []
+        drafts = self.engine.drafted_tokens(len(batch.reqs))
         for i, req in enumerate(batch.reqs):
             row = 2 * i
             req.drop_host(1)  # the draft re-enters through the commit loop like any token
-            if int(next_tokens_cpu[row]) == req.verify_draft:
+            if int(next_tokens_cpu[row]) == drafts[i]:
                 commits.append((req, row))
                 commits.append((req, row + 1))
                 req.cached_len = req.device_len

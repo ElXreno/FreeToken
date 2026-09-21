@@ -144,11 +144,15 @@ class FlashInferBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        # verify steps carry two queries per request, which the decode wrapper cannot express
+        self.verify_wrappers: Dict[int, BatchPrefillWithPagedKVCacheWrapper] = {}
+        self.verify_qo_indptr: torch.Tensor | None = None
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
         self._plan_wait_ns = 0
         self._plan_waits = 0
+        self._plan_ns = 0
 
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
         if metadata.initialized:
@@ -163,11 +167,7 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event.synchronize()
         self._plan_wait_ns += perf_counter_ns() - _t0
         self._plan_waits += 1
-        if self._plan_waits % 2000 == 0:
-            logger.info_rank0(
-                f"FlashInfer plan wait: {self._plan_wait_ns / self._plan_waits / 1000:.1f} us/call "
-                f"over {self._plan_waits} calls"
-            )
+        _tp = perf_counter_ns()
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
@@ -199,6 +199,13 @@ class FlashInferBackend(BaseAttnBackend):
                 kv_data_type=metadata.kv_dtype,
                 non_blocking=True,
                 causal=True,
+            )
+        self._plan_ns += perf_counter_ns() - _tp
+        if self._plan_waits % 100 == 0:
+            n = self._plan_waits
+            logger.info_rank0(
+                f"FlashInfer plan: wait {self._plan_wait_ns / n / 1e6:.2f} ms, "
+                f"plan {self._plan_ns / n / 1e6:.2f} ms over {n} calls"
             )
         self.last_event.record()
 
@@ -289,6 +296,7 @@ class FlashInferBackend(BaseAttnBackend):
         # long-lived workspace buffers. Lets init_capture_graph re-run after a cache rebuild.
         super().reset_capture()
         self.graph_wrappers = {}
+        self.verify_wrappers = {}
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -298,6 +306,10 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
+        # verify query indptr is [0, 2, 4, ...]: two rows per request, constant per size
+        self.verify_qo_indptr = torch.arange(
+            0, 2 * (max_bs + 1), 2, dtype=torch.int32, device=self.kvcache.device
+        )
 
     @cached_property
     def use_tensor_cores(self) -> bool:
@@ -307,10 +319,37 @@ class FlashInferBackend(BaseAttnBackend):
         GQA = self.config.num_qo_heads // self.config.num_kv_heads
         return GQA >= 4
 
+    def _verify_wrapper(self, bs: int) -> BatchPrefillWithPagedKVCacheWrapper:
+        """Graph-mode append wrapper for a verify step's two queries per request."""
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        capture = self.capture
+        assert capture is not None and self.verify_qo_indptr is not None
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.float_workspace_buffer,
+            kv_layout="NHD",
+            use_cuda_graph=True,
+            qo_indptr_buf=self.verify_qo_indptr[: bs + 1],
+            paged_kv_indptr_buf=capture.cu_seqlens_k[: bs + 1],
+            paged_kv_indices_buf=capture.indices,
+            paged_kv_last_page_len_buf=capture.one_tensor[:bs],
+        )
+        wrapper._int_workspace_buffer = self.int_workspace_buffer
+        return wrapper
+
     def prepare_for_capture(self, batch: Batch) -> None:
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
+        if batch.verify:
+            assert bs in self.capture_bs and bs not in self.verify_wrappers
+            self.verify_wrappers[bs] = self._verify_wrapper(bs)
+            self.prepare_metadata(batch)
+            metadata = batch.attn_metadata
+            assert isinstance(metadata, FIMetadata)
+            metadata.wrapper = self.verify_wrappers[bs]
+            self._initialize_metadata_once(metadata)
+            return
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
         capture = self.capture
         self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
@@ -333,5 +372,5 @@ class FlashInferBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs
-        metadata.wrapper = self.graph_wrappers[bs]
+        metadata.wrapper = (self.verify_wrappers if batch.verify else self.graph_wrappers)[bs]
         self._initialize_metadata_once(metadata)

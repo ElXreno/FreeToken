@@ -94,6 +94,10 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def grow_host(self, n: int) -> None:
+        """Make room for ``n`` tokens the device writes; their values land at the drain."""
+        self.input_ids = self._ids_buf[: self.input_ids.numel() + n]
+
     def drop_host(self, n: int) -> None:
         """Drop the last ``n`` host-side tokens (a rejected draft never became output)."""
         self.input_ids = self._ids_buf[: self.input_ids.numel() - n]
