@@ -65,6 +65,12 @@ def _env_born_pinned() -> bool | None:
     return v in ("1", "true", "yes", "on")
 
 
+def _hugepages_wanted() -> bool:
+    """``FREETOKEN_BANK_HUGEPAGES`` (default on): ask for transparent huge pages on the private anonymous bank mmaps."""
+    v = os.environ.get("FREETOKEN_BANK_HUGEPAGES", "1").strip().lower()
+    return v not in ("0", "false", "no", "off") and hasattr(mmap, "MADV_HUGEPAGE")
+
+
 def born_pinned_default() -> bool:
     """Whether PINNED serving banks use cudaHostAlloc instead of mmap + register-after-fill.
 
@@ -78,7 +84,7 @@ def born_pinned_default() -> bool:
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
-    * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
+    * ``"mmap"`` (default) -- lazy private anonymous mmap (huge pages unless ``FREETOKEN_BANK_HUGEPAGES=0``); pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
@@ -109,7 +115,10 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)  # lazy: address space only, no resident pages yet
+            if _hugepages_wanted():
+                with contextlib.suppress(OSError):
+                    self._buf.madvise(mmap.MADV_HUGEPAGE)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False

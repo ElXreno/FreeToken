@@ -509,6 +509,43 @@ static inline __m512 nvfp4_i8_grp4(const uint8_t* packed, const uint8_t* scale,
   return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
 }
 
+// Same 4-block group with the block scales already resolved: ``scv`` holds the 4 products
+// (e4m3 block scale x per-block activation scale), each repeated over its 4 int32 lanes.
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+static inline __m512 nvfp4_i8_grp4s(const uint8_t* packed, const int8_t* asi8, int b,
+                                    __m512i lut, __m512i idx, __m512i mask0F, __m512 scv) {
+  const __mmask64 hi_half = 0xFF00FF00FF00FF00ULL;
+  __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + (size_t)b * 8));
+  __m512i src = _mm512_permutexvar_epi64(idx, _mm512_castsi256_si512(raw));
+  __m512i lo = _mm512_and_si512(src, mask0F);
+  __m512i hi = _mm512_and_si512(_mm512_srli_epi16(src, 4), mask0F);
+  __m512i comb = _mm512_mask_blend_epi8(hi_half, lo, hi);
+  __m512i w = _mm512_shuffle_epi8(lut, comb);
+  __m512i a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)b * 16));
+  __m512i aw = _mm512_abs_epi8(w);
+  __mmask64 neg = _mm512_movepi8_mask(w);
+  __m512i sa = _mm512_mask_sub_epi8(a, neg, _mm512_setzero_si512(), a);
+  __m512i di = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sa);
+  return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
+}
+
+// 16 e4m3 block scales -> fp32, bit-exact with e4m3_decode() (normals by exponent
+// rebias, subnormals as man * 2^-9, sign carried over), without the per-group LUT gather.
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+static inline __m512 e4m3x16_to_f32(const uint8_t* p) {
+  __m512i v = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+  __m512i sign = _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0x80)), 24);
+  __m512i exp = _mm512_and_si512(_mm512_srli_epi32(v, 3), _mm512_set1_epi32(0xF));
+  __m512i man = _mm512_and_si512(v, _mm512_set1_epi32(0x7));
+  __mmask16 sub = _mm512_cmpeq_epi32_mask(exp, _mm512_setzero_si512());
+  __m512i normal_bits = _mm512_or_si512(
+      _mm512_slli_epi32(_mm512_add_epi32(exp, _mm512_set1_epi32(120)), 23),
+      _mm512_slli_epi32(man, 20));
+  __m512 subn = _mm512_mul_ps(_mm512_cvtepi32_ps(man), _mm512_set1_ps(1.0f / 512.0f));
+  __m512 mag = _mm512_mask_blend_ps(sub, _mm512_castsi512_ps(normal_bits), subn);
+  return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(mag), sign));
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
 float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float global,
                               const int8_t* asi8, int K, const float* e4m3, const float* asb) {
@@ -517,6 +554,10 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
   const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);  // block i -> 128b lane i
   const __m512i mask0F = _mm512_set1_epi8(0x0F);
   const __m512i idxsc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  const __m512i idxsc1 = _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4);
+  const __m512i idxsc2 = _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8);
+  const __m512i idxsc3 =
+      _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12);
   __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
   __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
   const int nb = K / 16;
@@ -538,14 +579,15 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
       _mm_prefetch(reinterpret_cast<const char*>(packed + ((size_t)b + (size_t)pf) * 8 + 64),
                    _MM_HINT_T0);
     }
-    acc0 = _mm512_add_ps(acc0, nvfp4_i8_grp4(packed, scale, asi8, e4m3, asb, b, lut, idx,
-                                             mask0F, idxsc));
-    acc1 = _mm512_add_ps(acc1, nvfp4_i8_grp4(packed, scale, asi8, e4m3, asb, b + 4, lut, idx,
-                                             mask0F, idxsc));
-    acc2 = _mm512_add_ps(acc2, nvfp4_i8_grp4(packed, scale, asi8, e4m3, asb, b + 8, lut, idx,
-                                             mask0F, idxsc));
-    acc3 = _mm512_add_ps(acc3, nvfp4_i8_grp4(packed, scale, asi8, e4m3, asb, b + 12, lut, idx,
-                                             mask0F, idxsc));
+    const __m512 s16 = _mm512_mul_ps(e4m3x16_to_f32(scale + b), _mm512_loadu_ps(asb + b));
+    acc0 = _mm512_add_ps(acc0, nvfp4_i8_grp4s(packed, asi8, b, lut, idx, mask0F,
+                                              _mm512_permutexvar_ps(idxsc, s16)));
+    acc1 = _mm512_add_ps(acc1, nvfp4_i8_grp4s(packed, asi8, b + 4, lut, idx, mask0F,
+                                              _mm512_permutexvar_ps(idxsc1, s16)));
+    acc2 = _mm512_add_ps(acc2, nvfp4_i8_grp4s(packed, asi8, b + 8, lut, idx, mask0F,
+                                              _mm512_permutexvar_ps(idxsc2, s16)));
+    acc3 = _mm512_add_ps(acc3, nvfp4_i8_grp4s(packed, asi8, b + 12, lut, idx, mask0F,
+                                              _mm512_permutexvar_ps(idxsc3, s16)));
   }
   for (; b + 4 <= nb; b += 4)
     acc0 = _mm512_add_ps(acc0, nvfp4_i8_grp4(packed, scale, asi8, e4m3, asb, b, lut, idx,
@@ -561,6 +603,217 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
     s += (e4m3[scale[b]] * asb[b]) * (float)isum;
   }
   return s * (0.5f * global);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+static inline __m512 nvfp4_i8_grp4a(const uint8_t* packed, int b, __m512i lut, __m512i idx,
+                                    __m512i mask0F, __m512i a, __m512 scv) {
+  const __mmask64 hi_half = 0xFF00FF00FF00FF00ULL;
+  __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + (size_t)b * 8));
+  __m512i src = _mm512_permutexvar_epi64(idx, _mm512_castsi256_si512(raw));
+  __m512i lo = _mm512_and_si512(src, mask0F);
+  __m512i hi = _mm512_and_si512(_mm512_srli_epi16(src, 4), mask0F);
+  __m512i comb = _mm512_mask_blend_epi8(hi_half, lo, hi);
+  __m512i w = _mm512_shuffle_epi8(lut, comb);
+  __m512i aw = _mm512_abs_epi8(w);
+  __mmask64 neg = _mm512_movepi8_mask(w);
+  __m512i sa = _mm512_mask_sub_epi8(a, neg, _mm512_setzero_si512(), a);
+  __m512i di = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sa);
+  return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
+}
+
+// Pass-1 gate row i and up row I+i in one activation sweep; bit-identical to two dots.
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+void dot2_nvfp4_i8_avx512vnni(const uint8_t* packed0, const uint8_t* scale0, float global0,
+                              const uint8_t* packed1, const uint8_t* scale1, float global1,
+                              const int8_t* asi8, int K, const float* e4m3, const float* asb,
+                              float* out0, float* out1) {
+  const __m512i lut = _mm512_broadcast_i32x4(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
+  const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i mask0F = _mm512_set1_epi8(0x0F);
+  const __m512i idxsc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  const __m512i idxsc1 = _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4);
+  const __m512i idxsc2 = _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8);
+  const __m512i idxsc3 =
+      _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12);
+  __m512 p0 = _mm512_setzero_ps(), p1 = _mm512_setzero_ps();
+  __m512 p2 = _mm512_setzero_ps(), p3 = _mm512_setzero_ps();
+  __m512 q0 = _mm512_setzero_ps(), q1 = _mm512_setzero_ps();
+  __m512 q2 = _mm512_setzero_ps(), q3 = _mm512_setzero_ps();
+  const int nb = K / 16;
+  int b = 0;
+  for (; b + 16 <= nb; b += 16) {
+    const __m512 asb16 = _mm512_loadu_ps(asb + b);
+    const __m512 s0 = _mm512_mul_ps(e4m3x16_to_f32(scale0 + b), asb16);
+    const __m512 s1 = _mm512_mul_ps(e4m3x16_to_f32(scale1 + b), asb16);
+    __m512i a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)b * 16));
+    p0 = _mm512_add_ps(p0, nvfp4_i8_grp4a(packed0, b, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc, s0)));
+    q0 = _mm512_add_ps(q0, nvfp4_i8_grp4a(packed1, b, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc, s1)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 4) * 16));
+    p1 = _mm512_add_ps(p1, nvfp4_i8_grp4a(packed0, b + 4, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc1, s0)));
+    q1 = _mm512_add_ps(q1, nvfp4_i8_grp4a(packed1, b + 4, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc1, s1)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 8) * 16));
+    p2 = _mm512_add_ps(p2, nvfp4_i8_grp4a(packed0, b + 8, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc2, s0)));
+    q2 = _mm512_add_ps(q2, nvfp4_i8_grp4a(packed1, b + 8, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc2, s1)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 12) * 16));
+    p3 = _mm512_add_ps(p3, nvfp4_i8_grp4a(packed0, b + 12, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc3, s0)));
+    q3 = _mm512_add_ps(q3, nvfp4_i8_grp4a(packed1, b + 12, lut, idx, mask0F, a, _mm512_permutexvar_ps(idxsc3, s1)));
+  }
+  for (; b + 4 <= nb; b += 4) {
+    p0 = _mm512_add_ps(p0, nvfp4_i8_grp4(packed0, scale0, asi8, e4m3, asb, b, lut, idx, mask0F, idxsc));
+    q0 = _mm512_add_ps(q0, nvfp4_i8_grp4(packed1, scale1, asi8, e4m3, asb, b, lut, idx, mask0F, idxsc));
+  }
+  float s0 = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(p0, p1), _mm512_add_ps(p2, p3)));
+  float s1 = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(q0, q1), _mm512_add_ps(q2, q3)));
+  for (; b < nb; ++b) {
+    const uint8_t* pk0 = packed0 + (size_t)b * 8;
+    const uint8_t* pk1 = packed1 + (size_t)b * 8;
+    const int8_t* ae = asi8 + (size_t)b * 16; const int8_t* ao = ae + 8;
+    int i0 = 0, i1 = 0;
+    for (int j = 0; j < 8; ++j) {
+      i0 += (int)kE2M1x2[pk0[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk0[j] >> 4] * (int)ao[j];
+      i1 += (int)kE2M1x2[pk1[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk1[j] >> 4] * (int)ao[j];
+    }
+    s0 += (e4m3[scale0[b]] * asb[b]) * (float)i0;
+    s1 += (e4m3[scale1[b]] * asb[b]) * (float)i1;
+  }
+  *out0 = s0 * (0.5f * global0);
+  *out1 = s1 * (0.5f * global1);
+}
+
+// VBMI nibble unpack: one multishift + one 64-byte permute instead of and/shift/blend/shuffle.
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,avx2")))
+static inline __m512 nvfp4_i8_grp4v(const uint8_t* packed, int b, __m512i lut64, __m512i idx,
+                                    __m512i msctl, __m512i a, __m512 scv) {
+  __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + (size_t)b * 8));
+  __m512i src = _mm512_permutexvar_epi64(idx, _mm512_castsi256_si512(raw));
+  __m512i nib = _mm512_multishift_epi64_epi8(msctl, src);
+  __m512i w = _mm512_permutexvar_epi8(nib, lut64);
+  __m512i aw = _mm512_abs_epi8(w);
+  __mmask64 neg = _mm512_movepi8_mask(w);
+  __m512i sa = _mm512_mask_sub_epi8(a, neg, _mm512_setzero_si512(), a);
+  __m512i di = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sa);
+  return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,avx2")))
+static inline __m512i nvfp4_vbmi_lut64() {
+  return _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,avx2")))
+static inline __m512i nvfp4_vbmi_msctl() {
+  const long long lo = 0x3830282018100800LL, hi = 0x3C342C241C140C04LL;
+  return _mm512_set_epi64(hi, lo, hi, lo, hi, lo, hi, lo);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,avx2")))
+float dot_nvfp4_i8_avx512vbmi(const uint8_t* packed, const uint8_t* scale, float global,
+                              const int8_t* asi8, int K, const float* e4m3, const float* asb) {
+  const __m512i lut = nvfp4_vbmi_lut64();
+  const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i mask0F = _mm512_set1_epi8(0x0F);
+  const __m512i msctl = nvfp4_vbmi_msctl();
+  const __m512i idxsc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  const __m512i idxsc1 = _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4);
+  const __m512i idxsc2 = _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8);
+  const __m512i idxsc3 =
+      _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12);
+  __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+  __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+  const int nb = K / 16;
+  int b = 0;
+  for (; b + 16 <= nb; b += 16) {
+    const __m512 s16 = _mm512_mul_ps(e4m3x16_to_f32(scale + b), _mm512_loadu_ps(asb + b));
+    __m512i a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)b * 16));
+    acc0 = _mm512_add_ps(acc0, nvfp4_i8_grp4v(packed, b, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc, s16)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 4) * 16));
+    acc1 = _mm512_add_ps(acc1, nvfp4_i8_grp4v(packed, b + 4, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc1, s16)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 8) * 16));
+    acc2 = _mm512_add_ps(acc2, nvfp4_i8_grp4v(packed, b + 8, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc2, s16)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 12) * 16));
+    acc3 = _mm512_add_ps(acc3, nvfp4_i8_grp4v(packed, b + 12, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc3, s16)));
+  }
+  for (; b + 4 <= nb; b += 4)
+    acc0 = _mm512_add_ps(acc0, nvfp4_i8_grp4(packed, scale, asi8, e4m3, asb, b, lut, idx,
+                                             mask0F, idxsc));
+  float s = _mm512_reduce_add_ps(
+      _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3)));
+  for (; b < nb; ++b) {
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const int8_t* ae = asi8 + (size_t)b * 16; const int8_t* ao = ae + 8;
+    int isum = 0;
+    for (int j = 0; j < 8; ++j)
+      isum += (int)kE2M1x2[pk[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk[j] >> 4] * (int)ao[j];
+    s += (e4m3[scale[b]] * asb[b]) * (float)isum;
+  }
+  return s * (0.5f * global);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx512vbmi,avx2")))
+void dot2_nvfp4_i8_avx512vbmi(const uint8_t* packed0, const uint8_t* scale0, float global0,
+                              const uint8_t* packed1, const uint8_t* scale1, float global1,
+                              const int8_t* asi8, int K, const float* e4m3, const float* asb,
+                              float* out0, float* out1) {
+  const __m512i lut = nvfp4_vbmi_lut64();
+  const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i mask0F = _mm512_set1_epi8(0x0F);
+  const __m512i msctl = nvfp4_vbmi_msctl();
+  const __m512i idxsc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  const __m512i idxsc1 = _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4);
+  const __m512i idxsc2 = _mm512_set_epi32(11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8);
+  const __m512i idxsc3 =
+      _mm512_set_epi32(15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13, 12, 12, 12, 12);
+  __m512 p0 = _mm512_setzero_ps(), p1 = _mm512_setzero_ps();
+  __m512 p2 = _mm512_setzero_ps(), p3 = _mm512_setzero_ps();
+  __m512 q0 = _mm512_setzero_ps(), q1 = _mm512_setzero_ps();
+  __m512 q2 = _mm512_setzero_ps(), q3 = _mm512_setzero_ps();
+  const int nb = K / 16;
+  int b = 0;
+  for (; b + 16 <= nb; b += 16) {
+    const __m512 asb16 = _mm512_loadu_ps(asb + b);
+    const __m512 s0 = _mm512_mul_ps(e4m3x16_to_f32(scale0 + b), asb16);
+    const __m512 s1 = _mm512_mul_ps(e4m3x16_to_f32(scale1 + b), asb16);
+    __m512i a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)b * 16));
+    p0 = _mm512_add_ps(p0, nvfp4_i8_grp4v(packed0, b, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc, s0)));
+    q0 = _mm512_add_ps(q0, nvfp4_i8_grp4v(packed1, b, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc, s1)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 4) * 16));
+    p1 = _mm512_add_ps(p1, nvfp4_i8_grp4v(packed0, b + 4, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc1, s0)));
+    q1 = _mm512_add_ps(q1, nvfp4_i8_grp4v(packed1, b + 4, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc1, s1)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 8) * 16));
+    p2 = _mm512_add_ps(p2, nvfp4_i8_grp4v(packed0, b + 8, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc2, s0)));
+    q2 = _mm512_add_ps(q2, nvfp4_i8_grp4v(packed1, b + 8, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc2, s1)));
+    a = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(asi8 + (size_t)(b + 12) * 16));
+    p3 = _mm512_add_ps(p3, nvfp4_i8_grp4v(packed0, b + 12, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc3, s0)));
+    q3 = _mm512_add_ps(q3, nvfp4_i8_grp4v(packed1, b + 12, lut, idx, msctl, a, _mm512_permutexvar_ps(idxsc3, s1)));
+  }
+  for (; b + 4 <= nb; b += 4) {
+    p0 = _mm512_add_ps(p0, nvfp4_i8_grp4(packed0, scale0, asi8, e4m3, asb, b, lut, idx, mask0F, idxsc));
+    q0 = _mm512_add_ps(q0, nvfp4_i8_grp4(packed1, scale1, asi8, e4m3, asb, b, lut, idx, mask0F, idxsc));
+  }
+  float s0 = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(p0, p1), _mm512_add_ps(p2, p3)));
+  float s1 = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(q0, q1), _mm512_add_ps(q2, q3)));
+  for (; b < nb; ++b) {
+    const uint8_t* pk0 = packed0 + (size_t)b * 8;
+    const uint8_t* pk1 = packed1 + (size_t)b * 8;
+    const int8_t* ae = asi8 + (size_t)b * 16; const int8_t* ao = ae + 8;
+    int i0 = 0, i1 = 0;
+    for (int j = 0; j < 8; ++j) {
+      i0 += (int)kE2M1x2[pk0[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk0[j] >> 4] * (int)ao[j];
+      i1 += (int)kE2M1x2[pk1[j] & 0xF] * (int)ae[j] + (int)kE2M1x2[pk1[j] >> 4] * (int)ao[j];
+    }
+    s0 += (e4m3[scale0[b]] * asb[b]) * (float)i0;
+    s1 += (e4m3[scale1[b]] * asb[b]) * (float)i1;
+  }
+  *out0 = s0 * (0.5f * global0);
+  *out1 = s1 * (0.5f * global1);
+}
+
+inline bool cpu_has_avx512vbmi_kernel() {
+  const char* no = getenv("FREETOKEN_CPU_MOE_NO_VBMI");
+  if (no && no[0] && no[0] != '0') return false;
+  return __builtin_cpu_supports("avx512vbmi");
 }
 #endif  // avx512vnni available
 #endif
@@ -756,9 +1009,22 @@ inline bool cpu_has_avx512vnni() {
 nvi8dot_fn select_nvi8dot() {
 #if CPU_MOE_X86
 #if defined(CPU_MOE_HAS_AVX512VNNI)
+  if (cpu_has_avx512vnni() && cpu_has_avx512vbmi_kernel()) return dot_nvfp4_i8_avx512vbmi;
   if (cpu_has_avx512vnni()) return dot_nvfp4_i8_avx512vnni;
 #endif
   if (cpu_has_avxvnni()) return dot_nvfp4_i8_vnni;
+#endif
+  return nullptr;
+}
+
+using nvi8dot2_fn = void (*)(const uint8_t*, const uint8_t*, float, const uint8_t*,
+                             const uint8_t*, float, const int8_t*, int, const float*,
+                             const float*, float*, float*);
+
+nvi8dot2_fn select_nvi8dot2() {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+  if (cpu_has_avx512vnni() && cpu_has_avx512vbmi_kernel()) return dot2_nvfp4_i8_avx512vbmi;
+  if (cpu_has_avx512vnni()) return dot2_nvfp4_i8_avx512vnni;
 #endif
   return nullptr;
 }
@@ -1238,6 +1504,7 @@ struct CpuMoeExecutor {
   int act, apply_on_input;
   int fmt;                // WFmt
   bool needs_di = false;  // pre-deinterleave activations to fp32 (nvfp4/ds_fp4)
+  bool fused_prep = false;  // nvfp4: intermediate prep done per pass-1 block, no prep pass
   // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
   // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
   // table (down_tbl likewise for down); which reinterpretation applies is picked by
@@ -1255,6 +1522,7 @@ struct CpuMoeExecutor {
   dot_fn dot;
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
+  nvi8dot2_fn nvi8dot2 = nullptr;  // two-row variant for pass 1 (AVX-512 VNNI only)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   dsdot_fn dsdot;
@@ -1394,6 +1662,7 @@ struct CpuMoeExecutor {
     // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
     nvi8dot = select_nvi8dot();
+    nvi8dot2 = select_nvi8dot2();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
@@ -1408,6 +1677,7 @@ struct CpuMoeExecutor {
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
     // Row-major fp4 (nvfp4/ds_fp4) pre-deinterleaves activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4);
+    fused_prep = (fmt == WF_NVFP4) && (IBLK % 16 == 0) && (I % 16 == 0);
     if (needs_di) {
       if (fmt == WF_DSFP4) xq_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
       xe_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0);
@@ -1615,12 +1885,24 @@ struct CpuMoeExecutor {
     const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
     const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
+    const bool two_rows = use_vnni && nvi8dot2 != nullptr;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
-      float gate =
-          gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
-      float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
-                           xe, xo, xi8, xas) * w_in;
+      float gate, up;
+      if (two_rows) {
+        const size_t r0 = (size_t)e * (2 * I) + i, r1 = r0 + I;
+        nvi8dot2(gu_packed_l + r0 * (size_t)(H / 2), gu_scale_l + r0 * (size_t)(H / 16),
+                 fp16_to_f32(gu_global_l[r0]), gu_packed_l + r1 * (size_t)(H / 2),
+                 gu_scale_l + r1 * (size_t)(H / 16), fp16_to_f32(gu_global_l[r1]), xi8, H,
+                 e4m3_lut, xas, &gate, &up);
+        gate *= w_in;
+        up *= w_in;
+      } else {
+        gate = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo,
+                         xi8, xas) * w_in;
+        up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row, xe,
+                       xo, xi8, xas) * w_in;
+      }
       if (clamped) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
         // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
@@ -1634,6 +1916,18 @@ struct CpuMoeExecutor {
         g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
       }
     }
+    if (fused_prep) prep_g_block((size_t)tok * top_k + k, i0, i1);
+  }
+
+  // nvfp4 prep of one 16-aligned pass-1 slice by the worker that produced it (no prep pass).
+  void prep_g_block(size_t r, int i0, int i1) {
+    const bf16_t* g = g_scratch.data() + r * I + i0;
+    float* ge = ge_scratch.data() + r * (I / 2) + i0 / 2;
+    float* go = go_scratch.data() + r * (I / 2) + i0 / 2;
+    deinterleave_bf16_f32(g, ge, go, i1 - i0);
+    if (use_vnni)
+      quant_i8_pg16(ge, go, i1 - i0, gi8_scratch.data() + r * I + i0,
+                    gas_scratch.data() + r * (I / 16) + i0 / 16);
   }
 
   void do_pass2(const MoeTask* t, int64_t p) {
@@ -1656,25 +1950,25 @@ struct CpuMoeExecutor {
     const uint16_t* dn_global_l =
         reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
     bf16_t* y_row = t->y + (size_t)tok * H;
-    for (int h = h0; h < h1; ++h) {
-      float acc = 0.0f;
-      for (int k = 0; k < top_k; ++k) {
-        const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-        if (e < 0 || e >= num_experts) continue;
-        const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
-        const size_t gr = (size_t)tok * top_k + k;
-        const bf16_t* g_row = g_scratch.data() + gr * I;
-        const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
-        const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
-        const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
-        const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
-                         : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
-                                      : nullptr;
-        acc += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge, go, gi8,
-                         gas) * w_out;
-      }
-      y_row[h] = f32_to_bf16(acc);
+    float acc[HBLK];
+    for (int h = h0; h < h1; ++h) acc[h - h0] = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+      const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+      if (e < 0 || e >= num_experts) continue;
+      const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
+      const size_t gr = (size_t)tok * top_k + k;
+      const bf16_t* g_row = g_scratch.data() + gr * I;
+      const float* ge = needs_di ? ge_scratch.data() + gr * (I / 2) : nullptr;
+      const float* go = needs_di ? go_scratch.data() + gr * (I / 2) : nullptr;
+      const int8_t* gi8 = (use_vnni || use_q4a8) ? gi8_scratch.data() + gr * I : nullptr;
+      const float* gas = use_vnni ? gas_scratch.data() + gr * (I / 16)
+                       : use_q4a8 ? gas_scratch.data() + gr * (I / 32)
+                                    : nullptr;
+      for (int h = h0; h < h1; ++h)
+        acc[h - h0] += gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row, ge,
+                                 go, gi8, gas) * w_out;
     }
+    for (int h = h0; h < h1; ++h) y_row[h] = f32_to_bf16(acc[h - h0]);
   }
 
   // ----------------------------- mxfp4 (gpt-oss) -----------------------------
@@ -1851,7 +2145,7 @@ struct CpuMoeExecutor {
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
     // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    if ((needs_di && !fused_prep) || use_q4a8) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
