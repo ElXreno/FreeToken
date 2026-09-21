@@ -91,6 +91,26 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """A speculative step commits two tokens for one request, so a batch can carry several
+        messages per uid. ``_decode_round`` reads each uid's offsets before any of them move, so
+        a second message would re-emit the first one's text; give each its own round instead."""
+        rounds: List[List[int]] = []
+        position: Dict[int, int] = {}
+        for i, msg in enumerate(msgs):
+            n = position.get(msg.uid, 0)
+            position[msg.uid] = n + 1
+            if n == len(rounds):
+                rounds.append([])
+            rounds[n].append(i)
+        if len(rounds) == 1:
+            return self._decode_round(msgs)
+        out: List[str] = [""] * len(msgs)
+        for indices in rounds:
+            for i, text in zip(indices, self._decode_round([msgs[i] for i in indices]), strict=True):
+                out[i] = text
+        return out
+
+    def _decode_round(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
