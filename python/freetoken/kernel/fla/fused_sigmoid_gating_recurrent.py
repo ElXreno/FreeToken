@@ -25,6 +25,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o,
     h0_source,
     h0_indices,
+    h0_out_indices,
     cu_seqlens,
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
@@ -229,10 +230,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_o += HV * V
         p_a += stride_a
 
-    # Store final state back to h0_source with bounds checking
+    # Store the final state, by default over the slot it was read from. A verify step points
+    # the write at a second slot so the read slot keeps the state a rejected draft falls back to.
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
+            idx = tl.load(h0_out_indices + i_n)
             if idx >= 0:
                 p_h0 = (
                     h0_source
@@ -256,6 +258,8 @@ def fused_sigmoid_gating_delta_rule_update(
     b: torch.Tensor,
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
+    # slots the final state lands in; defaults to the ones it was read from
+    initial_state_out_indices: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
@@ -336,6 +340,9 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        h0_out_indices=(
+            initial_state_indices if initial_state_out_indices is None else initial_state_out_indices
+        ),
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,

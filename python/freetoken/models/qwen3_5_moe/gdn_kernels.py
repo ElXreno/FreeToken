@@ -54,6 +54,7 @@ def gdn_decode_fla(
     indices: torch.Tensor,      # [B] int32 slot id per request
     cu_seqlens: torch.Tensor,   # [B+1] query indptr (arange) from FLAMetadata
     scale: float,
+    out_indices: torch.Tensor | None = None,  # [B] int32 slots to land the new state in
 ) -> torch.Tensor:
     """Fused sigmoid-gating gated-delta-rule decode (vendored fla triton kernel): gating +
     in-kernel l2norm + recurrent update + state read/write-by-index in one kernel, with no
@@ -66,6 +67,7 @@ def gdn_decode_fla(
         q=q, k=k, v=v, b=b,
         initial_state_source=state_source,
         initial_state_indices=indices,  # already int32 (built int32 in the scheduler)
+        initial_state_out_indices=out_indices,
         scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
     )
     # kernel returns o = [NK, *v.shape] then squeeze(NK) -> [1, B, num_v, V].

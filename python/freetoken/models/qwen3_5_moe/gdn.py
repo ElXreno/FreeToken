@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from freetoken.attention.linear import _decode_cu_seqlens
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
@@ -107,6 +108,45 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
+    def _decode_verify(self, conv_in, a, b, pool, li, fla, dtype):
+        """Two tokens of one sequence per request, run as two ordered single-token passes.
+
+        Rows are grouped per request (``[r0 t0, r0 t1, r1 t0, ...]``), so the first tokens are
+        the even rows and the second ones the odd rows. Pass 1 reads the slot pass 0 just wrote
+        and lands its own state in ``verify_out_indices``, leaving the read slot holding the
+        state a rejected draft falls back to. The conv state is small enough to copy between
+        the passes (1.41 MiB per request against 60 MiB of recurrent state).
+        """
+        slot_in, slot_out = fla.cache_indices, fla.verify_out_indices
+        conv, rec = pool.conv_states[li], pool.recurrent_states[li]
+        cu = _decode_cu_seqlens(slot_in.shape[0], conv_in.device)
+
+        outs = []
+        for step in range(2):
+            rows = slice(step, None, 2)
+            if step == 1:
+                conv.index_copy_(0, slot_out.long(), conv.index_select(0, slot_in.long()))
+            mixed = causal_conv1d_decode(
+                conv_in[rows], conv, self._conv_weight(), slot_in if step == 0 else slot_out
+            )
+            n = mixed.shape[0]
+            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            outs.append(gdn_decode_fla(
+                qf.reshape(1, n, self.num_k_heads, self.head_k_dim).to(dtype),
+                kf.reshape(1, n, self.num_k_heads, self.head_k_dim).to(dtype),
+                vf.reshape(1, n, self.num_v_heads, self.head_v_dim).to(dtype),
+                a[rows], b[rows], A_log=self.A_log, dt_bias=self.dt_bias,
+                state_source=rec, indices=slot_in, cu_seqlens=cu,
+                scale=self.head_k_dim ** -0.5,
+                out_indices=None if step == 0 else slot_out,
+            ))
+        core_out = torch.empty(
+            (outs[0].shape[0] * 2, *outs[0].shape[1:]), dtype=outs[0].dtype, device=outs[0].device
+        )
+        core_out[0::2] = outs[0]
+        core_out[1::2] = outs[1]
+        return core_out
+
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
@@ -149,7 +189,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode and fla.verify_out_indices is not None:
+            core_out = self._decode_verify(conv_in, a, b, pool, li, fla, dtype)
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

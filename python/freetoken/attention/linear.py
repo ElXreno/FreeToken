@@ -26,12 +26,19 @@ class FLAMetadata:
       fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
                           (cached_len == 0) and must be zeroed before the chunk kernel
                           reads them in place. None if there are none / for decode.
+      verify_out_indices  speculative verify only: each request carries two tokens of one
+                          sequence, so the recurrence runs them in order and the second one
+                          writes its state to this slot instead of over ``cache_indices``.
+                          The read slot then still holds the state a rejected draft falls
+                          back to, and accepting is a host-side swap of which slot is live --
+                          no state is ever copied. None on every ordinary batch.
     """
 
     cu_seqlens: torch.Tensor
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
+    verify_out_indices: torch.Tensor | None = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
