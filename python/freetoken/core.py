@@ -202,6 +202,9 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
+    # Compute dtype of activations (q/k/v as the model emits them). The paged KV slab may
+    # be narrower (EngineConfig.kv_cache_dtype); None only in duck-typed tests.
+    dtype: torch.dtype | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.

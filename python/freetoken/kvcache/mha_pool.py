@@ -9,6 +9,15 @@ from freetoken.utils import div_even
 from .base import BaseKVCachePool
 
 
+def _to_slab_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast fresh K/V rows to the slab dtype. Saturate first: float8_e4m3fn has no inf, and
+    torch maps anything past its range to NaN instead of clamping."""
+    if x.dtype == dtype:
+        return x
+    finfo = torch.finfo(dtype)
+    return x.clamp(finfo.min, finfo.max).to(dtype)
+
+
 class MHAKVCache(BaseKVCachePool):
     """
     Base class for key-value caches.
@@ -56,6 +65,27 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._scales: dict[int, tuple[float, float]] = {}
+
+    def set_kv_scales(self, scales: dict[int, tuple[float, float]]) -> None:
+        """Install per-layer (k_scale, v_scale): store_kv divides fresh rows by them, so the slab
+        holds K/k_scale and V/v_scale; kv_scales() hands them to the attention backend, which
+        folds k_scale into sm_scale and v_scale into the output. Exactly the paged layers."""
+        paged = (
+            list(range(self._num_layers))
+            if self._layer_map is None
+            else [layer for layer, dense in enumerate(self._layer_map) if dense >= 0]
+        )
+        missing = [layer for layer in paged if layer not in scales]
+        extra = [layer for layer in scales if layer not in set(paged)]
+        if missing or extra:
+            raise ValueError(
+                f"kv scales must cover exactly the paged layers: missing {missing}, unexpected {extra}"
+            )
+        self._scales = {layer: (float(k), float(v)) for layer, (k, v) in scales.items()}
+
+    def kv_scales(self, layer_id: int) -> tuple[float, float] | None:
+        return self._scales.get(layer_id)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -127,12 +157,17 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        dtype = self.dtype
+        scales = self._scales.get(layer_id)
+        if scales is not None:
+            k = k * (1.0 / scales[0])
+            v = v * (1.0 / scales[1])
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
             indices=out_loc,
-            k=k,
-            v=v,
+            k=_to_slab_dtype(k, dtype),
+            v=_to_slab_dtype(v, dtype),
         )
 
     @property
