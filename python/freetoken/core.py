@@ -64,6 +64,9 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # MTP draft head: decode steps this request has drafted, so the first one clears the ring
+    # slot it inherits from whoever held the same GDN slot before.
+    mtp_drafted: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

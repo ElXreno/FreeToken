@@ -212,6 +212,7 @@ def load_weight(
     *,
     include_moe_experts: bool = True,
     include_vision: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -221,8 +222,12 @@ def load_weight(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
     from freetoken.models.config import VISION_KEY_PREFIXES
 
-    # a text-only engine never built the tower, so its tensors are not even read
-    keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
+    # a text-only engine never built the tower, so its tensors are not even read; the same for
+    # the MTP draft head, whose keys a family reader emits whenever the checkpoint carries them
+    drop = () if include_vision else VISION_KEY_PREFIXES
+    if not include_mtp:
+        drop = tuple(drop) + ("mtp.",)
+    keep = None if not drop else (lambda name: not name.startswith(drop))
     if is_ftw_checkpoint(model_path):
         weights = iter_ftw_weights(model_path, keep=keep)
     else:

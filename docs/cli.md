@@ -106,6 +106,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--mixed-batch-decode` | off | Running decodes ride each prefill chunk as one-token extends; composes with `--decode-steps-per-prefill-chunk` |
+| `--mtp-draft` | off | Build the checkpoint's multi-token-prediction head and report how often its draft matched the sampled token; the draft is not served |
+| `--mtp-window` | 512 | Attention history the draft head keeps per request, in tokens |
 | `--embed-table-host` | off | Input embedding table in pinned host memory, rows gathered over UVA; frees its VRAM for the caches (single rank) |
 | `--moe-collect-stats` | off | Expert-cache hit / PCIe-fetch / CPU-miss counters per decode step, in the decode log line and `/v1/stats` `moe_cache` |
 

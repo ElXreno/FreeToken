@@ -54,17 +54,26 @@ _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8
 
 
 def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith("mtp."):
-        return None
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ``mtp.*`` passes through for the draft head and ``load_weight`` drops it when the head is
+    off; its routed experts are skipped by ``_EXPERT_RE`` like any other per-expert tensor."""
     # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
     return rename_vl_prefix(raw_name)
 
 
+_GEMMA_NORM_NAMES = frozenset({
+    "model.norm.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+})
+
+
 def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
+    return name in _GEMMA_NORM_NAMES or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
 def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:

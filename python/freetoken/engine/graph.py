@@ -196,6 +196,7 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+        self.pool = pool  # graphs captured later (the MTP draft) share it rather than open a second
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)

@@ -478,8 +478,14 @@ class Scheduler(SchedulerIOMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
             moe_stats=moe_stats,
+            mtp=self._mtp_acceptance,
         )
         self.send_result(reply)
+
+    def _mtp_acceptance(self) -> tuple[int, int, float, float] | None:
+        """Called only when a status line is actually printed: it blocks on the draft's event."""
+        fn = getattr(self.engine, "mtp_acceptance", None)
+        return None if fn is None else fn()
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes

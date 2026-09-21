@@ -286,6 +286,16 @@ class ModelConfig:
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
+    # ----- multi-token-prediction draft head (``mtp.*``) -----
+    mtp_num_layers: int = 0
+    mtp_dedicated_embeddings: bool = False
+    mtp_draft: bool = False
+    # attention history the head keeps, in tokens; a ring this wide replaces a KV-cache layer
+    mtp_window: int = 512
+    # router width of the head's MoE; 0 keeps only the shared expert
+    mtp_top_k: int = 0
+    # drop the draft's vocabulary projection, to price it against the step it shares memory with
+    mtp_skip_projection: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
     # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist

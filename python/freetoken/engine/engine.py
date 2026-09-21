@@ -6,6 +6,7 @@ import gc
 import math
 import os
 from datetime import timedelta
+from time import perf_counter_ns
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
@@ -496,6 +497,33 @@ class Engine:
             config.attention_backend, config.model_config
         )
 
+        # ======================= MTP draft head initialization ========================
+        self.mtp_head = getattr(self.model, "mtp", None)
+        self.mtp_stream = torch.cuda.Stream() if self.mtp_head is not None else None
+        self._mtp_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._mtp_cpu_ns = 0
+        self._mtp_steps = 0
+        self._mtp_pending = 0
+        self._mtp_timed = False
+        self._mtp_begin = torch.cuda.Event(enable_timing=True)
+        self._mtp_end = torch.cuda.Event(enable_timing=True)
+        if self.mtp_head is not None:
+            slots = self.linear_state_pool.num_slots if self.linear_state_pool is not None else config.max_running_req + 1
+            self.mtp_head.alloc_rings(slots, self.device, self.dtype)
+            width = config.max_running_req + 1
+            self._mtp_slots_host = torch.empty(width, dtype=torch.int64, pin_memory=True)
+            self._mtp_fresh_host = torch.empty(width, dtype=torch.int64, pin_memory=True)
+            self._mtp_slots = torch.zeros(width, dtype=torch.int64, device=self.device)
+            self._mtp_tokens = torch.zeros(width, dtype=torch.int32, device=self.device)
+            self._mtp_positions = torch.zeros(width, dtype=torch.int32, device=self.device)
+            self._mtp_hidden = torch.zeros(
+                width, config.model_config.hidden_size, dtype=self.dtype, device=self.device
+            )
+            logger.info_rank0(
+                f"MTP draft head ready: window {config.mtp_window}, {slots} ring slots, "
+                f"{mem_GB(self.mtp_head.ring_bytes)} of rings"
+            )
+
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
@@ -530,6 +558,8 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
+        if self.mtp_head is not None:
+            self._capture_mtp_graphs(config.max_running_req)
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -586,6 +616,7 @@ class Engine:
                 self.device,
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
                 include_vision=bool(config.active_encoders),
+                include_mtp=config.model_config.mtp_draft,
             ),
             device=self.device,
         )
@@ -1097,6 +1128,8 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        if self._mtp_pending:
+            self._flush_mtp_draft()
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -1113,7 +1146,83 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if self.mtp_head is not None and batch.is_decode:
+            self._stage_mtp_draft(batch, next_tokens_gpu, batch.padded_size if use_graph else batch.size)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _stage_mtp_draft(self, batch: Batch, next_tokens_gpu: torch.Tensor, rows_forwarded: int) -> None:
+        """Copy this step's draft inputs aside; the draft itself runs at the top of the next step.
+
+        Queueing it here would put its kernels after the step's device-to-host copy, and a
+        compute/copy boundary on one channel costs a front-end drain. Running it just before the
+        next forward keeps all the compute contiguous instead. It touches nothing the main path
+        reads: a wrong draft costs a ring write and the counters, never a served token.
+        """
+        t0 = perf_counter_ns()
+        rows = batch.reqs[: batch.size]
+        n = len(rows)
+        host = self._mtp_slots_host[:n]
+        for i, req in enumerate(rows):
+            host[i] = req.linear_slot_idx
+            req.mtp_drafted += 1
+        self._mtp_slots[:n].copy_(host, non_blocking=True)
+        self._mtp_hidden[:n].copy_(self.model.decode_hidden(rows_forwarded)[:n])
+        self._mtp_tokens[:n].copy_(next_tokens_gpu)
+        self._mtp_positions[:n].copy_(batch.positions[:n])
+
+        fresh = [r.linear_slot_idx for r in rows if r.mtp_drafted == 1]
+        if fresh:
+            # its own pinned buffer: _mtp_slots_host is still being read by the copy above
+            staged = self._mtp_fresh_host[: len(fresh)]
+            for i, slot in enumerate(fresh):
+                staged[i] = slot
+            self.mtp_head.reset_slots(staged.to(self.device, non_blocking=True))
+        self._mtp_pending = n
+        self._mtp_cpu_ns += perf_counter_ns() - t0
+
+    def _flush_mtp_draft(self) -> None:
+        """Run the staged draft, immediately ahead of the next forward's own kernels."""
+        t0 = perf_counter_ns()
+        n, self._mtp_pending = self._mtp_pending, 0
+        self._mtp_begin.record(self.stream)
+        self._mtp_graphs[n].replay()
+        self._mtp_end.record(self.stream)
+        self._mtp_cpu_ns += perf_counter_ns() - t0
+        self._mtp_steps += 1
+        self._mtp_timed = True
+
+    def mtp_acceptance(self) -> tuple[int, int, float, float] | None:
+        """Draft hits, scored drafts, engine-thread microseconds per draft and its GPU milliseconds."""
+        if self.mtp_head is None:
+            return None
+        hits, scored = self.mtp_head.acceptance()
+        per_step = self._mtp_cpu_ns / self._mtp_steps / 1000 if self._mtp_steps else 0.0
+        gpu_ms = 0.0
+        if self._mtp_timed:
+            self._mtp_end.synchronize()
+            gpu_ms = self._mtp_begin.elapsed_time(self._mtp_end)
+        return hits, scored, per_step, gpu_ms
+
+    @torch.inference_mode()
+    def _capture_mtp_graphs(self, max_rows: int) -> None:
+        """Capture the draft once per row count so a step costs one launch instead of forty."""
+        for n in range(1, max_rows + 1):
+            batch = Batch(reqs=[self.dummy_req] * n, phase="decode")
+            batch.positions = self._mtp_positions[:n]
+            args = (self._mtp_hidden[:n], self._mtp_tokens[:n], self._mtp_positions[:n], self._mtp_slots[:n])
+            with self.ctx.forward_batch(batch):
+                side = torch.cuda.Stream()
+                side.wait_stream(self.stream)
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        self.model.draft_step(*args)
+                self.stream.wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=getattr(self.graph_runner, "pool", None), stream=self.stream):
+                    self.model.draft_step(*args)
+            self._mtp_graphs[n] = graph
+        self.mtp_head.reset_slots(torch.arange(self.mtp_head.num_slots, device=self.device))
+        self.mtp_head.clear_counters()
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

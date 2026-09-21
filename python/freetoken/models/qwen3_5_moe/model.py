@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
@@ -11,14 +12,14 @@ from freetoken.layers import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from freetoken.models.blocks import BaseLLMModel
-from freetoken.models.blocks import embed_input_ids
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen3_5Attention
 from .gdn import Qwen3_5GatedDeltaNet
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
+from .mtp import Qwen3_5MTPHead
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -108,11 +109,34 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        if config.mtp_draft:
+            self.mtp = Qwen3_5MTPHead(config)
+        self._decode_hidden: dict[int, torch.Tensor] | None = {} if config.mtp_draft else None
+        self._mtp_skip_projection = config.mtp_skip_projection
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
+        batch = get_global_ctx().batch
+        output = self.model.forward(batch.input_ids)
+        if self._decode_hidden is not None and batch.is_decode:
+            # Keyed by row count: each captured graph size owns its own buffer, and one shared
+            # attribute would leave every replay reading whichever size was captured last.
+            self._decode_hidden[output.shape[0]] = output
         return self.lm_head.forward(output)
+
+    def decode_hidden(self, rows: int) -> torch.Tensor:
+        """Post-norm hidden of the last decode forward that ran with ``rows`` rows."""
+        return self._decode_hidden[rows]
+
+    def draft_step(
+        self, hidden: torch.Tensor, next_ids: torch.Tensor, positions: torch.Tensor, slots: torch.Tensor
+    ) -> None:
+        if self._mtp_skip_projection:
+            self.mtp.draft_probe(hidden, next_ids, positions, slots, self.model.embed_tokens)
+            return
+        self.mtp.draft_and_score(
+            hidden, next_ids, positions, slots, self.model.embed_tokens, self.lm_head
+        )
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):

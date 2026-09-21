@@ -35,6 +35,7 @@ class SchedulerStatusReporter:
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
         moe_stats: dict | None = None,
+        mtp: tuple[int, int, float, float] | None = None,
     ) -> None:
         if batch.is_prefill:
             self._report_prefill(
@@ -57,6 +58,7 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
                 moe_stats=moe_stats,
+                mtp=mtp,
             )
 
     def _report_prefill(
@@ -105,6 +107,7 @@ class SchedulerStatusReporter:
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
         moe_stats: dict | None = None,
+        mtp: tuple[int, int, float, float] | None = None,
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs)
@@ -116,6 +119,7 @@ class SchedulerStatusReporter:
         self._last_decode_time = now
         gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
         self._decode_generated_tokens = 0
+        mtp_now = mtp() if callable(mtp) else mtp
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -124,6 +128,7 @@ class SchedulerStatusReporter:
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
             f"{_moe_msg(moe_stats)}"
+            f"{_mtp_msg(mtp_now)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
@@ -140,6 +145,16 @@ def _moe_msg(moe_stats: dict | None) -> str:
     w = moe_stats.get("window") or moe_stats
     return (
         f"moe hit: {w['hit_rate']:.2f} (pcie {w['pcie_share']:.2f}, cpu {w['cpu_share']:.2f}), "
+    )
+
+
+def _mtp_msg(mtp: tuple[int, int, float, float] | None) -> str:
+    """Draft acceptance, engine-thread cost and GPU time per draft (--mtp-draft); empty when off."""
+    if not mtp or not mtp[1]:
+        return ""
+    return (
+        f"mtp accept: {mtp[0] / mtp[1]:.3f} ({mtp[0]}/{mtp[1]}, "
+        f"cpu {mtp[2]:.0f} us, gpu {mtp[3]:.2f} ms), "
     )
 
 

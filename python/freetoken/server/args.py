@@ -586,6 +586,35 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--mtp-draft",
+        action="store_true",
+        default=ServerArgs.mtp_draft,
+        help=(
+            "Build the checkpoint's multi-token-prediction head and draft one token per decode "
+            "step, reporting how often the draft matched what the model then sampled. The draft "
+            "is not served; checkpoints without a head ignore the flag."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-window",
+        type=int,
+        default=ServerArgs.mtp_window,
+        help=(
+            "Attention history the draft head keeps per request, in tokens. A bounded ring "
+            "replaces a KV-cache layer for the head."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-skip-projection",
+        action="store_true",
+        default=ServerArgs.mtp_skip_projection,
+        help=(
+            "Diagnostic: run the draft head without its vocabulary projection, so the projection's "
+            "cost against a memory-bound decode step can be read off the throughput. Acceptance "
+            "reported under this flag is meaningless."
+        ),
+    )
+    parser.add_argument(
         "--embed-table-host",
         action="store_true",
         default=ServerArgs.embed_table_host,
