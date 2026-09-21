@@ -73,6 +73,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--kv-cache-dtype` | auto | Paged KV storage dtype: `auto` follows `--dtype`; `fp8_e4m3` stores K/V as float8_e4m3fn with a static scale of 1.0 (half the bytes per token; MHA/GQA models on the `fi` backend) |
 | `--kv-cache-scales` | none | JSON with per-layer fp8 KV dequant scales (`{"format": "freetoken-kv-scales-v1", "layers": {"<id>": {"k": s, "v": s}}}`) from a calibration pass; requires `--kv-cache-dtype fp8_e4m3` |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
+| `--linear-state-cache-ratio` | 2.0 | Hybrid GDN models: cross-request GDN snapshot cache slots as a multiple of `--max-running-requests` (floor 4); each slot pins one resumable cached prefix |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 
 ### MoE offload

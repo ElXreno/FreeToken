@@ -459,6 +459,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help="Hybrid GDN models: cross-request GDN snapshot cache slots as a multiple of "
+        "--max-running-requests (floor 4). Each slot pins one resumable cached prefix; interleaved "
+        "conversations (agent + subagents + classifiers) need more than the default.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,
