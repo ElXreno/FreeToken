@@ -636,6 +636,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mixed-batch-decode",
+        action="store_true",
+        default=ServerArgs.mixed_batch_decode,
+        help=(
+            "Carry running decodes inside each prefill chunk as one-token extends, so a chunk "
+            "no longer costs them a whole step of dead time. Composes with "
+            "--decode-steps-per-prefill-chunk."
+        ),
+    )
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,

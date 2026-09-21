@@ -114,6 +114,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+| `--mixed-batch-decode` | off | Running decodes ride each prefill chunk as one-token extends; composes with `--decode-steps-per-prefill-chunk` |
 
 ### Image input
 
