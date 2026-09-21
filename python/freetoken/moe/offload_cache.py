@@ -265,7 +265,6 @@ class OffloadMoeCache:
         # state as evict_slots/src_indices/num_indices).
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
-        self._fetch_event: torch.cuda.Event | None = None
         self._pending_whole_layer = False
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
@@ -1024,33 +1023,6 @@ class OffloadMoeCache:
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
         }
-
-    def fresh_route_mask(self, slots: torch.Tensor) -> torch.Tensor:
-        """Which routes point at a slot this step is still fetching, so they cannot be computed yet.
-
-        Entries of ``evict_slots`` past ``num_indices`` hold the previous step's victims, so the
-        position guard is what keeps a stale slot from masking a perfectly valid hit.
-        """
-        pos = torch.arange(self.evict_slots.numel(), device=slots.device)
-        live = pos < self.num_indices.reshape(())
-        hit = slots.unsqueeze(-1) == self.evict_slots.reshape(1, 1, -1).to(slots.dtype)
-        return (hit & live.reshape(1, 1, -1)).any(-1)
-
-    def copy_missing_overlapped(self, side: torch.cuda.Stream) -> torch.cuda.Event:
-        """Run the PCIe fetch on ``side`` so cache-hit routes can be computed against it.
-
-        The fetch saturates the link at 12.5 GB/s and leaves the GPU idle for its duration, while
-        the hits of the same layer are ready to run. Victims never collide with this step's hit
-        slots (the routed path already depends on that), so the two do not alias.
-        """
-        if self._fetch_event is None:
-            self._fetch_event = torch.cuda.Event()
-        main = torch.cuda.current_stream()
-        side.wait_stream(main)
-        with torch.cuda.stream(side):
-            self.copy_missing()
-        self._fetch_event.record(side)
-        return self._fetch_event
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
