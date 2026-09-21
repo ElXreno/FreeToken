@@ -576,6 +576,24 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--embed-table-host",
+        action="store_true",
+        default=ServerArgs.embed_table_host,
+        help=(
+            "Keep the input embedding table in pinned host memory and gather its rows over "
+            "UVA; its VRAM goes to the KV and expert caches instead. Single rank only."
+        ),
+    )
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Count expert-cache hits, PCIe fetches and CPU-computed misses per decode step "
+            "(offload/hybrid MoE); reported in the decode log line and /v1/stats moe_cache."
+        ),
+    )
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,

@@ -413,6 +413,13 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        embed_freed = self._move_embedding_to_host(config)
+        if embed_freed:
+            # those bytes are no longer resident weights: the pool budget is derived from
+            # (baseline_free - weights_bytes), so hand them to the caches explicitly
+            self._weights_bytes -= embed_freed
+            self._post_weights_free += embed_freed
+            self._host_tables_bytes += embed_freed
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -763,6 +770,7 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        cache.collect_decode_freq = config.moe_collect_stats
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -837,6 +845,44 @@ class Engine:
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+
+    def _move_embedding_to_host(self, config: EngineConfig) -> int:
+        """--embed-table-host: the input embedding table moves to pinned host memory and its
+        VRAM joins the pool budget measured right after this."""
+        if not getattr(config, "embed_table_host", False):
+            return 0
+        from freetoken.layers.base import BaseOP
+        from freetoken.layers.embedding import ParallelLMHead, VocabParallelEmbedding
+
+        tables, seen, stack = [], set(), [self.model]
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if isinstance(node, VocabParallelEmbedding):
+                # ParallelLMHead subclasses it and may carry a packed quantized weight
+                if (not isinstance(node, ParallelLMHead) and node._host_table is None
+                        and node.weight.numel() and node.weight.is_floating_point()):
+                    tables.append(node)
+                continue
+            values = node.__dict__.values() if isinstance(node, BaseOP) else node
+            for v in values:
+                if isinstance(v, BaseOP):
+                    stack.append(v)
+                elif isinstance(v, (list, tuple)):
+                    stack.extend(x for x in v if isinstance(x, BaseOP))
+        if not tables:
+            return 0
+        if config.tp_info.size > 1:
+            logger.warning_rank0("--embed-table-host is single-rank only; keeping the table in VRAM")
+            return 0
+        freed = sum(t.move_to_host() for t in tables)
+        logger.info_rank0(
+            f"input embedding table on the host: {freed / 2**20:.0f} MiB of VRAM released to the "
+            f"runtime pools, rows gathered over UVA"
+        )
+        return freed
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""

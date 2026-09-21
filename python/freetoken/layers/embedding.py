@@ -12,6 +12,54 @@ from .base import BaseOP
 from .quantization import LayerKind, QuantConfig, quant_method_for
 
 
+class HostEmbeddingTable:
+    """Vocabulary table left in pinned host memory, rows gathered over UVA by the PLE kernel.
+
+    The table is read once per token (4 KiB at hidden 2048) against a decode step that already
+    streams ~1 GiB of weights, so PCIe cost is noise -- but it hands the whole table's VRAM to
+    the MoE expert cache. One staging buffer per captured decode size (a captured graph writes
+    the same block on every replay), one growable buffer for eager calls."""
+
+    def __init__(self, weight: torch.Tensor, device: torch.device) -> None:
+        from freetoken.kernel.pinned import device_ptr
+        from freetoken.moe.host_banks import HostBank
+
+        assert weight.dtype in (torch.bfloat16, torch.float16, torch.float32), weight.dtype
+        self.num_rows, self.embed_dim = weight.shape
+        self.dtype = weight.dtype
+        self.device = device
+        self._bank = HostBank(tuple(weight.shape), weight.dtype)
+        self._bank.tensor.copy_(weight.to("cpu", non_blocking=False))
+        self._bank.pin()
+        self._table_ptr = device_ptr(self._bank.tensor)
+        self.nbytes = self._bank.nbytes
+        self._staging: torch.Tensor | None = None
+        self._graph_staging: Dict[int, torch.Tensor] = {}
+
+    def _stage(self, rows: int) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            buf = self._graph_staging.get(rows)
+            if buf is None:
+                buf = torch.empty((rows, self.embed_dim), dtype=self.dtype, device=self.device)
+                self._graph_staging[rows] = buf
+            return buf
+        buf = self._staging
+        if buf is None or buf.shape[0] < rows:
+            buf = torch.empty((rows, self.embed_dim), dtype=self.dtype, device=self.device)
+            self._staging = buf
+        return buf[:rows]
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows
+
+        flat = indices.reshape(-1)
+        out = ple_gather_rows(
+            self._table_ptr, self.num_rows, self.embed_dim, flat,
+            self._stage(flat.numel()), 1.0, False,
+        )
+        return out.view(*indices.shape, self.embed_dim)
+
+
 class VocabParallelEmbedding(BaseOP):
     def __init__(
         self,
@@ -36,16 +84,29 @@ class VocabParallelEmbedding(BaseOP):
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
         self._comm = DistributedCommunicator()
+        self._host_table: HostEmbeddingTable | None = None
+
+    def move_to_host(self) -> int:
+        """Hand the table's VRAM to the runtime pools; returns the pinned host bytes taken."""
+        assert self.tp_size == 1, "host embedding table is single-rank only"
+        table = HostEmbeddingTable(self.weight, self.weight.device)
+        self._host_table = table
+        self.weight = torch.empty(0, dtype=table.dtype, device=table.device)
+        torch.cuda.empty_cache()
+        return table.nbytes
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel import indexing
 
-        y = indexing(
-            weights=self.weight,
-            indices=x,
-            vocab_range=self.vocab_range if self.tp_size > 1 else None,
-        )
+        if self._host_table is not None:
+            y = self._host_table.lookup(x)
+        else:
+            y = indexing(
+                weights=self.weight,
+                indices=x,
+                vocab_range=self.vocab_range if self.tp_size > 1 else None,
+            )
 
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
