@@ -48,6 +48,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Expert-cache counters (--moe-collect-stats), refreshed every decode log interval.
+    moe_cache: dict | None = None
 
 
 @dataclass

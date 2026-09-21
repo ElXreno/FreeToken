@@ -172,6 +172,9 @@ class Scheduler(SchedulerIOMixin):
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
         )
+        self._moe_stats_last: dict | None = None
+        self._moe_stats_base: tuple[int, int, int, int] | None = None
+        self._moe_stats_count = 0
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -448,6 +451,7 @@ class Scheduler(SchedulerIOMixin):
         used, total = self._kv_usage_pages()
         mamba_slots = self._mamba_slot_usage()
         swa_tokens = self._swa_token_usage()
+        moe_stats = self._moe_cache_stats(batch)
         if reply:
             mem = self._gpu_mem_bytes()
             mamba_used, mamba_total = mamba_slots or (0, 0)
@@ -460,6 +464,7 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                m.moe_cache = moe_stats
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -469,6 +474,7 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            moe_stats=moe_stats,
         )
         self.send_result(reply)
 
@@ -528,6 +534,62 @@ class Scheduler(SchedulerIOMixin):
         if self.device.type != "cuda":
             return 0
         return torch.cuda.memory_reserved(self.device)
+
+    def _moe_cache_stats(self, batch: Batch) -> dict | None:
+        """Expert-cache counters, re-read from the device once per decode log interval
+        (--moe-collect-stats): cumulative rates plus the last window's hit / PCIe / CPU split."""
+        cache = self.engine.moe_offload_cache
+        if cache is None or not cache.collect_stats:
+            return None
+        if not batch.is_decode:
+            return self._moe_stats_last
+        self._moe_stats_count += 1
+        if self._moe_stats_count % self.status_reporter.decode_log_interval != 0:
+            return self._moe_stats_last
+        s = cache.decode_miss_stats()
+        calls = int(s["layer_calls"])
+        cur = (
+            calls,
+            round(s["active_per_layer"] * calls),
+            round(s["missing_per_layer"] * calls),
+            round(s["fetched_per_layer"] * calls),
+        )
+        base = self._moe_stats_base
+        if base is None or base[0] > cur[0]:
+            base = (0, 0, 0, 0)
+        d_calls, d_active, d_missing, d_fetched = (c - b for c, b in zip(cur, base))
+        self._moe_stats_base = cur
+
+        def rate(n: float, d: float) -> float:
+            return round(n / d, 4) if d else 0.0
+
+        self._moe_stats_last = {
+            "hit_rate": rate(cur[1] - cur[2], cur[1]),
+            "pcie_share": rate(cur[3], cur[1]),
+            "cpu_share": rate(cur[2] - cur[3], cur[1]),
+            "active_per_layer": round(s["active_per_layer"], 2),
+            "layer_calls": calls,
+            "window": {
+                "hit_rate": rate(d_active - d_missing, d_active),
+                "pcie_share": rate(d_fetched, d_active),
+                "cpu_share": rate(d_missing - d_fetched, d_active),
+                "layer_calls": d_calls,
+            },
+            "cache_size": cache.cache_size,
+            "num_experts": cache.num_experts,
+            "num_layers": cache.num_layers,
+            "prefill_hit_rows": s["prefill_hit_rows"],
+            "prefill_rows": s["prefill_rows"],
+        }
+        if cache.collect_decode_freq:
+            step = max(1, cache.num_layers * 8)
+            sizes = [cache.cache_size + k * step for k in range(5)]
+            self._moe_stats_last["oracle_hit"] = cache.oracle_hit_at(sizes)
+            self._moe_stats_last["routing"] = {
+                k: (round(v, 4) if isinstance(v, float) else v)
+                for k, v in cache.decode_routing_stats().items()
+            }
+        return self._moe_stats_last
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):

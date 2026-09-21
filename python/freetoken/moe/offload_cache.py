@@ -976,6 +976,22 @@ class OffloadMoeCache:
             })
         return {"per_layer": per_layer}
 
+    def oracle_hit_at(self, cache_sizes: list[int]) -> dict[str, float]:
+        """Best per-layer LRU hit rate on the observed routing histogram for each total
+        slot count in ``cache_sizes`` (slots split evenly over the MoE layers)."""
+        freq = self.decode_freq.float()
+        total = freq.sum(dim=1)
+        valid = total > 0
+        if int(valid.sum()) == 0:
+            return {}
+        sorted_f, _ = torch.sort(freq, dim=1, descending=True)
+        cdf = torch.cumsum(sorted_f, dim=1) / total.clamp(min=1).unsqueeze(1)
+        out: dict[str, float] = {}
+        for n in cache_sizes:
+            c = min(self.num_experts, max(1, round(n / self.num_layers)))
+            out[str(n)] = round(cdf[:, c - 1][valid].mean().item(), 4)
+        return out
+
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
