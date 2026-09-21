@@ -47,9 +47,10 @@ _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8
 
 
 def _rename(raw_name: str) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith("mtp."):
-        return None
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ``mtp.*`` passes through for the draft head and ``load_weight`` drops it when the head is
+    off; its routed experts are skipped by ``_EXPERT_RE`` like any other per-expert tensor."""
     # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
@@ -229,8 +230,9 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_vision: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield the dense weights fused to the model's buffers, and with ``include_moe_experts`` the bf16 stacked experts as stored.
+    """Yield the dense weights fused to the model's buffers, and with ``include_moe_experts`` the bf16 stacked experts as stored; the MTP head's only with ``include_mtp``.
 
     Block-fp8 and NVFP4 experts always come from the expert-bank reader.
     """
@@ -241,10 +243,14 @@ def iter_weights(
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
+        yield from _iter_shards(
+            model_path, device, reader, stacked=stacked, include_vision=include_vision, include_mtp=include_mtp
+        )
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
+def _iter_shards(
+    model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool, include_mtp: bool
+):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
@@ -252,6 +258,8 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                 if name is None or _EXPERT_RE.search(name):
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
+                    continue
+                if not include_mtp and name.startswith("mtp."):
                     continue
                 if _STACKED_EXPERT_RE.match(name):
                     if stacked:
