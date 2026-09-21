@@ -127,6 +127,7 @@ Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+| `--mixed-batch-decode` | off | Running decodes ride each prefill chunk as one-token extends; composes with `--decode-steps-per-prefill-chunk` |
 
 With `--enable-timings-report` every chat completion, completion and Responses response
 also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
