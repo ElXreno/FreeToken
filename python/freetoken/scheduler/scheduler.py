@@ -141,6 +141,7 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._decode_credit = 0
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
@@ -868,11 +869,18 @@ class Scheduler(SchedulerIOMixin):
             )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        batch = None
+        quota = self.config.decode_steps_per_prefill_chunk
+        if quota > 0 and self._decode_credit > 0 and self.decode_manager.runnable:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                self._decode_credit -= 1
+        if batch is None:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None:
+                self._decode_credit = -(-quota * batch.log_new_tokens // self.prefill_budget)
+            else:
+                batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

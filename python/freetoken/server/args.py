@@ -468,6 +468,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--decode-steps-per-prefill-chunk",
+        type=int,
+        default=ServerArgs.decode_steps_per_prefill_chunk,
+        help="Decode steps the scheduler runs between two prefill chunks when running requests "
+        "are decoding while another request's prompt is still being prefilled. 0 (default) keeps "
+        "strict prefill priority, where a long prompt stalls every running decode until its prefill "
+        "ends; N lets running requests advance N tokens per chunk at the cost of a slower prefill.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,

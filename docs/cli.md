@@ -74,6 +74,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--kv-cache-scales` | none | JSON with per-layer fp8 KV dequant scales (`{"format": "freetoken-kv-scales-v1", "layers": {"<id>": {"k": s, "v": s}}}`) from a calibration pass; requires `--kv-cache-dtype fp8_e4m3` |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--linear-state-cache-ratio` | 2.0 | Hybrid GDN models: cross-request GDN snapshot cache slots as a multiple of `--max-running-requests` (floor 4); each slot pins one resumable cached prefix |
+| `--decode-steps-per-prefill-chunk` | 0 | Decode steps run between two prefill chunks while other requests are decoding; 0 = strict prefill priority (a long prompt stalls running decodes until its prefill ends) |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 
 ### MoE offload

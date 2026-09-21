@@ -77,6 +77,9 @@ class EngineConfig:
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
     linear_state_cache_ratio: float = 2.0
+    # Decode steps the scheduler runs between two prefill chunks while both kinds of work are
+    # pending; 0 keeps strict prefill priority (a long chunked prefill stalls every running decode).
+    decode_steps_per_prefill_chunk: int = 0
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
