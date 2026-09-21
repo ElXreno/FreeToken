@@ -546,7 +546,7 @@ class CacheRebuildRequest(BaseModel):
     # Only "if_idle" (reject unless the scheduler is idle) is supported today. "drain" mode
     # is deferred (needs the drain-gate machinery); constraining the Literal makes an
     # unsupported value fail fast with a 422 at the API layer instead of a generic 503.
-    mode: Literal["if_idle"] = "if_idle"
+    mode: Literal["if_idle", "save"] = "if_idle"
     timeout: float = 300.0
 
 
@@ -708,6 +708,21 @@ async def cache_flush(timeout: float = Query(0.0, ge=0.0)):
         body["error"] = reply.error
     status_code = {"ok": 200, "timeout": 504}.get(reply.status, 503)
     return JSONResponse(body, status_code=status_code)
+
+
+@app.post("/v1/cache/save")
+async def cache_save():
+    """Flush the prefix cache host tier's tree metadata now (--prefix-cache-dir); the arena
+    itself is written through on every commit."""
+    state = get_global_state()
+    if state.maintenance_state != "serving":
+        return JSONResponse(
+            {"status": "busy", "error": f"server is {state.maintenance_state}"}, status_code=409
+        )
+    result = await dispatch_rebuild(state, moe_cache_size=None, num_pages=None, mode="save", timeout=120.0)
+    if result["status"] == "timeout":
+        return JSONResponse(result, status_code=504)
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
 
 
 def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -> dict:
