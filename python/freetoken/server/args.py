@@ -605,6 +605,18 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--mtp-routed-experts",
+        type=int,
+        dest="mtp_top_k",
+        default=ServerArgs.mtp_top_k,
+        help=(
+            "Routed experts the draft head takes per draft: 0 leaves it with its shared "
+            "expert alone and claims no cache slots, -1 (default) follows the model's router "
+            "width. The head's experts are quantized to NVFP4 at load and ride the offload "
+            "cache as one more bank layer."
+        ),
+    )
+    parser.add_argument(
         "--mtp-skip-projection",
         action="store_true",
         default=ServerArgs.mtp_skip_projection,

@@ -5,6 +5,8 @@ The dense pass reads every Linear module under the scheme the checkpoint's Quant
 
 from __future__ import annotations
 
+import itertools
+import os
 import re
 from typing import Iterator
 
@@ -34,6 +36,12 @@ _EXPERT_KEY_RE = (
 )
 # role -> the expert bank reader's canonical (ModelOpt) tensor kind
 _BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
+# the draft head's own routed experts, which ModelOpt left in bf16 (exclude_modules: ["mtp*"])
+_MTP_EXPERT_KEY_RE = re.compile(
+    r"^mtp\.layers\.\d+\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
+_MTP_PROJ_ROLE = {"gate_proj": "gate", "up_proj": "up", "down_proj": "down"}
 
 # Gemma-style (1+weight) RMSNorm weights; the GDN gated norm (linear_attn.norm) is a plain weight*x norm
 _GEMMA_NORM_SUFFIXES = (
@@ -386,7 +394,27 @@ def _moe_dims(model_config):
 
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
-    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
+    ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them.
+
+    NVFP4 is taken over only when the draft head routes experts of its own: the model's come
+    from the shared reader as always, the head's are quantized here onto the last bank layer.
+    Other expert kinds use the generic readers."""
+    if kind is QuantKind.NVFP4:
+        if not config.num_mtp_moe_layers:
+            return None
+        from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+
+        return itertools.chain(
+            iter_nvfp4_expert_pieces(
+                model_path,
+                _ModelLayersOnly(config),
+                nvfp4_expert_spec(model_path, config),
+                parallel=bool(parallel),
+                workers=workers,
+                chunk=chunk,
+            ),
+            _mtp_expert_pieces(model_path, config),
+        )
     if kind is not QuantKind.FP8_BLOCK:
         return None
     if get_tp_info().size > 1:
@@ -430,6 +458,93 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
             reader.close()
 
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+
+
+# e2m1 magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6; bucketize against the midpoints yields the
+# code directly, and values past the last one saturate at 6 the way the cast does.
+_E2M1_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+_E2M1_MAX = 6.0
+_E4M3_MAX = 448.0
+_TINY = torch.finfo(torch.float32).tiny
+
+
+def _quantize_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``[N, K]`` -> ModelOpt NVFP4: e2m1 codes packed two per byte ``[N, K // 2]``, one e4m3
+    scale per 16 inputs ``[N, K // 16]``, one fp16 per-tensor global.
+
+    ModelOpt skipped the draft head (``exclude_modules: ["mtp*"]``), so its experts ship bf16
+    at 6 MiB each. Quantizing them here lets them share the offload cache's banks with the
+    model's own experts instead of needing a second format.
+    """
+    rows, k = weight.shape
+    if k % 16:
+        raise ValueError(f"NVFP4 needs an input dim divisible by 16, got {k}")
+    blocks = weight.float().reshape(rows, k // 16, 16)
+    # ModelOpt convention: value = e2m1 * block_scale * global, global = amax / (448 * 6)
+    glob = (blocks.abs().amax() / (_E4M3_MAX * _E2M1_MAX)).clamp(min=_TINY)
+    scale = (blocks.abs().amax(-1) / _E2M1_MAX / glob).to(torch.float8_e4m3fn)
+    step = (scale.float() * glob).clamp(min=_TINY)
+    q = blocks / step[..., None]
+    codes = torch.bucketize(q.abs(), _E2M1_MIDPOINTS).to(torch.uint8)
+    codes = (codes | (q.signbit().to(torch.uint8) << 3)).reshape(rows, k)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed.contiguous(), scale, glob.to(torch.float16)
+
+
+def _mtp_expert_pieces(model_path: str, config):
+    """One piece per draft-head expert, quantized on the way in, on the head's bank layer."""
+    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.utils.hf import download_hf_weight
+
+    bank_layer = config.mtp_bank_layer
+    folder = download_hf_weight(model_path)
+    weight_map = safetensors_weight_map(folder)
+    wanted: dict[str, tuple[int, str]] = {}
+    for name in weight_map:
+        match = _MTP_EXPERT_KEY_RE.match(name)
+        if match is not None:
+            wanted[name] = (int(match.group("expert")), _MTP_PROJ_ROLE[match.group("proj")])
+    expected = config.num_experts * len(_MTP_PROJ_ROLE)
+    if len(wanted) != expected:
+        raise ValueError(
+            f"draft head: found {len(wanted)} routed-expert tensors, expected {expected}; "
+            "the head has no experts of its own, run with --mtp-routed-experts 0"
+        )
+    by_shard: dict[str, list[str]] = {}
+    for name in wanted:
+        by_shard.setdefault(weight_map[name], []).append(name)
+
+    pending: dict[int, dict[str, torch.Tensor]] = {}
+    desc = "Loading draft-head NVFP4 experts"
+    for shard in tqdm(sorted(by_shard), desc=desc, disable=not get_tp_info().is_primary()):
+        with safetensors.safe_open(os.path.join(folder, shard), framework="pt", device="cpu") as f:
+            for name in by_shard[shard]:
+                expert, role = wanted[name]
+                packed, scale, glob = _quantize_nvfp4(f.get_tensor(name))
+                piece = pending.setdefault(expert, {})
+                piece[role] = packed.unsqueeze(0)
+                piece[f"{role}_scale"] = scale.unsqueeze(0)
+                piece[f"{role}_global"] = glob.reshape(1, -1)
+                if len(piece) == 3 * len(_MTP_PROJ_ROLE):
+                    del pending[expert]
+                    yield bank_layer, expert, expert + 1, piece
+    if pending:
+        raise ValueError(f"draft head: incomplete expert tensors for {sorted(pending)[:8]}")
+
+
+class _ModelLayersOnly:
+    """``config`` view whose ``num_moe_layers`` counts the model's layers alone.
+
+    The draft head's experts are read separately (they are quantized on the way in), so the
+    shared NVFP4 reader must neither expect them in its tensor count nor admit its bank layer.
+    """
+
+    def __init__(self, config) -> None:
+        self._config = config
+        self.num_moe_layers = config.num_layers - config.first_k_dense_replace
+
+    def __getattr__(self, name: str):
+        return getattr(self._config, name)
 
 
 def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:

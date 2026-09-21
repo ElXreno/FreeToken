@@ -18,6 +18,23 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _resolve_mtp_top_k(requested: int, model_config: ModelConfig) -> int:
+    """Router width of the draft head's MoE: 0 (shared expert only) or the model's own.
+
+    The CPU MoE executor is built once, from the first MoE layer, and its pinned routing
+    buffers are ``[batch, top_k]``; a head routing narrower than the model would not fit them.
+    """
+    width = model_config.num_experts_per_tok
+    if requested < 0 or requested == width:
+        return width
+    if requested == 0:
+        return 0
+    raise ValueError(
+        f"--mtp-routed-experts must be 0 or the model's router width {width}, got {requested}: "
+        "the CPU MoE executor allocates one routing buffer for every layer"
+    )
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
@@ -57,6 +74,8 @@ class EngineConfig:
     # Build the checkpoint's MTP head and draft one token per decode step; no-op without a head.
     mtp_draft: bool = False
     mtp_window: int = 512
+    # routed experts the head takes per draft; 0 keeps only its shared expert, -1 follows the model
+    mtp_top_k: int = -1
     mtp_skip_projection: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
@@ -165,6 +184,7 @@ class EngineConfig:
             quant=quant,
             mtp_draft=self.mtp_draft and model_config.mtp_num_layers > 0,
             mtp_window=self.mtp_window,
+            mtp_top_k=_resolve_mtp_top_k(self.mtp_top_k, model_config),
             mtp_skip_projection=self.mtp_skip_projection,
         )
 

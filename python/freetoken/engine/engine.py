@@ -684,7 +684,14 @@ class Engine:
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
-        cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
+        # the draft head's bank layer is resolved over the model's layers alone, so enabling
+        # the head cannot shift which of them decode on the CPU
+        cpu_layer_ids = _resolve_cpu_layers(
+            config,
+            num_moe_layers - config.model_config.num_mtp_moe_layers,
+            reserved=self._host_tables_bytes,
+            method=method,
+        )
         _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target

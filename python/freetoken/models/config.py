@@ -364,7 +364,19 @@ class ModelConfig:
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+        A routing draft head adds its own block as the last bank layer.
         """
+        return self.num_layers - self.first_k_dense_replace + self.num_mtp_moe_layers
+
+    @property
+    def num_mtp_moe_layers(self) -> int:
+        """1 when the draft head routes experts of its own, else 0."""
+        return 1 if self.mtp_draft and self.mtp_top_k > 0 else 0
+
+    @property
+    def mtp_bank_layer(self) -> int:
+        """Bank layer holding the draft head's experts; valid only when it routes."""
+        assert self.num_mtp_moe_layers, "the draft head routes no experts"
         return self.num_layers - self.first_k_dense_replace
 
     @property

@@ -10,6 +10,7 @@ from freetoken.layers import (
     LinearColParallelMerged,
     LinearReplicated,
     OPList,
+    make_moe_layer,
     silu_and_mul,
 )
 from freetoken.layers.rotary import get_rope
@@ -26,24 +27,58 @@ class _SkipProjection:
         return x[:, :8]
 
 
-class _MTPMlp(BaseOP):
-    """The head's MoE block with the routed experts left out.
+class _HeadExpertQuant:
+    """Quant config view binding the head's experts to the model's routed-expert scheme.
 
-    The checkpoint ships them unquantized (1536 MiB for 256 experts), which does not fit in
-    VRAM beside the main expert cache, and serving them from the host costs more draft latency
-    than their acceptance is worth. ``gate`` is loaded so the state dict stays complete and a
-    routed path can be switched on without touching the loader.
+    ModelOpt excluded the head, so the checkpoint calls its experts bf16; the loader quantizes
+    them to NVFP4 to share the offload cache's banks, and the layer has to bind the method that
+    reads those banks. Only the scheme lookup is redirected -- the layer keeps its own prefix.
+    """
+
+    def __init__(self, quant, model_experts_prefix: str) -> None:
+        self._quant = quant
+        self._prefix = model_experts_prefix
+
+    def get_quant_method(self, layer, prefix: str):
+        return self._quant.get_quant_method(layer, self._prefix)
+
+
+class _MTPMlp(BaseOP):
+    """The head's MoE block: ``mtp_top_k`` routed experts plus the shared one.
+
+    The checkpoint ships the head unquantized (``exclude_modules: ["mtp*"]``, 1536 MiB for
+    256 experts), so the loader quantizes its experts to NVFP4 and they ride the offload
+    cache's banks as one extra bank layer. ``mtp_top_k == 0`` drops them and keeps only the
+    shared expert, which costs 0.14 acceptance; ``gate`` is loaded either way so the state
+    dict stays complete.
     """
 
     def __init__(self, config: ModelConfig, *, prefix: str = ""):
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        self.experts = (
+            make_moe_layer(
+                config,
+                layer_id=config.mtp_bank_layer,
+                top_k=config.mtp_top_k,
+                renormalize=config.norm_topk_prob,
+                quant_config=_HeadExpertQuant(config.quant, "model.layers.0.mlp.experts"),
+                prefix=f"{prefix}.experts",
+            )
+            if config.num_mtp_moe_layers
+            else None
+        )
         self.shared_expert = _MTPSharedExpert(
             config, config.shared_expert_intermediate_size, prefix=f"{prefix}.shared_expert"
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.shared_expert.forward(x) * torch.sigmoid(self.shared_expert_gate.forward(x))
+        # router and shared branch first: the fused expert kernel may write into ``x``
+        router_logits = None if self.experts is None else self.gate.forward(x)
+        shared = self.shared_expert.forward(x) * torch.sigmoid(self.shared_expert_gate.forward(x))
+        if self.experts is None:
+            return shared
+        return self.experts.forward(hidden_states=x, router_logits=router_logits) + shared
 
 
 class _MTPSharedExpert(BaseOP):
