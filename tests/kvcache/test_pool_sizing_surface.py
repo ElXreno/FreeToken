@@ -78,6 +78,53 @@ def test_generic_kv_cost_and_solve_parity():
     assert MHAKVCache.min_kv_tokens(config) == config.page_size
 
 
+def test_generic_kv_cost_honors_kv_cache_dtype():
+    from freetoken.kvcache.base import kv_cache_dtype, spec_kv_bytes_per_token
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = _generic_config()
+    (spec,) = config.model_config.kv_cache_group_specs()
+    per_token = spec_kv_bytes_per_token(spec, config)
+    # absent or None -> the compute dtype prices the slab
+    assert kv_cache_dtype(config) is config.dtype
+    config.kv_cache_dtype = None
+    assert spec_kv_bytes_per_token(spec, config) == per_token
+    # a 1-byte slab dtype halves the uniform-slab price, and the family's cost with it
+    config.kv_cache_dtype = SimpleNamespace(itemsize=1)
+    assert spec_kv_bytes_per_token(spec, config) == per_token // 2
+    assert MHAKVCache.kv_cost(config) == (per_token // 2 * config.page_size, 0, config.page_size, 0)
+
+
+def test_mha_pool_kv_scales_cover_paged_layers(tmp_path):
+    import json
+
+    import torch
+
+    from freetoken.kvcache.base import load_kv_cache_scales
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    pool = MHAKVCache(
+        num_kv_heads=2, num_layers=4, head_dim=8, num_pages=2, page_size=1,
+        dtype=torch.bfloat16, device=torch.device("cpu"), layer_ids=(1, 3),
+    )
+    assert pool.kv_scales(1) is None
+    with pytest.raises(ValueError, match=r"missing \[3\]"):
+        pool.set_kv_scales({1: (0.5, 0.25)})
+    with pytest.raises(ValueError, match=r"unexpected \[0\]"):
+        pool.set_kv_scales({0: (1.0, 1.0), 1: (0.5, 0.25), 3: (2.0, 4.0)})
+    path = tmp_path / "scales.json"
+    path.write_text(json.dumps({
+        "format": "freetoken-kv-scales-v1",
+        "layers": {"1": {"k": 0.5, "v": 0.25}, "3": {"k": 2, "v": 4}},
+    }))
+    pool.set_kv_scales(load_kv_cache_scales(str(path)))
+    assert pool.kv_scales(3) == (2.0, 4.0)
+    assert pool.kv_scales(0) is None
+    path.write_text(json.dumps({"format": "other", "layers": {}}))
+    with pytest.raises(ValueError, match="expected format"):
+        load_kv_cache_scales(str(path))
+
+
 def _dsv4_config(num_page_override=None):
     from freetoken.models.deepseek_v4.args import DeepseekV4Args
 
