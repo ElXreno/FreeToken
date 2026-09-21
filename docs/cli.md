@@ -70,6 +70,8 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
+| `--kv-cache-dtype` | auto | Paged KV storage dtype: `auto` follows `--dtype`; `fp8_e4m3` stores K/V as float8_e4m3fn with a static scale of 1.0 (half the bytes per token; MHA/GQA models on the `fi` backend) |
+| `--kv-cache-scales` | none | JSON with per-layer fp8 KV dequant scales (`{"format": "freetoken-kv-scales-v1", "layers": {"<id>": {"k": s, "v": s}}}`) from a calibration pass; requires `--kv-cache-dtype fp8_e4m3` |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 

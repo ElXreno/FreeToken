@@ -29,7 +29,7 @@ from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
-from freetoken.kvcache.base import CacheRebuildRejected
+from freetoken.kvcache.base import CacheRebuildRejected, kv_cache_dtype, load_kv_cache_scales
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
@@ -155,6 +155,34 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         "No attention backend can serve attention types "
         f"{sorted(t.value for t in required)} on this machine."
     )
+
+
+def _validate_kv_cache_dtype(config, override) -> None:
+    """Config-time gate for a paged-KV slab dtype narrower than the compute dtype
+    (--kv-cache-dtype fp8_e4m3). Only MHAKVCache allocates the slab in that dtype and only
+    the fi backend reads it (flashinfer's fa2 kernels dequantize KV-only fp8 in-kernel);
+    the other pool families price and allocate their tiers at 2 bytes/token and the other
+    backends never look at the slab dtype, so reject both before the weights are resident."""
+    kv_dtype = getattr(config, "kv_cache_dtype", None)
+    if getattr(config, "kv_cache_scales", None) is not None and kv_dtype is None:
+        raise ValueError("--kv-cache-scales applies to a narrow KV slab only; pass --kv-cache-dtype fp8_e4m3")
+    if kv_dtype is None or kv_dtype == getattr(config, "dtype", None):
+        return
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    if resolve_pool_class(config.model_config) is not MHAKVCache:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_dtype}: only the uniform MHA/GQA paged pool stores a "
+            "narrower KV slab; this model's attention needs another pool family."
+        )
+    if config.attention_backend == "auto":
+        override("attention_backend", "fi")
+        logger.info_rank0(f"--kv-cache-dtype {kv_dtype}: attention backend fi")
+    elif config.attention_backend != "fi":
+        raise ValueError(
+            f"--kv-cache-dtype {kv_dtype} is served by the fi attention backend only, "
+            f"got --attention-backend {config.attention_backend}."
+        )
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -344,7 +372,7 @@ class Engine:
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
-        self.ctx = Context(config.page_size)
+        self.ctx = Context(config.page_size, dtype=config.dtype)
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
@@ -420,8 +448,10 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=kv_cache_dtype(config)
         )
+        if config.kv_cache_scales is not None:
+            self.kv_cache.set_kv_scales(load_kv_cache_scales(config.kv_cache_scales))
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -1552,6 +1582,7 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    _validate_kv_cache_dtype(config, override)
     if config.attention_backend == "auto":
         override(
             "attention_backend",

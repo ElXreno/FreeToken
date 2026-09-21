@@ -66,6 +66,12 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
+    # Paged KV slab dtype; None stores K/V in ``dtype``. torch.float8_e4m3fn halves the slab
+    # (MHA/GQA pool on the fi backend only; static scale 1.0, saturating cast on store).
+    kv_cache_dtype: torch.dtype | None = None
+    # JSON with per-layer fp8 KV dequant scales ({"layers": {"<id>": {"k": s, "v": s}}}) from a
+    # calibration pass: store_kv divides by them, attention folds them back. fp8 slab only.
+    kv_cache_scales: str | None = None
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as

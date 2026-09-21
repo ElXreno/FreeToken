@@ -273,6 +273,24 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp8_e4m3"],
+        help="Storage dtype of the paged KV cache. 'auto' matches --dtype; 'fp8_e4m3' stores K/V as "
+        "float8_e4m3fn with a static scale of 1.0 (half the KV bytes per token; MHA/GQA models on "
+        "the fi attention backend).",
+    )
+
+    parser.add_argument(
+        "--kv-cache-scales",
+        type=str,
+        default=None,
+        help='JSON with per-layer fp8 KV dequant scales ({"layers": {"<id>": {"k": s, "v": s}}}) from a '
+        "calibration pass; requires --kv-cache-dtype fp8_e4m3. Without it the slab uses a static scale of 1.0.",
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,
@@ -876,6 +894,7 @@ def parse_args(
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+    kwargs["kv_cache_dtype"] = {"auto": None, "fp8_e4m3": torch.float8_e4m3fn}[kwargs["kv_cache_dtype"]]
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
