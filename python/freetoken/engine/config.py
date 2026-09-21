@@ -65,6 +65,9 @@ class EngineConfig:
     # Let running decodes ride each prefill chunk as one-token extends; composes with
     # decode_steps_per_prefill_chunk (they get the rider token AND the post-chunk burst).
     mixed_batch_decode: bool = False
+    # Build the checkpoint's MTP head and draft one token per decode step; no-op without a head.
+    mtp_draft: bool = False
+    mtp_window: int = 512
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
@@ -185,7 +188,12 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        return replace(
+            model_config,
+            quant=quant,
+            mtp_draft=self.mtp_draft and model_config.mtp_num_layers > 0,
+            mtp_window=self.mtp_window,
+        )
 
     @property
     def max_seq_len(self) -> int:

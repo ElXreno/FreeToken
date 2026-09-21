@@ -19,6 +19,7 @@ from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen3_5Attention
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
+from .mtp import Qwen3_5MTPHead
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -108,6 +109,8 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        if config.mtp_draft:
+            self.mtp = Qwen3_5MTPHead(config)
         super().__init__()
 
     def forward(self) -> torch.Tensor:
