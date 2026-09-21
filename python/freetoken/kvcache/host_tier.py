@@ -1,0 +1,350 @@
+"""Host tier under the hybrid radix cache: a file-backed arena that keeps every committed KV
+span and GDN snapshot, plus the tree metadata that lets the cache survive a restart.
+
+The arena is the source of truth and VRAM is a cache over it: commits write through, VRAM
+eviction only drops the resident copy, a prefix hit promotes the missing spans back over
+PCIe. Snapshots never occupy VRAM outside a running request's own slots; a hit restores
+the matched snapshot straight into that request's live slot.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import mmap
+import os
+import time
+from collections.abc import Callable, Iterator
+from typing import Any, NamedTuple
+
+import torch
+
+FORMAT_VERSION = 1
+ALIGN = 4096
+STAGE_ROWS = 1024
+_BITS_DTYPE = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
+META_NAME = "meta.json"
+ARENA_NAME = "arena.bin"
+
+
+class HostRef(NamedTuple):
+    offset: int
+    nbytes: int
+
+
+def _round_up(n: int, a: int) -> int:
+    return (n + a - 1) // a * a
+
+
+class HostArena:
+    """First-fit extent allocator over one sparse file mapped read-write."""
+
+    def __init__(self, path: str, capacity: int, free_extents: list[tuple[int, int]] | None = None) -> None:
+        self.path = path
+        self.capacity = _round_up(capacity, ALIGN)
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        if os.fstat(self.fd).st_size < self.capacity:
+            os.ftruncate(self.fd, self.capacity)
+        self.mm = mmap.mmap(self.fd, self.capacity, access=mmap.ACCESS_WRITE)
+        if free_extents is None:
+            self.free_extents: list[list[int]] = [[0, self.capacity]]
+        else:
+            self.free_extents = sorted([list(e) for e in free_extents if e[0] < self.capacity])
+            for e in self.free_extents:
+                e[1] = min(e[1], self.capacity - e[0])
+        self.used = self.capacity - sum(size for _, size in self.free_extents)
+
+    def alloc(self, nbytes: int) -> HostRef | None:
+        need = _round_up(max(nbytes, 1), ALIGN)
+        for i, (off, size) in enumerate(self.free_extents):
+            if size >= need:
+                if size == need:
+                    del self.free_extents[i]
+                else:
+                    self.free_extents[i] = [off + need, size - need]
+                self.used += need
+                return HostRef(off, nbytes)
+        return None
+
+    def free(self, ref: HostRef) -> None:
+        off, size = ref.offset, _round_up(max(ref.nbytes, 1), ALIGN)
+        self.used -= size
+        ext = self.free_extents
+        lo, hi = 0, len(ext)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if ext[mid][0] < off:
+                lo = mid + 1
+            else:
+                hi = mid
+        ext.insert(lo, [off, size])
+        if lo + 1 < len(ext) and ext[lo][0] + ext[lo][1] == ext[lo + 1][0]:
+            ext[lo][1] += ext[lo + 1][1]
+            del ext[lo + 1]
+        if lo > 0 and ext[lo - 1][0] + ext[lo - 1][1] == ext[lo][0]:
+            ext[lo - 1][1] += ext[lo][1]
+            del ext[lo]
+
+    def view(self, ref: HostRef) -> torch.Tensor:
+        return torch.frombuffer(self.mm, dtype=torch.uint8, count=ref.nbytes, offset=ref.offset)
+
+    def write(self, ref: HostRef, src: torch.Tensor) -> None:
+        src = src.contiguous()
+        n = src.numel() * src.element_size()
+        assert n <= ref.nbytes, f"host write {n} > extent {ref.nbytes}"
+        self.view(ref)[:n].view(src.dtype).view(src.shape).copy_(src)
+
+    def read(self, ref: HostRef, dst: torch.Tensor) -> None:
+        n = dst.numel() * dst.element_size()
+        assert n <= ref.nbytes, f"host read {n} > extent {ref.nbytes}"
+        dst.copy_(self.view(ref)[:n].view(dst.dtype).view(dst.shape))
+
+    def flush(self) -> None:
+        self.mm.flush()
+        os.fsync(self.fd)
+
+    def close(self) -> None:
+        self.mm.close()
+        os.close(self.fd)
+
+
+class SnapSegment(NamedTuple):
+    name: str
+    tensor: torch.Tensor
+    offset: int
+    nbytes: int
+
+
+class HostTier:
+    """Arena-backed store for KV rows of the paged pool and whole GDN state slots."""
+
+    def __init__(
+        self,
+        directory: str,
+        capacity: int,
+        kv_pool,
+        linear_pool,
+        validity_key: dict[str, Any],
+        evict: Callable[[int], bool] | None = None,
+    ) -> None:
+        os.makedirs(directory, mode=0o750, exist_ok=True)
+        self.directory = directory
+        self.meta_path = os.path.join(directory, META_NAME)
+        self.arena_path = os.path.join(directory, ARENA_NAME)
+        self.key = validity_key
+        self.kv_pool = kv_pool
+        self.linear_pool = linear_pool
+        self.evict = evict
+        self.device = kv_pool.device
+        buf = kv_pool._kv_buffer
+        two, layers, pages, page_size, heads, head_dim = buf.shape
+        bits = _BITS_DTYPE[buf.element_size()]
+        self.kv_flat = buf.view(two, layers, pages * page_size, heads, head_dim).view(bits)
+        self.kv_row_shape = (two, layers, heads, head_dim)
+        self.row_bytes = two * layers * heads * head_dim * buf.element_size()
+        self.stage_rows = STAGE_ROWS
+        self._gather = torch.empty((two, layers, STAGE_ROWS, heads, head_dim), dtype=bits, device=self.device)
+        self._rows = torch.empty((STAGE_ROWS, two, layers, heads, head_dim), dtype=bits, device=self.device)
+        self.snap_segments: list[SnapSegment] = []
+        off = 0
+        if linear_pool is not None:
+            for name, t in [("conv", linear_pool.conv_states), ("rec", linear_pool.recurrent_states),
+                            *sorted(linear_pool.slot_states.items())]:
+                nbytes = t[:, 0].numel() * t.element_size()
+                self.snap_segments.append(SnapSegment(name, t, off, nbytes))
+                off += _round_up(nbytes, 64)
+        self.snap_bytes = off
+        self.dirty = False
+        self.last_flush = 0.0
+        self.write_failures = 0
+        loaded = self._load_meta_file()
+        free = loaded["free"] if loaded is not None else None
+        self.arena = HostArena(self.arena_path, capacity, free)
+        self._loaded = loaded
+
+    # ---------------------------------------------------------------- allocation
+    def _alloc(self, nbytes: int) -> HostRef | None:
+        ref = self.arena.alloc(nbytes)
+        while ref is None and self.evict is not None and self.evict(nbytes):
+            ref = self.arena.alloc(nbytes)
+        if ref is None:
+            self.write_failures += 1
+        return ref
+
+    def free(self, ref: HostRef | None) -> None:
+        if ref is not None:
+            self.arena.free(ref)
+            self.dirty = True
+
+    # ---------------------------------------------------------------- KV rows
+    def put_kv(self, token_slots: torch.Tensor) -> HostRef | None:
+        n = int(token_slots.numel())
+        ref = self._alloc(n * self.row_bytes)
+        if ref is None:
+            return None
+        idx = token_slots.long()
+        for start, m, piece in self._chunks(ref, n):
+            sel = idx[start : start + m]
+            if m < self.stage_rows:
+                sel = torch.cat([sel, sel[-1:].expand(self.stage_rows - m)])
+            torch.index_select(self.kv_flat, 2, sel, out=self._gather)
+            rows = self._rows[:m]
+            rows.copy_(self._gather[:, :, :m].permute(2, 0, 1, 3, 4))
+            self.arena.write(piece, rows)
+        self.dirty = True
+        return ref
+
+    def get_kv(self, ref: HostRef, token_slots: torch.Tensor) -> None:
+        n = int(token_slots.numel())
+        assert ref.nbytes == n * self.row_bytes, f"host span {ref.nbytes} != {n} rows"
+        idx = token_slots.long()
+        for start, m, piece in self._chunks(ref, n):
+            rows = self._rows[:m]
+            self.arena.read(piece, rows)
+            gathered = self._gather[:, :, :m]
+            gathered.copy_(rows.permute(1, 2, 0, 3, 4))
+            self.kv_flat.index_copy_(2, idx[start : start + m], gathered)
+
+    def _chunks(self, ref: HostRef, n: int) -> Iterator[tuple[int, int, HostRef]]:
+        for start in range(0, n, self.stage_rows):
+            m = min(self.stage_rows, n - start)
+            yield start, m, HostRef(ref.offset + start * self.row_bytes, m * self.row_bytes)
+
+    def split_kv(self, ref: HostRef, pos: int) -> tuple[HostRef, HostRef]:
+        head = pos * self.row_bytes
+        return HostRef(ref.offset, head), HostRef(ref.offset + head, ref.nbytes - head)
+
+    # ---------------------------------------------------------------- GDN snapshots
+    def put_snap(self, slot: int) -> HostRef | None:
+        ref = self._alloc(self.snap_bytes)
+        if ref is None:
+            return None
+        for seg in self.snap_segments:
+            self.arena.write(HostRef(ref.offset + seg.offset, seg.nbytes), seg.tensor[:, slot])
+        self.dirty = True
+        return ref
+
+    def get_snap(self, ref: HostRef, slot: int) -> None:
+        for seg in self.snap_segments:
+            self.arena.read(HostRef(ref.offset + seg.offset, seg.nbytes), seg.tensor[:, slot])
+
+    # ---------------------------------------------------------------- metadata
+    def _load_meta_file(self) -> dict[str, Any] | None:
+        try:
+            with open(self.meta_path) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if meta.get("format") != FORMAT_VERSION or meta.get("key") != self.key:
+            return None
+        if meta.get("row_bytes") != self.row_bytes or meta.get("snap_bytes") != self.snap_bytes:
+            return None
+        return meta
+
+    def take_loaded_nodes(self) -> list[dict[str, Any]]:
+        """Nodes recorded by the last flush whose key matches this server, once; [] otherwise."""
+        loaded, self._loaded = self._loaded, None
+        return list(loaded["nodes"]) if loaded is not None else []
+
+    def read_nodes(self) -> list[dict[str, Any]]:
+        meta = self._load_meta_file()
+        return list(meta["nodes"]) if meta is not None else []
+
+    def save_meta(self, nodes: list[dict[str, Any]]) -> None:
+        self.arena.flush()
+        meta = {
+            "format": FORMAT_VERSION,
+            "key": self.key,
+            "saved_at": time.time(),
+            "capacity": self.arena.capacity,
+            "row_bytes": self.row_bytes,
+            "snap_bytes": self.snap_bytes,
+            "free": self.arena.free_extents,
+            "nodes": nodes,
+        }
+        tmp = self.meta_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(meta, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.meta_path)
+        self.dirty = False
+        self.last_flush = time.time()
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "directory": self.directory,
+            "capacity_bytes": self.arena.capacity,
+            "used_bytes": self.arena.used,
+            "row_bytes": self.row_bytes,
+            "snap_bytes": self.snap_bytes,
+            "dirty": self.dirty,
+            "last_flush": self.last_flush,
+            "write_failures": self.write_failures,
+        }
+
+    def close(self) -> None:
+        self.arena.close()
+
+
+def encode_tokens(tokens: torch.Tensor) -> str:
+    return base64.b64encode(tokens.to("cpu", torch.int32).contiguous().numpy().tobytes()).decode("ascii")
+
+
+def decode_tokens(text: str) -> torch.Tensor:
+    """Tree keys stay on the CPU: fast_compare_key walks them there."""
+    raw = base64.b64decode(text.encode("ascii"))
+    return torch.frombuffer(bytearray(raw), dtype=torch.int32).clone()
+
+
+def _file_stamp(path: str) -> list[int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [st.st_size, int(st.st_mtime)]
+
+
+def build_validity_key(config, kv_pool, linear_pool) -> dict[str, Any]:
+    """Everything that changes the bytes a cached prefix would produce; a mismatch ignores the
+    stored tree instead of feeding another model's state into this one."""
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.version import __version__
+
+    model_path = os.path.realpath(config.model_path)
+    key: dict[str, Any] = {
+        "freetoken": __version__,
+        "model_path": model_path,
+        "config_json": _file_stamp(os.path.join(model_path, "config.json")),
+        "weights_index": _file_stamp(os.path.join(model_path, "model.safetensors.index.json")),
+        "page_size": config.page_size,
+        "chunk_size": CHUNK_SIZE,
+        "kv_dtype": str(kv_pool.dtype),
+        "kv_shape": list(kv_pool._kv_buffer.shape[:2]) + list(kv_pool._kv_buffer.shape[4:]),
+        "kv_scales": None,
+    }
+    scales = getattr(config, "kv_cache_scales", None)
+    if scales:
+        with open(scales, "rb") as f:
+            key["kv_scales"] = hashlib.sha256(f.read()).hexdigest()
+    if linear_pool is not None:
+        key["conv"] = [list(linear_pool.conv_states.shape[2:]), str(linear_pool.conv_states.dtype),
+                       int(linear_pool.conv_states.shape[0])]
+        key["rec"] = [list(linear_pool.recurrent_states.shape[2:]), str(linear_pool.recurrent_states.dtype),
+                      int(linear_pool.recurrent_states.shape[0])]
+        key["slot_states"] = sorted(
+            [name, list(t.shape[2:]), str(t.dtype), int(t.shape[0])] for name, t in linear_pool.slot_states.items()
+        )
+    return key
+
+
+__all__ = [
+    "ALIGN",
+    "FORMAT_VERSION",
+    "HostArena",
+    "HostRef",
+    "HostTier",
+    "build_validity_key",
+    "decode_tokens",
+    "encode_tokens",
+]

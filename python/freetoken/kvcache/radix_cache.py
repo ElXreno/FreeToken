@@ -44,6 +44,11 @@ class RadixTreeNode:
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
+        # Host tier: arena spans of this node's KV rows and end-boundary GDN snapshot
+        self.host_kv = None
+        self.host_snap = None
+        self.resident: bool = True  # False = only the host copy exists, promote before use
+
         # these fields should be updated later
         self._key: torch.Tensor
         self._value: torch.Tensor
@@ -54,6 +59,12 @@ class RadixTreeNode:
         self._key = key
         self._value = value
         self._length = len(key)
+
+    def set_key_host(self, key: torch.Tensor) -> None:
+        self._key = key
+        self._value = key[:0].clone()
+        self._length = len(key)
+        self.resident = False
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
@@ -89,7 +100,10 @@ class RadixTreeNode:
         parent = self.parent
 
         new_node = RadixTreeNode(self.key_fn, self.timestamp)
-        new_node.set_key_value(self._key[:pos], self._value[:pos])
+        if self.resident:
+            new_node.set_key_value(self._key[:pos], self._value[:pos])
+        else:
+            new_node.set_key_host(self._key[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves
@@ -99,8 +113,17 @@ class RadixTreeNode:
         new_node.swa_tombstone = self.swa_tombstone
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
+        # Host tier: the arena span is row-contiguous in token order, so both halves keep a
+        # sub-span of it; the snapshot sits on the end boundary and stays with the suffix.
+        if self.host_kv is not None:
+            row = self.host_kv.nbytes // self._length
+            new_node.host_kv = type(self.host_kv)(self.host_kv.offset, pos * row)
+            self.host_kv = type(self.host_kv)(self.host_kv.offset + pos * row, (self._length - pos) * row)
 
-        self.set_key_value(self._key[pos:], self._value[pos:])
+        if self.resident:
+            self.set_key_value(self._key[pos:], self._value[pos:])
+        else:
+            self.set_key_host(self._key[pos:])
         self.set_parent(new_node)
 
         return new_node
