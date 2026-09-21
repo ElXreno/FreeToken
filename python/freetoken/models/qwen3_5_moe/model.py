@@ -114,6 +114,10 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        if config.mtp_draft:
+            from .mtp import Qwen3_5MTPHead
+
+            self.mtp = Qwen3_5MTPHead(config)
         super().__init__()
 
     def forward(self) -> torch.Tensor:

@@ -142,6 +142,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
+        mtp_num_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
+        mtp_dedicated_embeddings=bool(getattr(text, "mtp_use_dedicated_embeddings", False)),
     )
 
 
