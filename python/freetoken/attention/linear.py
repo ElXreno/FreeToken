@@ -54,6 +54,23 @@ def gdn_slot(req) -> int:
     return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
 
 
+_CU_SEQLENS_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
+def _decode_cu_seqlens(bs: int, rows: int, device: torch.device) -> torch.Tensor:
+    """``arange(0, (bs+1)*rows, rows)`` for a decode or verify batch; constant per shape, so it is built once per device.
+
+    A graph replay reads its own persistent copy built in ``GraphCaptureBuffer.set_batch``, which
+    left this one launching a kernel and allocating every step for a value nobody read.
+    """
+    key = (int(bs), int(rows), str(device))
+    buf = _CU_SEQLENS_CACHE.get(key)
+    if buf is None:
+        buf = torch.arange(0, (bs + 1) * rows, rows, dtype=torch.int32, device=device)
+        _CU_SEQLENS_CACHE[key] = buf
+    return buf
+
+
 def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePool) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
@@ -71,7 +88,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
         bs = len(reqs)
         idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
         metadata = FLAMetadata(
-            cu_seqlens=torch.arange(0, (bs + 1) * batch.rows_per_req, batch.rows_per_req, dtype=torch.int32, device=device),
+            cu_seqlens=_decode_cu_seqlens(bs, batch.rows_per_req, device),
             cache_indices=idx_host.to(device, non_blocking=True),
         )
         if batch.phase == "verify":
