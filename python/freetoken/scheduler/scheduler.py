@@ -513,7 +513,14 @@ class Scheduler(SchedulerIOMixin):
     def _mtp_acceptance(self) -> tuple[int, int, float, float] | None:
         """Called only when a status line is actually printed: it blocks on the draft's event."""
         fn = getattr(self.engine, "mtp_acceptance", None)
-        return None if fn is None else fn()
+        if fn is None:
+            return None
+        stats = fn()
+        if stats is None or not self._verify_steps:
+            return stats
+        # under verify the head never scores a draft against a later real token, so its own
+        # counter stays at zero; the commit loop is the only place that knows what held
+        return self._verify_hits, self._verify_steps, stats[2], stats[3]
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -1104,6 +1111,7 @@ class Scheduler(SchedulerIOMixin):
             if int(next_tokens_cpu[row]) == drafts[i]:
                 commits.append((req, row))
                 commits.append((req, row + 1))
+                self.status_reporter.add_generated(1)
                 req.cached_len = req.device_len
                 req.device_len += 1
                 req.linear_slot_idx, req.verify_slot = req.verify_slot, req.linear_slot_idx

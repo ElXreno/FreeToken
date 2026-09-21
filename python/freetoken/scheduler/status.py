@@ -23,6 +23,10 @@ class SchedulerStatusReporter:
         self._last_decode_time = now
         self.decode_log_interval = max(1, self.decode_log_interval)
 
+    def add_generated(self, n: int) -> None:
+        """Tokens a drain committed beyond the one row per request the forward already counted."""
+        self._decode_generated_tokens += n
+
     def report_batch(
         self,
         batch: Batch,
@@ -110,6 +114,8 @@ class SchedulerStatusReporter:
         mtp: tuple[int, int, float, float] | None = None,
     ) -> None:
         self._decode_forward_count += 1
+        # a verify step commits one token per row it accepted, so counting rows would read the
+        # speculative decode as slower than it is; the drain adds the extra ones it committed
         self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
