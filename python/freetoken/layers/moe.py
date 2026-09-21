@@ -24,6 +24,16 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# Compute this layer's cache hits while its misses are still crossing PCIe.
+_FETCH_OVERLAP = os.getenv("FREETOKEN_MOE_OVERLAP_FETCH", "0") != "0"
+_FETCH_STREAM: "torch.cuda.Stream | None" = None
+
+
+def _fetch_side_stream():
+    global _FETCH_STREAM
+    if _FETCH_STREAM is None and torch.cuda.is_available():
+        _FETCH_STREAM = torch.cuda.Stream()
+    return _FETCH_STREAM
 
 
 class MoELayer(BaseOP):
@@ -328,19 +338,34 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
-        cache.copy_missing()
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
-        gpu_routed = self._expert_gemm(
-            cache,
-            hidden_states,
-            gpu_w,
-            gpu_slots,
-            views=cache.bank_views(),
-            n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
-            is_prefill=False,
-        )
+
+        def gemm(weights):
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                weights,
+                gpu_slots,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
+
+        if _FETCH_OVERLAP and _fetch_side_stream() is not None:
+            # The fetch owns the link, not the SMs, so the hits of this layer are free real
+            # estate for its duration. Split the routed GEMM around it instead of waiting.
+            fresh = cache.fresh_route_mask(gpu_slots)
+            zero = topk_weights.new_zeros(())
+            side = _fetch_side_stream()
+            done = cache.copy_missing_overlapped(side)
+            gpu_routed = gemm(torch.where(fresh, zero, gpu_w).contiguous())
+            torch.cuda.current_stream().wait_event(done)
+            gpu_routed = gpu_routed + gemm(torch.where(fresh, gpu_w, zero).contiguous())
+        else:
+            cache.copy_missing()
+            gpu_routed = gemm(gpu_w)
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
         return gpu_routed + cpu_routed
 
