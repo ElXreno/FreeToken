@@ -364,6 +364,9 @@ class Scheduler(SchedulerIOMixin):
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        # riders are mid-generation, not a finished prompt: they follow the decode policy
+        # (cached only when they finish), never the prefill prefix commit below
+        rider_set = set(batch.decode_rows)
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -434,7 +437,7 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
+                elif batch.is_prefill and req.table_idx != -1 and req not in rider_set:
                     # for prefill, non-chunk req, cache the prefix.
                     # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
                     # the generic manager inserts the prefix into its radix/naive cache.
@@ -912,15 +915,16 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
-        if batch.is_decode:
+        decode_rows = batch.reqs if batch.is_decode else batch.decode_rows
+        if decode_rows:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
             self.cache_manager.maybe_free_swa_out_of_window(
-                batch.reqs, forward_iter=self._forward_iter)
-            for req in batch.reqs:
+                decode_rows, forward_iter=self._forward_iter)
+            for req in decode_rows:
                 req.decode_batch_idx += 1
-        else:
+        if batch.is_prefill:
             # Prefill sibling of the decode driver: free out-of-window swa BEFORE allocating
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
@@ -988,13 +992,14 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         batch = None
+        mixed = self.config.mixed_batch_decode
         quota = self.config.decode_steps_per_prefill_chunk
         if quota > 0 and self._decode_credit > 0 and self.decode_manager.runnable:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
                 self._decode_credit -= 1
         if batch is None:
-            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget, mixed)
             if batch is not None:
                 self._decode_credit = -(-quota * batch.log_new_tokens // self.prefill_budget)
             else:

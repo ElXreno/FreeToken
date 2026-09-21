@@ -293,7 +293,7 @@ class PrefillManager:
             )
         )
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def schedule_next_batch(self, prefill_budget: int, mixed_decode: bool = False) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
@@ -343,10 +343,19 @@ class PrefillManager:
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        n_decode_rows = 0
+        if mixed_decode:
+            riders = sorted(
+                (r for r in self.decode_manager.running_reqs if r.can_decode and r not in set(reqs)),
+                key=lambda r: r.uid,
+            )
+            reqs.extend(riders)
+            n_decode_rows = len(riders)
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
+        batch.n_decode_rows = n_decode_rows
         return batch
 
     def abort_req(self, uid: int) -> Req | None:

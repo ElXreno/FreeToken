@@ -81,8 +81,9 @@ class SchedulerStatusReporter:
         input_throughput = new_tokens / gap if gap > 0 else 0.0
         self.log(
             f"Prefill batch, "
-            f"#new-seq: {len(batch.reqs)}, "
+            f"#new-seq: {len(batch.reqs) - batch.n_decode_rows}, "
             f"#new-token: {new_tokens}, "
+            f"#rider: {batch.n_decode_rows}, "
             f"#cached-token: {cached_tokens}, "
             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
             f"{_swa_msg(swa_tokens)}"

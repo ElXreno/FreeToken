@@ -51,6 +51,9 @@ class EngineConfig:
     # Keep the input embedding table in pinned host memory (gathered over UVA) so its VRAM
     # goes to the runtime pools instead. Single rank only.
     embed_table_host: bool = False
+    # Let running decodes ride each prefill chunk as one-token extends; composes with
+    # decode_steps_per_prefill_chunk (they get the rider token AND the post-chunk burst).
+    mixed_batch_decode: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

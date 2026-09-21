@@ -149,6 +149,8 @@ class Batch:
     # PrefillManager; 0 on decode batches.
     log_new_tokens: int = field(default=0, init=False)
     log_cached_tokens: int = field(default=0, init=False)
+    # trailing reqs of a prefill batch that are running decodes riding it (--mixed-batch-decode)
+    n_decode_rows: int = field(default=0, init=False)
     # (uid, complete prompt length, prefix-cache hit) for requests entering their first
     # prepared prefill batch. The scheduler turns these into PromptAdmittedMsg only AFTER
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
@@ -158,6 +160,11 @@ class Batch:
     @property
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
+
+    @property
+    def decode_rows(self) -> List[Req]:
+        """Running requests riding this prefill chunk as one-token extends (mixed batch)."""
+        return self.reqs[len(self.reqs) - self.n_decode_rows :] if self.n_decode_rows else []
 
     @property
     def is_decode(self) -> bool:
