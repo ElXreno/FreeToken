@@ -707,7 +707,9 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            # a decode step frees nothing, and cat of one tensor still copies the whole free list
+            if lazy_free_list:
+                self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
     def flush(self) -> int:
         """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
