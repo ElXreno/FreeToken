@@ -795,6 +795,11 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # The verify scratch slot is the scheduler's own: the cache manager only knows the live
+        # slot and the prefill ping-pong pair, so nothing else would ever hand this one back.
+        if req.verify_slot is not None:
+            self.engine.linear_state_pool.free([req.verify_slot])
+            req.verify_slot = None
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
