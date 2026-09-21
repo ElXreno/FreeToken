@@ -284,6 +284,8 @@ def _linear_pool_num_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
+    if getattr(config, "prefix_cache_dir", None):
+        return 3 * mr + 1  # live + 2 ping-pong + padding; snapshots live in the host arena
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
@@ -298,4 +300,6 @@ def _linear_pool_min_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1
+    if getattr(config, "prefix_cache_dir", None):
+        return 3 * mr + 1
     return 4 * mr + 1

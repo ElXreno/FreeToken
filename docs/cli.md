@@ -75,6 +75,9 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--linear-state-cache-ratio` | 2.0 | Hybrid GDN models: cross-request GDN snapshot cache slots as a multiple of `--max-running-requests` (floor 4); each slot pins one resumable cached prefix |
 | `--decode-steps-per-prefill-chunk` | 0 | Decode steps run between two prefill chunks while other requests are decoding; 0 = strict prefill priority (a long prompt stalls running decodes until its prefill ends) |
+| `--prefix-cache-dir` | off | Hybrid GDN models: host tier of the prefix cache (arena file + tree metadata in this directory). Commits write through, VRAM eviction keeps the host copy, hits promote it back, the tree reloads at start-up |
+| `--prefix-cache-host-bytes` | 32 GiB | Arena capacity; LRU leaves are dropped when it fills |
+| `--prefix-cache-flush-idle-seconds` | 600 | Idle time after which unsaved tree metadata is written (also on orderly stop and `POST /v1/cache/save`) |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 
 ### MoE offload

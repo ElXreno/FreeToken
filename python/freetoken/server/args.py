@@ -478,6 +478,33 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefix-cache-dir",
+        type=str,
+        default=ServerArgs.prefix_cache_dir,
+        help="Hybrid GDN models: directory for the host tier of the prefix cache (an arena file "
+        "plus tree metadata). Committed KV spans and GDN snapshots are written through to it, "
+        "VRAM eviction only drops the resident copy, a hit promotes the span back, and the tree "
+        "is reloaded at start-up, so prefixes survive both eviction and restarts.",
+    )
+
+    parser.add_argument(
+        "--prefix-cache-host-bytes",
+        type=int,
+        default=ServerArgs.prefix_cache_host_bytes,
+        help="Capacity of the --prefix-cache-dir arena in bytes (sparse file; LRU leaves are "
+        "dropped when it fills).",
+    )
+
+    parser.add_argument(
+        "--prefix-cache-flush-idle-seconds",
+        type=float,
+        default=ServerArgs.prefix_cache_flush_idle_seconds,
+        help="Write the --prefix-cache-dir tree metadata after the scheduler has been idle this "
+        "long with unsaved changes; it is also written on an orderly stop and on "
+        "POST /v1/cache/save.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,

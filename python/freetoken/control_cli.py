@@ -300,6 +300,7 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     _add_rebuild_args(cache)
     cache_sub = cache.add_subparsers(dest="cache_command")
     cache_sub.add_parser("status", help="Show /v1/cache/status")
+    cache_sub.add_parser("save", help="POST /v1/cache/save (flush the prefix cache host tier metadata)")
     rebuild = cache_sub.add_parser("rebuild", help="POST /v1/cache/rebuild")
     _add_rebuild_args(rebuild)
 
@@ -401,6 +402,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft ctl") -> int:
             return 0
         if args.command == "cache" and args.cache_command == "rebuild":
             return _run_cache_rebuild(args)
+        if args.command == "cache" and args.cache_command == "save":
+            doc = _request_json("POST", args.base_url, "/v1/cache/save", body={}, timeout=args.timeout + 120)
+            _print_doc(doc, _format_rebuild, raw_json=args.json)
+            return 0 if doc.get("status") == "ok" else 1
     except ControlCliError as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code

@@ -31,7 +31,7 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, host_tier=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -45,6 +45,8 @@ class CacheManager:
         self.sliding_window_size = sliding_window_size
         self.is_hybrid = type == "hybrid_radix"
         self.is_swa = type == "swa_radix"
+        self.host_tier = host_tier
+        self.is_tiered = self.is_hybrid and host_tier is not None
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
         # lifecycle (alloc_swa / out-of-window free / free-on-finish). is_swa gates only the extra
@@ -82,6 +84,9 @@ class CacheManager:
         return total - len(self.free_slots) - evictable // self.page_size, total
 
     def _make_prefix_cache(self, device, page_size, type):
+        if type == "hybrid_radix" and self.host_tier is not None:
+            from freetoken.kvcache.tiered_hybrid_cache import TieredHybridRadixCache
+            return TieredHybridRadixCache(device, page_size, self.host_tier)
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
             return HybridRadixCache(device, page_size)
@@ -98,6 +103,10 @@ class CacheManager:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
             return MatchResult(SWACacheHandle(m.cached_len, m.node, m.kv_indices))
+        if self.is_tiered:
+            from freetoken.kvcache.tiered_hybrid_cache import TieredCacheHandle
+            m = self.prefix_cache.match_prefix(ids)
+            return MatchResult(TieredCacheHandle(m.cached_len, m.node, m.promote_tokens), mamba_value=m.snap)
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -115,6 +124,34 @@ class CacheManager:
     def mamba_available_size(self) -> int:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
         return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
+
+    # ----- host tier (TieredHybridRadixCache) -----
+    def _allocate_tokens(self, num_tokens: int) -> torch.Tensor:
+        return self._page_to_token(self._allocate(div_ceil(num_tokens, self.page_size)))
+
+    def _drain_host_evictions(self) -> None:
+        freed = self.prefix_cache.take_freed_kv()
+        if freed.numel():
+            self._free(freed)
+
+    def load_host_tier(self) -> int:
+        """Rebuild the tree from the last flush (every node host-only); 0 without a usable flush."""
+        if not self.is_tiered:
+            return 0
+        n = self.prefix_cache.import_nodes(self.host_tier.take_loaded_nodes())
+        self._drain_host_evictions()
+        return n
+
+    def flush_host_meta(self) -> dict | None:
+        if not self.is_tiered:
+            return None
+        self.host_tier.save_meta(self.prefix_cache.export_nodes())
+        return self.prefix_cache.host_stats()
+
+    def maybe_flush_host_meta(self, idle_seconds: float, min_idle: float) -> dict | None:
+        if not self.is_tiered or not self.host_tier.dirty or idle_seconds < min_idle:
+            return None
+        return self.flush_host_meta()
 
     @property
     def swa_available_size(self) -> int:
@@ -138,6 +175,8 @@ class CacheManager:
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
+        if self.is_tiered:
+            return  # snapshots live in the arena; the pool only holds running requests' slots
         while self.linear_state_pool.num_free_slots < n:
             er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
             if not er.mamba_slots:
@@ -238,6 +277,9 @@ class CacheManager:
         if self.is_swa:
             # records the window boundary on the (frozen) handle for unlock/dec_lock.
             object.__setattr__(handle, "swa_uuid", self.prefix_cache.inc_lock(handle.node))
+        elif self.is_tiered:
+            self.prefix_cache.inc_lock(handle.node)
+            self.prefix_cache.promote(handle.node, self._allocate_tokens)
         elif self.is_hybrid:
             self.prefix_cache.inc_lock(handle.node)
         else:
@@ -281,6 +323,8 @@ class CacheManager:
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
+        if self.is_tiered:
+            return self._cache_req_tiered(req, finished=finished)
         if self.is_hybrid:
             return self._cache_req_hybrid(req, finished=finished)
         # ==================================== valid cache region ====================================
@@ -323,6 +367,67 @@ class CacheManager:
                     canonical[old_handle.cached_len : cached_len])
             req.cache_handle = new_handle
             self.lock(new_handle)
+
+    def _commit_tiered(self, req: Req, length: int, slot: int, floor: int, *, keep_lock: bool):
+        """Insert ``[0, length)`` with the GDN state in ``slot`` as its end snapshot, write both
+        through to the arena, and free the request's duplicates of resident tree pages inside
+        ``[floor, prefix_len)``. The committed node stays locked when ``keep_lock``."""
+        from freetoken.kvcache.tiered_hybrid_cache import TieredCacheHandle
+
+        pc, tier = self.prefix_cache, self.host_tier
+        page_indices = self.page_table[req.table_idx, :length]
+        prefix_len, node, dups = pc.insert(req.input_ids[:length], page_indices)
+        pc.inc_lock(node)
+        if node.host_kv is None and node.resident:
+            node.host_kv = tier.put_kv(node.value)
+        if node.host_snap is None:
+            node.host_snap = tier.put_snap(slot)
+        for a, b in dups:
+            a, b = max(a, floor), min(b, prefix_len)
+            if a < b:
+                self._free(page_indices[a:b])
+        self._drain_host_evictions()
+        if not keep_lock:
+            pc.dec_lock(node)
+        return prefix_len, node, TieredCacheHandle(length, node)
+
+    def _cache_req_tiered(self, req: Req, *, finished: bool) -> None:
+        old_handle = req.cache_handle
+        old_cached = old_handle.cached_len
+        page_indices = self.page_table[req.table_idx, : req.cached_len]
+
+        if finished:
+            free_upto = old_cached
+            L = req.mamba_last_track_seqlen
+            if (L is not None and 0 < L <= req.cached_len and align_down(L, self.page_size) == L
+                    and req.mamba_ping_pong is not None):
+                frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+                self._commit_tiered(req, L, frozen, free_upto, keep_lock=False)
+                free_upto = max(free_upto, L)
+            insert_len = align_down(req.cached_len, self.page_size)
+            if insert_len == req.cached_len and insert_len > 0:
+                self._commit_tiered(req, insert_len, req.linear_slot_idx, free_upto, keep_lock=False)
+                self.unlock(old_handle)
+            else:
+                self.unlock(old_handle)
+                self._free(page_indices[free_upto:])
+            self._free_req_slots(req)
+            return
+
+        L = req.mamba_last_track_seqlen
+        if L is None:
+            return
+        if align_down(L, self.page_size) != L:
+            req.mamba_last_track_seqlen = None
+            return
+        frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+        prefix_len, _node, handle = self._commit_tiered(req, L, frozen, old_cached, keep_lock=True)
+        self.unlock(old_handle)
+        if prefix_len > old_cached:
+            canonical = handle.get_matched_indices()
+            self.page_table[req.table_idx, old_cached:prefix_len].copy_(canonical[old_cached:prefix_len])
+        req.cache_handle = handle
+        req.mamba_last_track_seqlen = None
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
@@ -509,7 +614,13 @@ class CacheManager:
         req.linear_slot_idx = None
 
     def check_integrity(self) -> None:
-        if self.is_hybrid:
+        if self.is_tiered:
+            pc = self.prefix_cache
+            pc.check_integrity()
+            cache_pages = (pc.full_evictable + pc.full_protected) // self.page_size
+            pool = self.linear_state_pool
+            assert pool.num_free_slots <= pool.num_slots - 1, "GDN-slot double free"
+        elif self.is_hybrid:
             pc = self.prefix_cache
             pc.check_integrity()  # structural: every snapshot node owns a slot, refs >= 0
             cache_pages = (pc.full_evictable + pc.full_protected) // self.page_size
@@ -560,11 +671,16 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_table = page_table
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
+        if self.is_tiered:
+            self.flush_host_meta()
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+        if self.is_tiered:
+            self.prefix_cache.import_nodes(self.host_tier.read_nodes())
+            self._drain_host_evictions()
 
     @contextmanager
     def lazy_free_region(self):

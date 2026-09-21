@@ -80,6 +80,10 @@ class PrefillAdder:
         estimated_size = self._kv_reservation_size(
             req.input_len + req.output_len, cached_len
         )
+        promote = getattr(handle, "promote_tokens", 0)
+        if promote:
+            page_size = self.cache_manager.page_size
+            estimated_size += div_ceil(promote, page_size) * page_size
 
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None

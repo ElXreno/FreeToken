@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -81,6 +83,19 @@ class Scheduler(SchedulerIOMixin):
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
         # linear_state_pool. No model supplies its own manager.
+        host_tier = None
+        if config.prefix_cache_dir and config.cache_type == "hybrid_radix" and config.tp_info.size == 1:
+            from freetoken.kvcache.host_tier import HostTier, build_validity_key
+
+            host_tier = HostTier(
+                config.prefix_cache_dir,
+                config.prefix_cache_host_bytes,
+                self.engine.kv_cache,
+                self.engine.linear_state_pool,
+                build_validity_key(config, self.engine.kv_cache, self.engine.linear_state_pool),
+            )
+        elif config.prefix_cache_dir:
+            logger.warning_rank0("--prefix-cache-dir needs the hybrid_radix cache on a single rank; ignored")
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
@@ -89,7 +104,16 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            host_tier=host_tier,
         )
+        self._prefix_cache_flush_idle = config.prefix_cache_flush_idle_seconds
+        self._last_activity = time.monotonic()
+        if host_tier is not None:
+            restored = self.cache_manager.load_host_tier()
+            logger.info_rank0(
+                f"prefix cache host tier at {config.prefix_cache_dir}: {restored} nodes restored, "
+                f"{host_tier.arena.used >> 20} MiB of {host_tier.arena.capacity >> 20} MiB in use"
+            )
         self.decode_manager = DecodeManager(config.page_size)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
@@ -156,6 +180,11 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        stats = self.cache_manager.maybe_flush_host_meta(
+            time.monotonic() - self._last_activity, self._prefix_cache_flush_idle
+        )
+        if stats is not None:
+            logger.info_rank0(f"prefix cache host tier flushed: {stats}")
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -290,6 +319,13 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
+        if self.cache_manager.is_tiered:
+            # systemd stops the worker with SIGTERM; route it through the same graceful path as
+            # ^C so the host tier metadata is flushed before the process goes away.
+            def _term(signum, frame):
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, _term)
         # DSV4 (owned-KV) decode reads its per-token window/cmp/idx slot maps off the attention
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
@@ -307,6 +343,13 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        if self.cache_manager.is_tiered:
+            try:
+                stats = self.cache_manager.flush_host_meta()
+                logger.info_rank0(f"prefix cache host tier flushed on stop: {stats}")
+            except Exception as e:  # noqa: BLE001 -- a failed flush must not block the stop
+                logger.warning_rank0(f"prefix cache host tier flush failed on stop: {e!r}")
+            self.cache_manager.host_tier.close()
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -592,7 +635,17 @@ class Scheduler(SchedulerIOMixin):
             # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
             # need the drain-gate / all-rank failure-agreement machinery (deferred), so we
             # reject them cleanly rather than ship hang-prone half-wired paths.
-            if not self.cache_manager.supports_runtime_rebuild:
+            if msg.mode == "save":
+                if not self.cache_manager.is_tiered:
+                    self._reply_rebuild(msg.request_id, "unsupported", "no --prefix-cache-dir on this server")
+                else:
+                    try:
+                        stats = self.cache_manager.flush_host_meta()
+                        logger.info_rank0(f"prefix cache host tier flushed on request: {stats}")
+                        self._reply_rebuild(msg.request_id, "ok")
+                    except Exception as e:  # noqa: BLE001 -- report, the engine is untouched
+                        self._reply_rebuild(msg.request_id, "rejected", error=repr(e))
+            elif not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "this model's cache does not support runtime rebuild"
                 )
@@ -623,7 +676,10 @@ class Scheduler(SchedulerIOMixin):
             return
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
-                pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+                if isinstance(req.mamba_restore_src, int):
+                    pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
+                else:
+                    self.cache_manager.host_tier.get_snap(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
     def _free_req_resources(self, req: Req) -> None:
@@ -883,6 +939,7 @@ class Scheduler(SchedulerIOMixin):
                 batch = self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
+        self._last_activity = time.monotonic()
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
