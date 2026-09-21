@@ -509,6 +509,14 @@ class Engine:
         self._verify_draft_cpu = torch.zeros(
             max(config.max_running_req, 1), dtype=torch.int32, pin_memory=True
         )
+        # staging for place_drafts: a device tensor built from a python list copies through
+        # pageable memory, which blocks the host until the queued draft head has run
+        self._verify_slot_cpu = torch.zeros(
+            max(config.max_running_req, 1), dtype=torch.int64, pin_memory=True
+        )
+        self._verify_dst_cpu = torch.zeros(
+            max(config.max_running_req, 1), dtype=torch.int64, pin_memory=True
+        )
         self._mtp_begin = torch.cuda.Event(enable_timing=True)
         self._mtp_end = torch.cuda.Event(enable_timing=True)
         if self.mtp_head is not None:
@@ -1184,9 +1192,13 @@ class Engine:
         if self.mtp_head is None:
             return
         n = len(slots)
-        idx = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        slot_host, dst_host = self._verify_slot_cpu[:n], self._verify_dst_cpu[:n]
+        for i in range(n):
+            slot_host[i] = slots[i]
+            dst_host[i] = flat_positions[i]
+        idx = slot_host.to(self.device, non_blocking=True)
         pred = self.mtp_head.drafts(idx)[0].to(token_pool.dtype)
-        dst = torch.tensor(flat_positions, dtype=torch.int64, device=self.device)
+        dst = dst_host.to(self.device, non_blocking=True)
         token_pool.view(-1).index_copy_(0, dst, pred)
         self._verify_draft_cpu[:n].copy_(pred, non_blocking=True)
 
