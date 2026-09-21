@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import cached_property
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
@@ -146,6 +147,8 @@ class FlashInferBackend(BaseAttnBackend):
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
+        self._plan_wait_ns = 0
+        self._plan_waits = 0
 
     def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
         if metadata.initialized:
@@ -156,7 +159,15 @@ class FlashInferBackend(BaseAttnBackend):
         metadata.initialized = True
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
+        _t0 = perf_counter_ns()
         self.last_event.synchronize()
+        self._plan_wait_ns += perf_counter_ns() - _t0
+        self._plan_waits += 1
+        if self._plan_waits % 2000 == 0:
+            logger.info_rank0(
+                f"FlashInfer plan wait: {self._plan_wait_ns / self._plan_waits / 1000:.1f} us/call "
+                f"over {self._plan_waits} calls"
+            )
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,

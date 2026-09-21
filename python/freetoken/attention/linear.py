@@ -44,6 +44,23 @@ class FLAMetadata:
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
 
+_CU_SEQLENS_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _decode_cu_seqlens(bs: int, device: torch.device) -> torch.Tensor:
+    """``arange(bs+1)`` for a decode batch; constant per size, so it is built once per device.
+
+    A graph replay reads its own persistent copy built in ``GraphCaptureBuffer.set_batch``, which
+    left this one launching a kernel and allocating every step for a value nobody read.
+    """
+    key = (int(bs), str(device))
+    buf = _CU_SEQLENS_CACHE.get(key)
+    if buf is None:
+        buf = torch.arange(bs + 1, dtype=torch.int32, device=device)
+        _CU_SEQLENS_CACHE[key] = buf
+    return buf
+
+
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
@@ -65,7 +82,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 
     if batch.is_decode:
         bs = len(reqs)
-        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
+        cu_seqlens = _decode_cu_seqlens(bs, device)
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
