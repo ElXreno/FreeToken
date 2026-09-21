@@ -274,7 +274,13 @@ class FlashInferBackend(BaseAttnBackend):
             seq_lens_cpu=seq_len_cpu,
             dtype=self.q_dtype,
             kv_dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            # a verify step is a decode batch carrying two queries per request; the decode
+            # wrapper assumes one, so the query length picks the wrapper, not the phase
+            wrapper=(
+                self.decode_wrappers
+                if batch.is_decode and max_seqlen_q == 1
+                else self.prefill_wrapper
+            ),
         )
 
     def reset_capture(self) -> None:

@@ -617,6 +617,15 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--mtp-verify",
+        action="store_true",
+        default=ServerArgs.mtp_verify,
+        help=(
+            "Carry the draft head's guess as a second row and commit it when it matched, so "
+            "one step can emit two tokens. Implies --mtp-draft."
+        ),
+    )
+    parser.add_argument(
         "--mtp-skip-projection",
         action="store_true",
         default=ServerArgs.mtp_skip_projection,

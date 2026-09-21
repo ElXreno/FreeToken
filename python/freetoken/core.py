@@ -67,6 +67,8 @@ class Req:
     # MTP draft head: decode steps this request has drafted, so the first one clears the ring
     # slot it inherits from whoever held the same GDN slot before.
     mtp_drafted: int = 0
+    verify_draft: int | None = None  # head's guess at the token after the last committed one
+    verify_slot: int | None = None  # GDN slot the verify step's second token writes its state to
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -91,6 +93,10 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+
+    def drop_host(self, n: int) -> None:
+        """Drop the last ``n`` host-side tokens (a rejected draft never became output)."""
+        self.input_ids = self._ids_buf[: self.input_ids.numel() - n]
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
@@ -154,6 +160,8 @@ class Batch:
     log_cached_tokens: int = field(default=0, init=False)
     # trailing reqs of a prefill batch that are running decodes riding it (--mixed-batch-decode)
     n_decode_rows: int = field(default=0, init=False)
+    # decode batch carrying each request's drafted token as a second row (speculative verify)
+    verify: bool = field(default=False, init=False)
     # (uid, complete prompt length, prefix-cache hit) for requests entering their first
     # prepared prefill batch. The scheduler turns these into PromptAdmittedMsg only AFTER
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is

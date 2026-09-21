@@ -505,6 +505,7 @@ class Engine:
         self._mtp_steps = 0
         self._mtp_pending = 0
         self._mtp_timed = False
+        self._last_rows_forwarded = 0
         self._mtp_begin = torch.cuda.Event(enable_timing=True)
         self._mtp_end = torch.cuda.Event(enable_timing=True)
         if self.mtp_head is not None:
@@ -1145,39 +1146,81 @@ class Engine:
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+        if not batch.verify:
+            # a verify step's lengths depend on whether the draft held, so the drain sets them
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
+        batch_logits = logits[: batch.size * (2 if batch.verify else 1)]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if self.mtp_head is not None and batch.is_decode:
+        if self.mtp_head is not None and batch.is_decode and not batch.verify:
             self._stage_mtp_draft(batch, next_tokens_gpu, batch.padded_size if use_graph else batch.size)
+        self._last_rows_forwarded = batch.padded_size if use_graph else batch_logits.shape[0]
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
-    def _stage_mtp_draft(self, batch: Batch, next_tokens_gpu: torch.Tensor, rows_forwarded: int) -> None:
+    def flush_pending_draft(self) -> None:
+        """Run a staged draft now, so a reader of the head's predictions sees this step's."""
+        if self._mtp_pending:
+            self._flush_mtp_draft()
+
+    def pending_drafts(self, slots: list[int]) -> list[int] | None:
+        """Each slot's drafted token, or None where the head has not drafted for it yet.
+
+        Reads device state, so it belongs to a step that already serialized on the host.
+        """
+        if self.mtp_head is None:
+            return None
+        idx = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        pred, live = self.mtp_head.drafts(idx)
+        pred_cpu, live_cpu = pred.tolist(), live.tolist()
+        return [int(p) if ok else None for p, ok in zip(pred_cpu, live_cpu)]
+
+    def stage_verify_draft(self, batch: Batch, next_tokens_gpu: torch.Tensor, pick: list[int]) -> None:
+        """Draft from the last row a verify step committed, once the host knows which that is."""
+        if self.mtp_head is not None:
+            self._stage_mtp_draft(batch, next_tokens_gpu, self._last_rows_forwarded, pick=pick)
+
+    def _stage_mtp_draft(
+        self,
+        batch: Batch,
+        next_tokens_gpu: torch.Tensor,
+        rows_forwarded: int,
+        pick: list[int] | None = None,
+    ) -> None:
         """Copy this step's draft inputs aside; the draft itself runs at the top of the next step.
 
         Queueing it here would put its kernels after the step's device-to-host copy, and a
         compute/copy boundary on one channel costs a front-end drain. Running it just before the
         next forward keeps all the compute contiguous instead. It touches nothing the main path
         reads: a wrong draft costs a ring write and the counters, never a served token.
+
+        ``pick`` names the forwarded row each request drafts from; a verify step passes the last
+        row it committed, which is known only once the draft has been checked on the host.
         """
         t0 = perf_counter_ns()
         rows = batch.reqs[: batch.size]
         n = len(rows)
         host = self._mtp_slots_host[:n]
         for i, req in enumerate(rows):
-            host[i] = req.linear_slot_idx
+            # keyed by request, not by GDN slot: a verify step swaps which slot is live
+            host[i] = req.table_idx
             req.mtp_drafted += 1
         self._mtp_slots[:n].copy_(host, non_blocking=True)
-        self._mtp_hidden[:n].copy_(self.model.decode_hidden(rows_forwarded)[:n])
-        self._mtp_tokens[:n].copy_(next_tokens_gpu)
-        self._mtp_positions[:n].copy_(batch.positions[:n])
+        hidden = self.model.decode_hidden(rows_forwarded)
+        if pick is None:
+            self._mtp_hidden[:n].copy_(hidden[:n])
+            self._mtp_tokens[:n].copy_(next_tokens_gpu)
+            self._mtp_positions[:n].copy_(batch.positions[:n])
+        else:
+            sel = torch.tensor(pick, dtype=torch.int64, device=self.device)
+            self._mtp_hidden[:n].copy_(hidden.index_select(0, sel))
+            self._mtp_tokens[:n].copy_(next_tokens_gpu.index_select(0, sel))
+            self._mtp_positions[:n].copy_(batch.positions.index_select(0, sel))
 
-        fresh = [r.linear_slot_idx for r in rows if r.mtp_drafted == 1]
+        fresh = [r.table_idx for r in rows if r.mtp_drafted == 1]
         if fresh:
             # its own pinned buffer: _mtp_slots_host is still being read by the copy above
             staged = self._mtp_fresh_host[: len(fresh)]

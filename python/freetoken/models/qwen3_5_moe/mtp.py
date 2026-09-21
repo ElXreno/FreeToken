@@ -203,6 +203,10 @@ class Qwen3_5MTPHead(BaseOP):
         self._pred.index_copy_(0, slots, pred.to(self._pred.dtype))
         self._has_pred.index_fill_(0, slots, True)
 
+    def drafts(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pending draft per slot and whether the slot has one yet."""
+        return self._pred.index_select(0, slots), self._has_pred.index_select(0, slots)
+
     def acceptance(self) -> tuple[int, int]:
         return int(self._hits.item()), int(self._scored.item())
 

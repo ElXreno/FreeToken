@@ -76,6 +76,8 @@ class EngineConfig:
     mtp_window: int = 512
     # routed experts the head takes per draft; 0 keeps only its shared expert, -1 follows the model
     mtp_top_k: int = -1
+    # carry the head's draft as a second row and commit it when it held (speculative decode)
+    mtp_verify: bool = False
     mtp_skip_projection: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
@@ -182,7 +184,7 @@ class EngineConfig:
         return replace(
             model_config,
             quant=quant,
-            mtp_draft=self.mtp_draft and model_config.mtp_num_layers > 0,
+            mtp_draft=(self.mtp_draft or self.mtp_verify) and model_config.mtp_num_layers > 0,
             mtp_window=self.mtp_window,
             mtp_top_k=_resolve_mtp_top_k(self.mtp_top_k, model_config),
             mtp_skip_projection=self.mtp_skip_projection,

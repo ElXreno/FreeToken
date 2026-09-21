@@ -57,7 +57,9 @@ class Sampler:
     vocab_size: int
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
-        params = [r.sampling_params for r in batch.reqs]
+        # a verify step samples every row, so each request's params cover its two tokens
+        rows = 2 if batch.verify else 1
+        params = [r.sampling_params for r in batch.reqs for _ in range(rows)]
         is_greedy = [p.is_greedy for p in params]
         if all(is_greedy):
             return BatchSamplingArgs(temperatures=None)

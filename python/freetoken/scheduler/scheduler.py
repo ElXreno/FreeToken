@@ -166,6 +166,9 @@ class Scheduler(SchedulerIOMixin):
         )
         self.config = config
         self._decode_credit = 0
+        self._verify_enabled = config.mtp_verify and config.model_config.mtp_draft
+        self._verify_hits = 0
+        self._verify_steps = 0
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
@@ -272,6 +275,10 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+        if self._verify_enabled and last_data is not None:
+            # whether the draft held decides the next batch's rows, so the drain comes first
+            self._process_last_data(last_data)
+            last_data = None
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -360,15 +367,21 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, (next_tokens_gpu, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        commit_rows = [(req, i) for i, req in enumerate(batch.reqs)]
+        if batch.verify:
+            commit_rows, picks = self._commit_verify(batch, next_tokens_cpu)
+            self.engine.stage_verify_draft(batch, next_tokens_gpu, picks)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         # riders are mid-generation, not a finished prompt: they follow the decode policy
         # (cached only when they finish), never the prefill prefix commit below
         rider_set = set(batch.decode_rows)
         with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
+            for req, row in commit_rows:
+                if req in new_finished_reqs:
+                    continue  # an accepted pair whose first token already ended the request
                 if isinstance(req, ChunkedReq):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
@@ -394,7 +407,7 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
+                next_token = next_tokens_cpu[row]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
@@ -968,6 +981,11 @@ class Scheduler(SchedulerIOMixin):
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
             batch.fla_metadata = build_fla_metadata(batch, self.device)
+            if batch.verify:
+                batch.fla_metadata.verify_out_indices = torch.tensor(
+                    [r.verify_slot for r in batch.reqs],
+                    dtype=torch.int32, device="cpu", pin_memory=True,
+                ).to(self.device, non_blocking=True)
         if batch.is_decode:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
@@ -1013,9 +1031,84 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             return None
         self._last_activity = time.monotonic()
+        self._arm_verify(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _arm_verify(self, batch: Batch) -> None:
+        """Carry each request's drafted token as a second row, so one step can commit two.
+
+        Every request in the batch has to be armed or none: the two rows per request are what
+        the GDN two-pass and the row arithmetic downstream assume. A request without a live
+        draft, or too close to its output limit to hold the extra row, keeps the batch plain.
+        """
+        if not self._verify_enabled or not batch.is_decode or self.engine.mtp_head is None:
+            return
+        reqs = batch.reqs
+        if any(r.linear_slot_idx is None or r.remain_len < 2 for r in reqs):
+            return
+        # run the staged draft now, on its own stream, and wait: the read below is a D2H copy
+        # on this stream and would otherwise overtake it and return the previous step's guess
+        with self.engine_stream_ctx:
+            self.engine.stream.wait_stream(self.stream)
+            self.engine.flush_pending_draft()
+        self.stream.wait_stream(self.engine.stream)
+        drafts = self.engine.pending_drafts([r.table_idx for r in reqs])
+        if drafts is None or any(d is None for d in drafts):
+            return
+        if ENV.VERIFY_DRY:  # pay the serialization, skip the second row: prices one against the other
+            return
+        pool = self.engine.linear_state_pool
+        for req, draft in zip(reqs, drafts):
+            if req.verify_slot is None:
+                req.verify_slot = pool.alloc(1)[0]
+            req.verify_draft = draft
+            req.append_host(torch.tensor([draft], dtype=req.input_ids.dtype))
+            req.device_len += 1
+            # the forward reads its rows from the device token pool, not from input_ids
+            self.token_pool[req.table_idx, req.device_len - 1 : req.device_len].copy_(
+                req.input_ids[-1:], non_blocking=True
+            )
+        batch.verify = True
+
+    def _commit_verify(self, batch: Batch, next_tokens_cpu) -> Tuple[List[Tuple[Req, int]], List[int]]:
+        """Settle each request's draft and say which rows it committed.
+
+        A draft that matched the token row 0 produced is already in place, both at its position
+        and in the KV, so the step commits two tokens and the state written by the second pass
+        becomes live -- a swap of slot names, nothing copied. A draft that missed leaves its
+        position holding the wrong KV, so the position is given back: the host token is dropped,
+        the page is freed, and the next step re-feeds it with the token the model produced.
+        """
+        commits: List[Tuple[Req, int]] = []
+        picks: List[int] = []
+        for i, req in enumerate(batch.reqs):
+            row = 2 * i
+            req.drop_host(1)  # the draft re-enters through the commit loop like any token
+            if int(next_tokens_cpu[row]) == req.verify_draft:
+                commits.append((req, row))
+                commits.append((req, row + 1))
+                req.cached_len = req.device_len
+                req.device_len += 1
+                req.linear_slot_idx, req.verify_slot = req.verify_slot, req.linear_slot_idx
+                picks.append(row + 1)
+                self._verify_hits += 1
+            else:
+                commits.append((req, row))
+                stale = self.engine.page_table[req.table_idx, req.device_len - 1 : req.device_len]
+                self.cache_manager._free(stale)
+                req.cached_len = req.device_len - 1
+                req.device_len = req.cached_len + 1
+                picks.append(row)
+            req.verify_draft = None
+            self._verify_steps += 1
+        if self._verify_steps and self._verify_steps % 40 < len(batch.reqs):
+            logger.info_rank0(
+                f"verify: {self._verify_hits}/{self._verify_steps} drafts committed "
+                f"({self._verify_hits / self._verify_steps:.3f})"
+            )
+        return commits, picks
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
@@ -1100,6 +1193,18 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    if batch.verify:
+        # two rows per request: their tokens belong at the position each row predicts, so the
+        # first one lands over the draft and the next step reads it whether or not it held
+        mapping_list = [req.table_idx for req in batch.reqs for _ in range(2)]
+        mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+        write_list = [
+            (p if req.can_decode else -1)
+            for req in batch.reqs
+            for p in (req.device_len - 1, req.device_len)
+        ]
+        write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
