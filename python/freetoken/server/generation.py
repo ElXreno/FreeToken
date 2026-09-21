@@ -193,9 +193,36 @@ def resolve_sampling(
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
-    return [_render_message(m) for m in messages]
+    content parts to a string, decode tool-call arguments from JSON and fold consecutive
+    leading system messages into one. Raises ValueError on a non-text content part
+    (text-only server). Shared by all adapters."""
+    return _merge_leading_system([_render_message(m) for m in messages])
+
+
+def _merge_leading_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold the run of system messages at the head of the conversation into a single one.
+    The AI SDK's OpenAI-compatible provider (opencode among others) ships every system
+    prompt part as its own message, while Qwen3.5-family templates raise_exception on any
+    system message that is not the first. Text is joined by a blank line; a run that carries
+    image parts stays a part list. System messages further down are left to the template."""
+    n = 0
+    while n < len(messages) and messages[n].get("role") == "system":
+        n += 1
+    if n < 2:
+        return messages
+    contents = [m.get("content") for m in messages[:n]]
+    head = dict(messages[0])
+    if all(c is None or isinstance(c, str) for c in contents):
+        head["content"] = "\n\n".join(c for c in contents if c)
+    else:
+        parts: list[dict[str, Any]] = []
+        for c in contents:
+            if isinstance(c, str):
+                parts.append({"type": "text", "text": c})
+            elif c:
+                parts.extend(c)
+        head["content"] = parts
+    return [head, *messages[n:]]
 
 
 def _render_message(message: dict[str, Any]) -> dict[str, Any]:

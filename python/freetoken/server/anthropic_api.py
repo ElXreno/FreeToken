@@ -186,9 +186,8 @@ def convert_anthropic_prompt(
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
-    # Collect all system content (top-level `system` + any system-role messages
-    # Claude Code interleaves in the array) and emit ONE system message at the
-    # front: strict chat templates (e.g. Qwen3.5) require system at the beginning.
+    # leading system content -> ONE front system message (strict templates such as Qwen3.5);
+    # later system-role turns stay in place so the prefix cache keeps matching across turns
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
@@ -201,7 +200,11 @@ def convert_anthropic_prompt(
     other: list[dict[str, Any]] = []
     for msg in req.messages:
         if msg.role == "system":
-            system_texts.append(_content_text(msg.content))
+            text = _content_text(msg.content)
+            if not other:
+                system_texts.append(text)
+            elif text:
+                _append_user_text(other, text)
             continue
 
         if isinstance(msg.content, str):
@@ -328,6 +331,22 @@ def convert_anthropic_to_genspec(
         template_tools=template_tools,
         parser_tools=parser_tools,
     )
+
+
+def _append_user_text(other: list[dict[str, Any]], text: str) -> None:
+    """Attach a non-leading system-role message to the conversation in place: appended to
+    the preceding user turn, or emitted as its own user turn after a tool or assistant
+    message."""
+    prev = other[-1]
+    if prev["role"] == "user":
+        content = prev.get("content")
+        if isinstance(content, str):
+            prev["content"] = f"{content}\n\n{text}" if content else text
+            return
+        if isinstance(content, list):
+            content.append({"type": "text", "text": text})
+            return
+    other.append({"role": "user", "content": text})
 
 
 def _content_text(content) -> str:

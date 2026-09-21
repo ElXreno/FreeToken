@@ -231,27 +231,30 @@ def test_convert_thinking_replay_in_tool_loop():
     assert spec.messages[2]["role"] == "tool"
 
 
-def test_convert_hoists_and_merges_system_messages():
-    # Claude Code interleaves system messages mid-array; strict chat templates
-    # (e.g. Qwen3.5: "System message must be at the beginning") require ONE system
-    # message at the front. Merge top-level system + in-array system, hoist to front.
+def test_convert_hoists_leading_system_and_keeps_later_ones_in_place():
+    # leading system content -> one front message; later system turns stay in place,
+    # so turn N's rendered prompt remains a prefix of turn N+1 for the radix cache
     req = AnthropicMessagesRequest.model_validate(
         {
             "model": "claude-x",
             "max_tokens": 64,
             "system": "top-level sys",
             "messages": [
+                {"role": "system", "content": "leading sys"},
                 {"role": "user", "content": "hello"},
-                {"role": "system", "content": "mid-stream sys"},
+                {"role": "system", "content": "turn-1 reminder"},
                 {"role": "assistant", "content": "hi"},
+                {"role": "system", "content": "after assistant"},
+                {"role": "user", "content": "again"},
             ],
         }
     )
     spec = A.convert_anthropic_to_genspec(req, {})
-    assert [m["role"] for m in spec.messages] == ["system", "user", "assistant"]
-    assert sum(1 for m in spec.messages if m["role"] == "system") == 1
-    assert "top-level sys" in spec.messages[0]["content"]
-    assert "mid-stream sys" in spec.messages[0]["content"]
+    assert [m["role"] for m in spec.messages] == ["system", "user", "assistant", "user", "user"]
+    assert spec.messages[0]["content"] == "top-level sys\n\nleading sys"
+    assert spec.messages[1]["content"] == "hello\n\nturn-1 reminder"
+    assert spec.messages[3]["content"] == "after assistant"
+    assert spec.messages[4]["content"] == "again"
 
 
 # --------------------------------------------------------------------------- #
