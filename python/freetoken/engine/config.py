@@ -62,6 +62,9 @@ class EngineConfig:
     # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Let running decodes ride each prefill chunk as one-token extends; composes with
+    # decode_steps_per_prefill_chunk (they get the rider token AND the post-chunk burst).
+    mixed_batch_decode: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
