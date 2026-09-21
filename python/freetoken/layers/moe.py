@@ -329,13 +329,13 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
+        # CPU-assigned routes keep their -1 and the kernel skips them instead of computing a
+        # whole expert per route only to multiply it away
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
-            gpu_w,
-            gpu_slots,
+            topk_weights,
+            topk_ids,
             views=cache.bank_views(),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
