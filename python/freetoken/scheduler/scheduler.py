@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
+from freetoken import hostprof
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -283,16 +284,14 @@ class Scheduler(SchedulerIOMixin):
             last_data = None
         _t1 = time.perf_counter_ns()
         forward_input = self._schedule_next_batch()
-        self._host_ns[0] += _t1 - _t0
-        self._host_ns[1] += time.perf_counter_ns() - _t1
+        hostprof.add("drain", _t1 - _t0)
+        hostprof.add("sched", time.perf_counter_ns() - _t1)
+        if self._host_ns[0]:
+            hostprof.add("iter", _t0 - self._host_ns[0])
+        self._host_ns[0] = _t0
         self._host_ns[2] += 1
-        if self._verify_enabled and self._host_ns[2] % 100 == 0:
-            n = self._host_ns[2]
-            logger.info_rank0(
-                f"host phase: drain {self._host_ns[0] / n / 1e6:.2f} ms, "
-                f"schedule {self._host_ns[1] / n / 1e6:.2f} ms, "
-                f"forward {self._host_ns[3] / n / 1e6:.2f} ms over {n} iters"
-            )
+        if ENV.HOST_TIMING and self._host_ns[2] % 50 == 0:
+            logger.info_rank0(f"host parts: {hostprof.report(50)}")
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -301,9 +300,8 @@ class Scheduler(SchedulerIOMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
-                _t2 = time.perf_counter_ns()
-                ongoing_data = (forward_input, self._forward(forward_input))
-                self._host_ns[3] += time.perf_counter_ns() - _t2
+                with hostprof.phase("fwd"):
+                    ongoing_data = (forward_input, self._forward(forward_input))
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -355,6 +353,8 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
+        hostprof.reset()
+        self._host_ns = [0, 0, 0, 0]
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -383,11 +383,21 @@ class Scheduler(SchedulerIOMixin):
             return
 
         batch, (next_tokens_gpu, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        with hostprof.phase("gpuwait"):
+            copy_done.synchronize()
+        if ENV.HOST_TIMING:
+            evs = getattr(batch, "gpu_events", None)
+            if evs is not None:
+                hostprof.add("gpustep", int(evs[0].elapsed_time(evs[1]) * 1e6))
+            evs = getattr(batch, "draft_events", None)
+            if evs is not None:
+                hostprof.add("gpudraft", int(evs[0].elapsed_time(evs[1]) * 1e6))
         commit_rows = [(req, i) for i, req in enumerate(batch.reqs)]
         if batch.verify:
-            commit_rows, picks = self._commit_verify(batch, next_tokens_cpu)
-            self.engine.stage_verify_draft(batch, next_tokens_gpu, picks)
+            with hostprof.phase("commit"):
+                commit_rows, picks = self._commit_verify(batch, next_tokens_cpu)
+            with hostprof.phase("stage"):
+                self.engine.stage_verify_draft(batch, next_tokens_gpu, picks)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         # riders are mid-generation, not a finished prompt: they follow the decode policy
@@ -1058,8 +1068,10 @@ class Scheduler(SchedulerIOMixin):
         if batch is None:
             return None
         self._last_activity = time.monotonic()
-        self._arm_verify(batch)
-        forward_input = self._prepare_batch(batch)
+        with hostprof.phase("arm"):
+            self._arm_verify(batch)
+        with hostprof.phase("prep"):
+            forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
 
@@ -1084,7 +1096,13 @@ class Scheduler(SchedulerIOMixin):
         # ride in this batch; enqueue it here, on the stream it was captured against
         with self.engine_stream_ctx:
             self.engine.stream.wait_stream(self.stream)
-            self.engine.flush_pending_draft()
+            if ENV.HOST_TIMING:
+                batch.draft_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+                batch.draft_events[0].record(self.engine.stream)
+            with hostprof.phase("draftflush"):
+                self.engine.flush_pending_draft()
+            if ENV.HOST_TIMING:
+                batch.draft_events[1].record(self.engine.stream)
         self.stream.wait_stream(self.engine.stream)
         pool = self.engine.linear_state_pool
         width = self.token_pool.shape[1]
@@ -1110,6 +1128,15 @@ class Scheduler(SchedulerIOMixin):
         commits: List[Tuple[Req, int]] = []
         picks: List[int] = []
         drafts = self.engine.drafted_tokens(len(batch.reqs))
+        if ENV.VERIFY_TRACE.value > self._verify_steps:
+            logger.info_rank0(
+                "verify trace: "
+                + " ".join(
+                    f"[{i}] draft={drafts[i]} row0={int(next_tokens_cpu[2 * i])} "
+                    f"row1={int(next_tokens_cpu[2 * i + 1])}"
+                    for i in range(len(batch.reqs))
+                )
+            )
         for i, req in enumerate(batch.reqs):
             row = 2 * i
             req.drop_host(1)  # the draft re-enters through the commit loop like any token
@@ -1163,12 +1190,16 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]
+        with hostprof.phase("tokin"):
+            batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        with hostprof.phase("fwbatch"):
+            forward_output = self.engine.forward_batch(batch, sample_args)
+        with hostprof.phase("tokout"):
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        with hostprof.phase("filter"):
+            self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
 

@@ -77,6 +77,8 @@ class EnvClassSingleton:
     MAMBA_SSM_DTYPE = EnvStr("float32")
     VERIFY_DRY = EnvBool(False)  # verify's host serialization without its second row
     VERIFY_NOSYNC = EnvBool(False)  # timing probe: verify without the drain-first order, output is wrong
+    HOST_TIMING = EnvBool(False)  # log the scheduler's per-iteration host phase
+    VERIFY_TRACE = EnvInt(0)  # log this many verify steps as (draft, row0, row1)
 
     def __new__(cls):
         # single instance

@@ -13,6 +13,8 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken import hostprof
+from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
@@ -1150,10 +1152,22 @@ class Engine:
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         if self._mtp_pending:
-            self._flush_mtp_draft()
+            with hostprof.phase("draft"):
+                self._flush_mtp_draft()
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+        if ENV.HOST_TIMING:
+            batch.gpu_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+            batch.gpu_events[0].record(self.stream)
+        with hostprof.phase("ctxent"):
+            _cm1 = self.ctx.forward_batch(batch)
+            _cm1.__enter__()
+            _cm2 = self.model.forward_host_ctx(batch, use_graph)
+            _cm2.__enter__()
+        with hostprof.phase("replay"):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        with hostprof.phase("ctxext"):
+            _cm2.__exit__(None, None, None)
+            _cm1.__exit__(None, None, None)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1165,12 +1179,18 @@ class Engine:
                 req.complete_one()
 
         batch_logits = logits[: batch.size * (2 if batch.verify else 1)]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
+        with hostprof.phase("sample"):
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            if ENV.HOST_TIMING:
+                # ahead of copy_done: the drain waits on that one, and an event recorded after
+                # it is not guaranteed complete when elapsed_time asks
+                batch.gpu_events[1].record(self.stream)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
         if self.mtp_head is not None and batch.is_decode and not batch.verify:
-            self._stage_mtp_draft(batch, next_tokens_gpu, batch.padded_size if use_graph else batch.size)
+            with hostprof.phase("stage"):
+                self._stage_mtp_draft(batch, next_tokens_gpu, batch.padded_size if use_graph else batch.size)
         # rows, not requests: the hidden buffer is keyed by row count and a verify step has two
         self._last_rows_forwarded = (batch.padded_size if use_graph else batch.size) * (
             2 if batch.verify else 1

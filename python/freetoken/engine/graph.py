@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+from freetoken import hostprof
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -270,14 +271,20 @@ class GraphRunner:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
-        assert self.can_use_cuda_graph(batch)
+        with hostprof.phase("cangraph"):
+            assert self.can_use_cuda_graph(batch)
         buffer = self.verify_buffer if batch.verify else self.buffer
         graphs = self.verify_graph_map if batch.verify else self.graph_map
-        buffer.copy_from(batch)
+        with hostprof.phase("bufcopy"):
+            buffer.copy_from(batch)
         g = graphs[batch.padded_size]
-        self.attn_backend.prepare_for_replay(batch)
-        g.replay()
-        return buffer.logits[: batch.size * buffer.rows_per_req]
+        with hostprof.phase("attnprep"):
+            self.attn_backend.prepare_for_replay(batch)
+        with hostprof.phase("glaunch"):
+            g.replay()
+        with hostprof.phase("lslice"):
+            out = buffer.logits[: batch.size * buffer.rows_per_req]
+        return out
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
