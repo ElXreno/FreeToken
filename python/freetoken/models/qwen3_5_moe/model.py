@@ -17,6 +17,7 @@ from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 from freetoken.utils import nvtx_annotate
 
+from .ablate import DirectionAblation
 from .attention import Qwen3_5Attention
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
 from .mtp import Qwen3_5MTPHead
@@ -30,8 +31,18 @@ class Qwen3_5DecoderLayer(BaseOP):
     where the mixer is a GatedDeltaNet (linear layers) or gated attention (full layers).
     All norms are Gemma-style (1+weight)."""
 
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        *,
+        prefix: str = "",
+        ablate: DirectionAblation | None = None,
+        writer_cut: DirectionAblation | None = None,
+    ):
         self._layer_id = layer_id
+        self._ablate = ablate
+        self._writer_cut = writer_cut
         self._is_linear = config.is_linear_layer(layer_id)
         if self._is_linear:
             g = config.linear_attention_group()
@@ -65,12 +76,49 @@ class Qwen3_5DecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
+        if self._ablate is not None:
+            return self._forward_ablated(hidden, residual)
+        if self._writer_cut is not None:
+            return self._forward_writers_cut(hidden, residual)
         # Residual-stream form: fuse each residual-add into the next RMSNorm so add + norm are one kernel per sublayer.
         hidden, residual = self.input_layernorm.forward(hidden, residual)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
         hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
+
+    def _forward_ablated(self, hidden: torch.Tensor, residual: torch.Tensor | None):
+        """Cut the direction at the block input, after the mixer and after the MLP.
+
+        The fused add+norm leaves no gap between the add and the norm, so the add is unrolled,
+        but the buffers stay the fused path's: the stream accumulates in ``residual`` and the
+        norm lands in ``hidden``. The caller still holds the old ``residual`` while the block
+        runs, so accumulating anywhere else keeps a second chunk-sized stream alive, and with
+        the norm's own output that is the 16 MiB a full prefill chunk did not have. The block
+        input is also the previous block's output, so that point is cut twice; with alpha below
+        1 the two compound, and that compounded strength is the one that was tuned.
+        """
+        a = self._ablate
+        if residual is None:
+            # as unablated: the embedding buffer becomes the stream, the norm gets a new one
+            residual = a.cut_(hidden)
+            hidden, _ = self.input_layernorm.forward(residual)
+        else:
+            a.add_cut_norm_(residual, hidden, self.input_layernorm)
+        hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        a.add_cut_norm_(residual, hidden, self.post_attention_layernorm)
+        hidden = self.mlp.forward(hidden)
+        return a.cut_sum_(hidden, residual), residual
+
+    def _forward_writers_cut(self, hidden: torch.Tensor, residual: torch.Tensor | None):
+        """The fused path with this layer's row cut from the mixer's and the MLP's output before
+        either reaches the stream; the block input is the previous layer's output, already cut."""
+        hidden, residual = self.input_layernorm.forward(hidden, residual)
+        hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        self._writer_cut.cut_(hidden)
+        hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
+        hidden = self.mlp.forward(hidden)
+        return self._writer_cut.cut_(hidden), residual
 
 
 class Qwen3_5Model(BaseOP):
@@ -81,9 +129,17 @@ class Qwen3_5Model(BaseOP):
             quant_config=config.quant,
             prefix=f"{prefix}.embed_tokens",
         )
+        ablate = DirectionAblation.from_config(config)
+        writer_cuts = DirectionAblation.writers_from_config(config)
         self.layers = OPList(
             [
-                Qwen3_5DecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                Qwen3_5DecoderLayer(
+                    config,
+                    layer_id,
+                    prefix=f"{prefix}.layers.{layer_id}",
+                    ablate=ablate,
+                    writer_cut=writer_cuts[layer_id] if writer_cuts else None,
+                )
                 for layer_id in range(config.num_layers)
             ]
         )
