@@ -78,6 +78,9 @@ class EnvClassSingleton:
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
     PAGE_PROBE = EnvBool(False)  # check KV page ownership after every drain, log the first breach
+    KPROF = EnvStr("")  # "decode=200" or "prefill=4": torch.profiler capture, see kprof.py
+    KPROF_SKIP = EnvInt(20)
+    KPROF_OUT = EnvStr(".")
 
     def __new__(cls):
         # single instance
