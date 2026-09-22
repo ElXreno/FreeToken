@@ -365,6 +365,7 @@ class Engine:
         from freetoken.gpu_select import bind_assigned_gpu
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
+        _shrink_triton_bench_flush(self.device)
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -1427,6 +1428,21 @@ def _fused_resident_ok(model_config) -> bool:
     if expert_quant not in ("none", "fp8_block"):
         return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16")
+
+
+def _shrink_triton_bench_flush(device: torch.device) -> None:
+    """Size Triton's autotune L2-flush scratch to two L2s instead of a fixed 256 MB, so a
+    runtime autotune fits the few hundred MB the KV pool leaves free."""
+    try:
+        from triton.backends.nvidia.driver import CudaDriver
+    except ImportError:
+        return
+    nbytes = 2 * torch.cuda.get_device_properties(device).L2_cache_size
+
+    def empty_cache_for_benchmark(_self):
+        return torch.empty(nbytes // 4, dtype=torch.int, device="cuda")
+
+    CudaDriver.get_empty_cache_for_benchmark = empty_cache_for_benchmark
 
 
 def _ensure_expandable_segments() -> None:
