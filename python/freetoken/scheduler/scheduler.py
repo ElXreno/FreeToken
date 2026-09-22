@@ -347,6 +347,9 @@ class Scheduler(SchedulerIOMixin):
             # systemd stops the worker with SIGTERM; route it through the same graceful path as
             # ^C so the host tier metadata is flushed before the process goes away.
             def _term(signum, frame):
+                # systemd signals every process in the cgroup, so a second SIGTERM lands while
+                # shutdown is still flushing; disarm first or the flush dies half-written
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 raise KeyboardInterrupt
 
             signal.signal(signal.SIGTERM, _term)
