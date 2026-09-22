@@ -170,6 +170,7 @@ class Scheduler(SchedulerIOMixin):
         self._verify_enabled = config.mtp_verify and config.model_config.mtp_draft
         self._verify_hits = 0
         self._verify_steps = 0
+        self._verify_starved = False
         self._host_ns = [0, 0, 0, 0]
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
@@ -1092,6 +1093,18 @@ class Scheduler(SchedulerIOMixin):
             return
         if ENV.VERIFY_DRY:
             return
+        # speculation is optional, so a pool with no room for the second slot per request
+        # drops to a plain step instead of taking the scheduler down mid-request
+        pool = self.engine.linear_state_pool
+        if sum(1 for r in reqs if r.verify_slot is None) > pool.num_free_slots():
+            if not self._verify_starved:
+                self._verify_starved = True
+                logger.info_rank0(
+                    f"verify off: {pool.num_free_slots()} free GDN slots for {len(reqs)} "
+                    "requests; raise --linear-state-cache-ratio to keep it on"
+                )
+            return
+        self._verify_starved = False
         # the draft staged at the last drain runs at the top of the next forward, too late to
         # ride in this batch; enqueue it here, on the stream it was captured against
         with self.engine_stream_ctx:
@@ -1104,7 +1117,6 @@ class Scheduler(SchedulerIOMixin):
             if ENV.HOST_TIMING:
                 batch.draft_events[1].record(self.engine.stream)
         self.stream.wait_stream(self.engine.stream)
-        pool = self.engine.linear_state_pool
         width = self.token_pool.shape[1]
         flat = []
         for req in reqs:
