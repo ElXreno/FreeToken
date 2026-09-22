@@ -185,6 +185,10 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+        if ENV.PAGE_PROBE:
+            from .page_probe import PageProbe
+
+            self._page_probe = PageProbe(self)
 
     def _moe_stats_line(self) -> str | None:
         # on the engine stream, so the read and the zeroing fall between decode replays
