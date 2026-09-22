@@ -646,6 +646,39 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--ablate-direction",
+        type=str,
+        default=ServerArgs.ablate_direction,
+        help=(
+            "Safetensors file with a 'direction' tensor of shape [layers, hidden]. One row is "
+            "removed from the residual stream at every layer and in the MTP head, e.g. a refusal "
+            "direction. Qwen3.5 models only."
+        ),
+    )
+    parser.add_argument(
+        "--ablate-layer",
+        type=int,
+        default=ServerArgs.ablate_layer,
+        help="Row of --ablate-direction to use, i.e. the layer the direction was measured at.",
+    )
+    parser.add_argument(
+        "--ablate-alpha",
+        type=float,
+        default=ServerArgs.ablate_alpha,
+        help="Share of the direction's component removed at each cut; 1 removes it entirely.",
+    )
+    parser.add_argument(
+        "--ablate-mode",
+        choices=("stream", "writers"),
+        default=ServerArgs.ablate_mode,
+        help=(
+            "stream: cut --ablate-layer's row from the residual stream at every layer and in the "
+            "MTP head. writers: layer l cuts row l from its mixer's and its MLP's output, the "
+            "runtime form of a per-layer weight orthogonalization; needs a row per layer, "
+            "ignores --ablate-layer and leaves the embedding and the MTP head alone."
+        ),
+    )
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,
