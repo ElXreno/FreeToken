@@ -13,6 +13,7 @@ from freetoken.env import ENV
 from freetoken.utils import div_even, init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
+from .fi_blocked import MAX_REQS, QCAP, BlockedFp8Prefill, BlockedReq
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -62,6 +63,7 @@ class FIMetadata(BaseAttnMetadata):
     kv_dtype:           torch.dtype  # paged slab dtype (narrower under --kv-cache-dtype)
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
+    blocked:            List[BlockedReq] | None = None  # set when prefill runs blockwise in bf16
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -134,6 +136,25 @@ class FlashInferBackend(BaseAttnBackend):
         self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
         self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
 
+        self.blocked_prefill: BlockedFp8Prefill | None = None
+        if (
+            ENV.FI_BLOCKED_PREFILL.value
+            and tp_size == 1
+            and self.kvcache.dtype == torch.float8_e4m3fn
+            and not getattr(self.kvcache, "_scales", None)
+        ):
+            try:
+                self.blocked_prefill = BlockedFp8Prefill(
+                    self.float_workspace_buffer, self.int_workspace_buffer,
+                    qo_local, kv_local, config.head_dim, self.q_dtype,
+                )
+                logger.info_rank0(
+                    f"fp8 KV prefill runs blockwise in bf16 past a "
+                    f"{ENV.FI_BLOCKED_PREFILL.value}-token prefix"
+                )
+            except ValueError as exc:
+                logger.warning(f"blocked fp8 prefill off: {exc}")
+
         # initialize some data members
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
@@ -168,7 +189,10 @@ class FlashInferBackend(BaseAttnBackend):
         self._plan_wait_ns += perf_counter_ns() - _t0
         self._plan_waits += 1
         _tp = perf_counter_ns()
-        if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
+        if metadata.blocked is not None:
+            assert self.blocked_prefill is not None
+            self.blocked_prefill.plan(metadata.blocked)
+        elif isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
                 indices=metadata.indices,
@@ -238,6 +262,12 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if metadata.blocked is not None:
+            assert self.blocked_prefill is not None
+            return self.blocked_prefill.run(
+                q, self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id),
+                metadata.indices, metadata.blocked,
+            )
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         scales = self.kvcache.kv_scales(layer_id)
@@ -266,6 +296,23 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
+        blocked = None
+        if (
+            self.blocked_prefill is not None
+            and batch.is_prefill
+            and not batch.n_decode_rows
+            and len(reqs) <= MAX_REQS
+            and 0 < min(seqlens_q)
+            and max_seqlen_q <= QCAP
+        ):
+            prefixes = [k - q for q, k in zip(seqlens_q, seqlens_k, strict=True)]
+            if max(prefixes) >= ENV.FI_BLOCKED_PREFILL.value:
+                cq, ck = cu_seqlens_q_cpu.tolist(), cu_seqlens_k_cpu.tolist()
+                blocked = [
+                    BlockedReq(q0=cq[i], q1=cq[i + 1], k0=ck[i], prefix=prefixes[i])
+                    for i in range(len(reqs))
+                ]
+
         page_table = get_global_ctx().page_table
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
@@ -288,6 +335,7 @@ class FlashInferBackend(BaseAttnBackend):
                 if batch.is_decode and max_seqlen_q == 1
                 else self.prefill_wrapper
             ),
+            blocked=blocked,
         )
 
     def reset_capture(self) -> None:
