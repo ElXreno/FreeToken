@@ -69,6 +69,8 @@ class EnvClassSingleton:
 
     # backend runtime
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
+    # prefill over an fp8 KV prefix at least this long runs blockwise in bf16; 0 disables
+    FI_BLOCKED_PREFILL = EnvInt(8192)
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
