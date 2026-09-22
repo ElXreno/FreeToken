@@ -81,6 +81,7 @@ class EnvClassSingleton:
     VERIFY_NOSYNC = EnvBool(False)  # timing probe: verify without the drain-first order, output is wrong
     HOST_TIMING = EnvBool(False)  # log the scheduler's per-iteration host phase
     VERIFY_TRACE = EnvInt(0)  # log this many verify steps as (draft, row0, row1)
+    PAGE_PROBE = EnvBool(False)  # check KV page ownership after every drain, log the first breach
 
     def __new__(cls):
         # single instance

@@ -184,6 +184,10 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+        if ENV.PAGE_PROBE:
+            from .page_probe import PageProbe
+
+            self._page_probe = PageProbe(self)
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
