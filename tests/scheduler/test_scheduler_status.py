@@ -27,7 +27,7 @@ def _prefill_batch(new_tokens, cached_tokens, n_seqs):
     reqs = [_req(extend=1, cached=10_000) for _ in range(n_seqs)]
     return SimpleNamespace(
         is_prefill=True, is_decode=False, reqs=reqs,
-        log_new_tokens=new_tokens, log_cached_tokens=cached_tokens,
+        log_new_tokens=new_tokens, log_cached_tokens=cached_tokens, n_decode_rows=0,
     )
 
 
