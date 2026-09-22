@@ -13,7 +13,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from freetoken import hostprof
+from freetoken import hostprof, kprof
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
@@ -1150,6 +1150,7 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        kprof.begin(batch)
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         if self._mtp_pending:
@@ -1196,6 +1197,7 @@ class Engine:
         self._last_rows_forwarded = (batch.padded_size if use_graph else batch.size) * (
             2 if batch.verify else 1
         )
+        kprof.end(batch)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def flush_pending_draft(self) -> None:
