@@ -282,13 +282,14 @@ def _linear_pool_num_slots(config) -> int:
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
     snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
     mr = config.max_running_req
+    spec = mr if getattr(config, "mtp_verify", False) else 0  # verify's second slot per request
     if config.cache_type != "hybrid_radix":
-        return mr + 1  # live + dummy/padding
+        return mr + spec + 1  # live + dummy/padding
     if getattr(config, "prefix_cache_dir", None):
-        return 3 * mr + 1  # live + 2 ping-pong + padding; snapshots live in the host arena
+        return 3 * mr + spec + 1  # live + 2 ping-pong + padding; snapshots live in the host arena
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
-    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+    return 4 * mr + spec + n_cache + 1  # live + 2 ping-pong + locked snapshot + cache + padding
 
 
 def _linear_pool_min_slots(config) -> int:
@@ -298,8 +299,9 @@ def _linear_pool_min_slots(config) -> int:
     padding. Below this, a full max_running_req batch can't get its slots and admission
     deadlocks -- so a runtime rebuild rejects a smaller request."""
     mr = config.max_running_req
+    spec = mr if getattr(config, "mtp_verify", False) else 0
     if config.cache_type != "hybrid_radix":
-        return mr + 1
+        return mr + spec + 1
     if getattr(config, "prefix_cache_dir", None):
-        return 3 * mr + 1
-    return 4 * mr + 1
+        return 3 * mr + spec + 1
+    return 4 * mr + spec + 1
