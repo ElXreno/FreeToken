@@ -1159,7 +1159,10 @@ class Scheduler(SchedulerIOMixin):
         for i, req in enumerate(batch.reqs):
             row = 2 * i
             req.drop_host(1)  # the draft re-enters through the commit loop like any token
-            if int(next_tokens_cpu[row]) == drafts[i]:
+            hit = int(next_tokens_cpu[row]) == drafts[i]
+            self._verify_hits += hit
+            # an aborted request skips the commit loop's host append, so it keeps one token
+            if hit and not req.aborted:
                 commits.append((req, row))
                 commits.append((req, row + 1))
                 self.status_reporter.add_generated(1)
@@ -1167,7 +1170,6 @@ class Scheduler(SchedulerIOMixin):
                 req.device_len += 1
                 req.linear_slot_idx, req.verify_slot = req.verify_slot, req.linear_slot_idx
                 picks.append(row + 1)
-                self._verify_hits += 1
             else:
                 commits.append((req, row))
                 stale = self.engine.page_table[req.table_idx, req.device_len - 1 : req.device_len]
