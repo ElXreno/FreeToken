@@ -75,6 +75,12 @@ class GemmaRMSNorm(BaseOP):
         self.fused_add_rmsnorm(x, residual, self._kernel_weight(x), self.eps)
         return x, residual
 
+    def forward_into(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """``forward`` of a 2-D ``x`` written into ``out``, for a caller that has to split the
+        fused add from the norm but keep the buffer the fused kernel would have reused."""
+        self.rmsnorm(x, self._kernel_weight(x), self.eps, out=out)
+        return out
+
 
 class GemmaPlusOneRMSNorm(BaseOP):
     """(1 + w)-scaled RMSNorm (Gemma semantics: the checkpoint stores ``scale - 1``

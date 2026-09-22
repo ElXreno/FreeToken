@@ -296,6 +296,10 @@ class ModelConfig:
     mtp_top_k: int = 0
     # drop the draft's vocabulary projection, to price it against the step it shares memory with
     mtp_skip_projection: bool = False
+    # ----- residual-stream direction ablation (qwen3_5_moe/ablate.py) -----
+    ablate_direction: str | None = None
+    ablate_layer: int = 0
+    ablate_alpha: float = 1.0
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
     # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist

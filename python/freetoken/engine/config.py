@@ -79,6 +79,11 @@ class EngineConfig:
     # carry the head's draft as a second row and commit it when it held (speculative decode)
     mtp_verify: bool = False
     mtp_skip_projection: bool = False
+    # remove row ``ablate_layer`` of this [layers, hidden] safetensors table from the residual
+    # stream at every layer, scaled by ``ablate_alpha``; Qwen3.5 models only
+    ablate_direction: str | None = None
+    ablate_layer: int = 0
+    ablate_alpha: float = 1.0
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
@@ -188,6 +193,9 @@ class EngineConfig:
             mtp_window=self.mtp_window,
             mtp_top_k=_resolve_mtp_top_k(self.mtp_top_k, model_config),
             mtp_skip_projection=self.mtp_skip_projection,
+            ablate_direction=self.ablate_direction,
+            ablate_layer=self.ablate_layer,
+            ablate_alpha=self.ablate_alpha,
         )
 
     @property

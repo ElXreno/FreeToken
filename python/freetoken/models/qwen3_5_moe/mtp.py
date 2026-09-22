@@ -16,6 +16,8 @@ from freetoken.layers import (
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
+from .ablate import DirectionAblation
+
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
@@ -169,6 +171,8 @@ class Qwen3_5MTPHead(BaseOP):
         self.fc = LinearReplicated(2 * config.hidden_size, config.hidden_size, has_bias=False)
         self.layers = OPList([Qwen3_5MTPLayer(config, prefix=f"{prefix}.layers.0")])
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # the head writes the stream too; left alone it keeps drafting what the body no longer says
+        self._ablate = DirectionAblation.from_config(config)
         self._window = int(config.mtp_window)
         self._k_ring: torch.Tensor | None = None
         self._v_ring: torch.Tensor | None = None
@@ -269,6 +273,8 @@ class Qwen3_5MTPHead(BaseOP):
         e = self.pre_fc_norm_embedding.forward(embed_tokens.forward(next_ids))
         h = self.pre_fc_norm_hidden.forward(hidden)
         x = self.fc.forward(torch.cat([e, h], dim=-1))
+        if self._ablate is not None:
+            x = self._ablate.cut_(x)
 
         residual = x
         q, k, v, gate = attn.project(layer.input_layernorm.forward(x), positions)
@@ -293,9 +299,13 @@ class Qwen3_5MTPHead(BaseOP):
             attn_mask=live[:, None, None, :],
         ).view(n, attn.qo_attn_dim)
         x = attn.o_proj.forward(o.to(x.dtype) * torch.sigmoid(gate)) + residual
+        if self._ablate is not None:
+            x = self._ablate.cut_(x)
 
         residual = x
         x = layer.mlp.forward(layer.post_attention_layernorm.forward(x)) + residual
+        if self._ablate is not None:
+            x = self._ablate.cut_(x)
         return lm_head.forward(self.norm.forward(x))
 
 

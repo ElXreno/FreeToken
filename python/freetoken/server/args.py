@@ -636,6 +636,28 @@ def parse_args(
         ),
     )
     parser.add_argument(
+        "--ablate-direction",
+        type=str,
+        default=ServerArgs.ablate_direction,
+        help=(
+            "Safetensors file with a 'direction' tensor of shape [layers, hidden]. One row is "
+            "removed from the residual stream at every layer and in the MTP head, e.g. a refusal "
+            "direction. Qwen3.5 models only."
+        ),
+    )
+    parser.add_argument(
+        "--ablate-layer",
+        type=int,
+        default=ServerArgs.ablate_layer,
+        help="Row of --ablate-direction to use, i.e. the layer the direction was measured at.",
+    )
+    parser.add_argument(
+        "--ablate-alpha",
+        type=float,
+        default=ServerArgs.ablate_alpha,
+        help="Share of the direction's component removed at each cut; 1 removes it entirely.",
+    )
+    parser.add_argument(
         "--embed-table-host",
         action="store_true",
         default=ServerArgs.embed_table_host,
