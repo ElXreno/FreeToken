@@ -82,6 +82,7 @@ class EnvClassSingleton:
     HOST_TIMING = EnvBool(False)  # log the scheduler's per-iteration host phase
     VERIFY_TRACE = EnvInt(0)  # log this many verify steps as (draft, row0, row1)
     PAGE_PROBE = EnvBool(False)  # check KV page ownership after every drain, log the first breach
+    EARLY_DRAFT = EnvBool(True)  # enqueue a verify step's next draft at its drain, not at the next arm
     KPROF = EnvStr("")  # "decode=200" or "prefill=4": torch.profiler capture, see kprof.py
     KPROF_SKIP = EnvInt(20)
     KPROF_OUT = EnvStr(".")

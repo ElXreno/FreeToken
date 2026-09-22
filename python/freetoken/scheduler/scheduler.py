@@ -406,6 +406,11 @@ class Scheduler(SchedulerIOMixin):
                 commit_rows, picks = self._commit_verify(batch, next_tokens_cpu)
             with hostprof.phase("stage"):
                 self.engine.stage_verify_draft(batch, next_tokens_gpu, picks)
+            if ENV.EARLY_DRAFT:
+                # the device is idle through this drain, so the draft runs under the host's scheduling
+                with self.engine_stream_ctx:
+                    self.engine.stream.wait_stream(self.stream)
+                    self.engine.flush_pending_draft()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         # riders are mid-generation, not a finished prompt: they follow the decode policy

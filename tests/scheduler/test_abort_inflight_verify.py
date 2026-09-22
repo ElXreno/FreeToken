@@ -1,6 +1,7 @@
 """Abort of a request whose verify step is in flight, draft accepted or not."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -16,12 +17,17 @@ PROMPT = torch.arange(1, 13, dtype=torch.int32)
 
 def _verify_stub():
     pool, cm, tm, dm, pm, sent, stub = _setup()
+    stub.flushes = []
     stub.engine = SimpleNamespace(
         page_table=cm.page_table,
         linear_state_pool=pool,
         drafted_tokens=lambda n: [DRAFT] * n,
         stage_verify_draft=lambda *_: None,
+        stream=SimpleNamespace(wait_stream=lambda _s: None),
+        flush_pending_draft=lambda: stub.flushes.append("drain"),
     )
+    stub.stream = object()
+    stub.engine_stream_ctx = nullcontext()
     stub.status_reporter.add_generated = lambda _n: None
     stub._verify_steps = 0
     stub._verify_hits = 0
@@ -90,3 +96,10 @@ def test_accepted_draft_without_abort_still_commits_both_tokens():
     assert req.input_ids.tolist()[-3:] == [50, DRAFT, 77]
     Scheduler._free_req_resources(stub, req)
     cm.check_integrity()
+
+
+def test_verify_drain_enqueues_the_next_draft():
+    pool, cm, tm, dm, _pm, _sent, stub = _verify_stub()
+    _req, batch = _armed_verify(pool, cm, tm, dm)
+    Scheduler._process_last_data(stub, _in_flight(batch, DRAFT, 77))
+    assert stub.flushes == ["drain"]
