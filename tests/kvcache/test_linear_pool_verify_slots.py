@@ -7,9 +7,17 @@ once, which is why a single-request benchmark never sees it.
 
 from __future__ import annotations
 
+import ast
+import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
-from freetoken.kvcache.linear_state_pool import _linear_pool_min_slots, _linear_pool_num_slots
+from freetoken.kvcache import linear_state_pool as pool_mod
+from freetoken.kvcache.linear_state_pool import (
+    LinearStatePool,
+    _linear_pool_min_slots,
+    _linear_pool_num_slots,
+)
 
 
 def cfg(**kw) -> SimpleNamespace:
@@ -46,6 +54,27 @@ def test_floor_grows_too():
         on = _linear_pool_min_slots(cfg(mtp_verify=True, **extra))
         assert on - off == 2, (extra, off, on)
         assert _linear_pool_num_slots(cfg(mtp_verify=True, **extra)) >= on
+
+
+def test_num_free_slots_is_read_as_a_property_everywhere():
+    """It is a property, so `pool.num_free_slots()` raises TypeError only once the pool runs dry.
+
+    That is the one path the guard exists for, so no ordinary run reaches it: the scheduler
+    shipped, served fine, and died the first time two requests filled the pool.
+    """
+    assert isinstance(inspect.getattr_static(LinearStatePool, "num_free_slots"), property)
+    root = Path(pool_mod.__file__).parents[2]
+    offenders = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "num_free_slots"
+            ):
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not offenders, f"num_free_slots called as a method at {offenders}"
 
 
 def test_verify_off_is_untouched():

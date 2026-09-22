@@ -1099,11 +1099,11 @@ class Scheduler(SchedulerIOMixin):
         # speculation is optional, so a pool with no room for the second slot per request
         # drops to a plain step instead of taking the scheduler down mid-request
         pool = self.engine.linear_state_pool
-        if sum(1 for r in reqs if r.verify_slot is None) > pool.num_free_slots():
+        if sum(1 for r in reqs if r.verify_slot is None) > pool.num_free_slots:
             if not self._verify_starved:
                 self._verify_starved = True
                 logger.info_rank0(
-                    f"verify off: {pool.num_free_slots()} free GDN slots for {len(reqs)} "
+                    f"verify off: {pool.num_free_slots} free GDN slots for {len(reqs)} "
                     "requests; raise --linear-state-cache-ratio to keep it on"
                 )
             return
