@@ -14,6 +14,7 @@ from freetoken.attention import AttnType, attention_backend_info, create_attenti
 from freetoken.attention.linear import LinearAttnBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken import kprof
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
@@ -1399,6 +1400,7 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        kprof.begin(batch)
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         spec_prefill = self.spec is not None and batch.is_prefill
@@ -1417,6 +1419,7 @@ class Engine:
         if spec_prefill:
             # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
             self.spec.on_prefill(batch, next_tokens_gpu)
+        kprof.end(batch)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
