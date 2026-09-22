@@ -77,6 +77,7 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    PAGE_PROBE = EnvBool(False)  # check KV page ownership after every drain, log the first breach
 
     def __new__(cls):
         # single instance
