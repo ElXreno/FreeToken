@@ -147,13 +147,22 @@ class HostArena:
     @staticmethod
     def _land(done: torch.cuda.Event, staging: torch.Tensor, dst: torch.Tensor) -> None:
         done.synchronize()
-        dst.copy_(staging)
+        # the view may be an inference tensor of the scheduler thread; the mode is thread-local
+        with torch.inference_mode():
+            dst.copy_(staging)
 
     def _submit(self, lo: int, hi: int, nbytes: int, fn: Callable[..., None], *args: Any) -> None:
-        self._pending = [p for p in self._pending if not p[3].done()]
+        self._reap()
         while self._pending and sum(p[2] for p in self._pending) + nbytes > MAX_PENDING_BYTES:
             self._pending.pop(0)[3].result()
         self._pending.append((lo, hi, nbytes, self._writer.submit(fn, *args)))
+
+    def _reap(self) -> None:
+        """Drop landed writes, re-raising the first failure instead of leaving its range stale."""
+        for p in self._pending:
+            if p[3].done():
+                p[3].result()
+        self._pending = [p for p in self._pending if not p[3].done()]
 
     def _wait(self, lo: int = 0, hi: int | None = None) -> None:
         """Block until every queued write overlapping [lo, hi) has landed; re-raise its error."""
@@ -161,7 +170,7 @@ class HostArena:
         for a, b, _, fut in self._pending:
             if a < hi and lo < b:
                 fut.result()
-        self._pending = [p for p in self._pending if not p[3].done()]
+        self._reap()
 
     def read(self, ref: HostRef, dst: torch.Tensor) -> None:
         n = dst.numel() * dst.element_size()
