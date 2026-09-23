@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 
+import pytest
 import torch
 
 from freetoken.kvcache.host_tier import ALIGN, HostArena, HostTier
@@ -280,4 +281,76 @@ def test_arena_eviction_drops_lru_leaf():
         freed = cache.take_freed_kv()
         assert freed.numel() >= 64
         cache.check_integrity()
+        tier.close()
+
+
+def _slow_landing(monkeypatch):
+    import time
+
+    import freetoken.kvcache.host_tier as ht
+
+    land = ht.HostArena._land
+
+    def slow(done, staging, dst):
+        time.sleep(0.2)
+        land(done, staging, dst)
+
+    monkeypatch.setattr(ht.HostArena, "_land", staticmethod(slow))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_device_write_lands_before_a_read_of_its_range(monkeypatch):
+    _slow_landing(monkeypatch)
+    with tempfile.TemporaryDirectory() as d:
+        arena = HostArena(os.path.join(d, "a.bin"), 64 * ALIGN)
+        ref = arena.alloc(4 * ALIGN)
+        src = torch.randint(0, 255, (4 * ALIGN,), dtype=torch.uint8, device="cuda")
+        arena.write(ref, src)
+        out = torch.empty(4 * ALIGN, dtype=torch.uint8)
+        arena.read(ref, out)
+        assert torch.equal(out, src.cpu())
+        arena.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_freed_extent_is_reused_only_after_its_pending_write_landed(monkeypatch):
+    _slow_landing(monkeypatch)
+    with tempfile.TemporaryDirectory() as d:
+        arena = HostArena(os.path.join(d, "a.bin"), 64 * ALIGN)
+        ref = arena.alloc(4 * ALIGN)
+        arena.write(ref, torch.full((4 * ALIGN,), 3, dtype=torch.uint8, device="cuda"))
+        arena.free(ref)
+        again = arena.alloc(4 * ALIGN)
+        assert again.offset == ref.offset
+        arena.write(again, torch.full((4 * ALIGN,), 7, dtype=torch.uint8))
+        arena.flush()
+        assert torch.equal(arena.view(again), torch.full((4 * ALIGN,), 7, dtype=torch.uint8))
+        arena.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_device_commits_round_trip_through_the_tier():
+    with tempfile.TemporaryDirectory() as d:
+        kv = FakeKVPool(pages=8192)
+        kv._kv_buffer = kv._kv_buffer.cuda()
+        kv.device = torch.device("cuda")
+        lin = FakeLinearPool()
+        lin.conv_states, lin.recurrent_states = lin.conv_states.cuda(), lin.recurrent_states.cuda()
+        tier = HostTier(d, 64 << 20, kv, lin, {"model": "fake"})
+        raw = kv.raw()
+        src = torch.arange(0, 2500, dtype=torch.int32, device="cuda")
+
+        def scramble():
+            raw[:, :, src.long()] = torch.randint(0, 255, raw[:, :, src.long()].shape, dtype=torch.uint8, device="cuda")
+            lin.recurrent_states[:, 2] = torch.randn_like(lin.recurrent_states[:, 2])
+
+        scramble()
+        want_kv, want_rec = kv.rows(src), lin.recurrent_states[:, 2].clone()
+        kref, sref = tier.put_kv(src), tier.put_snap(2)
+        scramble()
+        dst = torch.arange(3000, 3000 + 2500, dtype=torch.int32, device="cuda")
+        tier.get_kv(kref, dst)
+        tier.get_snap(sref, 5)
+        assert torch.equal(kv.rows(dst), want_kv)
+        assert torch.equal(lin.recurrent_states[:, 5], want_rec)
         tier.close()
