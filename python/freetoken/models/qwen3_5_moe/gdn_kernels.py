@@ -41,6 +41,59 @@ def gdn_prefill_chunk_fla(
     return o[0]  # [total, num_v_heads, head_v_dim]
 
 
+def gdn_prefill_chunk_fla_owned(
+    qkv: list[torch.Tensor],
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    state_source: torch.Tensor,
+    indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    return_h: bool = False,
+):
+    """``gdn_prefill_chunk_fla`` with the same kernels in the same order, for inference only.
+
+    It takes q/k/v out of ``qkv`` (the caller keeps no other reference) and lets each tensor go
+    once its last reader has run: raw q/k after the l2norm, v after the intra-chunk pass, w/u
+    after the state pass. A long prefill chunk then peaks at about half the memory.
+    """
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+    from freetoken.kernel.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+    from freetoken.kernel.fla.chunk_o import chunk_fwd_o
+    from freetoken.kernel.fla.cumsum import chunk_local_cumsum
+    from freetoken.kernel.fla.index import prepare_chunk_indices
+    from freetoken.kernel.fla.l2norm import l2norm_fwd
+    from freetoken.kernel.fla.utils import custom_device_ctx
+
+    q, k, v = (t.contiguous() for t in qkv)
+    qkv.clear()
+    assert q.dtype == k.dtype == v.dtype and q.dtype != torch.float32 and q.shape[0] == 1
+    g, beta = g.contiguous(), beta.contiguous()
+    cu = cu_seqlens.to(torch.int64)
+    idx = indices.to(torch.int32)
+    with custom_device_ctx(q.device.index):
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+        chunk_indices = prepare_chunk_indices(cu, CHUNK_SIZE)
+        g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu, chunk_indices=chunk_indices)
+        w, u, _ = chunk_gated_delta_rule_fwd_intra(
+            k=k, v=v, g=g, beta=beta, cu_seqlens=cu, chunk_indices=chunk_indices,
+        )
+        v = None
+        h, v_new = chunk_gated_delta_rule_fwd_h(
+            k=k, w=w, u=u, g=g, initial_state=state_source, initial_state_indices=idx,
+            cu_seqlens=cu, chunk_indices=chunk_indices,
+        )
+        w = u = None
+        o = chunk_fwd_o(q=q, k=k, v=v_new, h=h, g=g, scale=scale, cu_seqlens=cu)
+    o = o.to(q.dtype)
+    if return_h:
+        return o[0], h
+    return o[0]
+
+
 def gdn_decode_fla(
     q: torch.Tensor,        # [1, B, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
     k: torch.Tensor,        # [1, B, num_k_heads, head_k_dim] bf16
@@ -75,4 +128,4 @@ def gdn_decode_fla(
     return o[0]
 
 
-__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla"]
+__all__ = ["gdn_decode_fla", "gdn_prefill_chunk_fla", "gdn_prefill_chunk_fla_owned"]

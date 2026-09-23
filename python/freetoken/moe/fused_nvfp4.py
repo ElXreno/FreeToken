@@ -322,6 +322,7 @@ def fused_experts_nvfp4(
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
+    del ic1
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,
