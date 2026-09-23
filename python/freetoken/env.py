@@ -85,6 +85,7 @@ class EnvClassSingleton:
     CPU_MOE_PHASES = EnvBool(False)  # log the CPU executor's per-dispatch phase times
     CPU_MOE_DELAY_US = EnvInt(0)  # read by _cpu_moe: busy-wait before each dispatch's done flag
     EARLY_DRAFT = EnvBool(True)  # enqueue a verify step's next draft at its drain, not at the next arm
+    DEVICE_PICK = EnvBool(True)  # pick a verify step's draft row on the device, queue the draft behind it
     KPROF = EnvStr("")  # "decode=200" or "prefill=4": torch.profiler capture, see kprof.py
     KPROF_SKIP = EnvInt(20)
     KPROF_OUT = EnvStr(".")

@@ -534,6 +534,8 @@ class Engine:
             self._mtp_hidden = torch.zeros(
                 width, config.model_config.hidden_size, dtype=self.dtype, device=self.device
             )
+            self._verify_draft_dev = torch.zeros(width, dtype=torch.int32, device=self.device)
+            self._verify_row0 = torch.arange(0, 2 * width, 2, dtype=torch.int64, device=self.device)
             logger.info_rank0(
                 f"MTP draft head ready: window {config.mtp_window}, {slots} ring slots, "
                 f"{mem_GB(self.mtp_head.ring_bytes)} of rings"
@@ -1205,6 +1207,13 @@ class Engine:
         self._last_rows_forwarded = (batch.padded_size if use_graph else batch.size) * (
             2 if batch.verify else 1
         )
+        if self.mtp_head is not None and batch.verify and ENV.DEVICE_PICK:
+            # the device already knows which row held, so the draft runs right behind the step
+            with hostprof.phase("stage"):
+                pick = self._device_pick(next_tokens_gpu, batch.size)
+                self._stage_mtp_draft(batch, next_tokens_gpu, self._last_rows_forwarded, pick=pick)
+                self._flush_mtp_draft()
+            batch.draft_staged = True
         kprof.end(batch)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
@@ -1232,14 +1241,20 @@ class Engine:
         dst = dst_host.to(self.device, non_blocking=True)
         token_pool.view(-1).index_copy_(0, dst, pred)
         self._verify_draft_cpu[:n].copy_(pred, non_blocking=True)
+        self._verify_draft_dev[:n].copy_(pred)
 
     def drafted_tokens(self, n: int) -> list[int]:
         """The drafts placed this step; valid once the step's copy_done event has fired."""
         return self._verify_draft_cpu[:n].tolist()
 
+    def _device_pick(self, next_tokens_gpu: torch.Tensor, n: int) -> torch.Tensor:
+        """Row each request drafts from: its second row if row 0 reproduced the draft, else row 0."""
+        held = next_tokens_gpu[0 : 2 * n : 2] == self._verify_draft_dev[:n]
+        return self._verify_row0[:n] + held.to(torch.int64)
+
     def stage_verify_draft(self, batch: Batch, next_tokens_gpu: torch.Tensor, pick: list[int]) -> None:
         """Draft from the last row a verify step committed, once the host knows which that is."""
-        if self.mtp_head is not None:
+        if self.mtp_head is not None and not getattr(batch, "draft_staged", False):
             self._stage_mtp_draft(batch, next_tokens_gpu, self._last_rows_forwarded, pick=pick)
 
     def _stage_mtp_draft(
@@ -1247,7 +1262,7 @@ class Engine:
         batch: Batch,
         next_tokens_gpu: torch.Tensor,
         rows_forwarded: int,
-        pick: list[int] | None = None,
+        pick: list[int] | torch.Tensor | None = None,
     ) -> None:
         """Copy this step's draft inputs aside; the draft itself runs at the top of the next step.
 
@@ -1257,7 +1272,7 @@ class Engine:
         reads: a wrong draft costs a ring write and the counters, never a served token.
 
         ``pick`` names the forwarded row each request drafts from; a verify step passes the last
-        row it committed, which is known only once the draft has been checked on the host.
+        row it committed, as the host's list after the drain or as the device-side pick.
         """
         t0 = perf_counter_ns()
         rows = batch.reqs[: batch.size]
@@ -1274,7 +1289,7 @@ class Engine:
             self._mtp_tokens[:n].copy_(next_tokens_gpu)
             self._mtp_positions[:n].copy_(batch.positions[:n])
         else:
-            sel = torch.tensor(pick, dtype=torch.int64, device=self.device)
+            sel = pick if isinstance(pick, torch.Tensor) else torch.tensor(pick, dtype=torch.int64, device=self.device)
             self._mtp_hidden[:n].copy_(hidden.index_select(0, sel))
             self._mtp_tokens[:n].copy_(next_tokens_gpu.index_select(0, sel))
             self._mtp_positions[:n].copy_(batch.positions.index_select(0, sel))
