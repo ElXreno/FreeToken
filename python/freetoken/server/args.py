@@ -889,6 +889,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hybrid-fetch-fraction",
+        type=float,
+        default=ServerArgs.moe_hybrid_fetch_fraction,
+        help=(
+            "With --moe-hybrid-max-fetch -1: fetch this share of each step's misses over PCIe "
+            "instead of the benched pcie/cpu bandwidth ratio (-1, default). The fetch sits on "
+            "the GPU's critical path while the CPU share overlaps it, so a share well below "
+            "the ratio can be faster."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

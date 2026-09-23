@@ -7,6 +7,7 @@ per-step integer split (GPU kernel vs CPU reference mirror, and the balance rule
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -113,6 +114,41 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
         assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
         assert torch.equal(gpu.id_of_slot.cpu(), ref.id_of_slot.cpu())
         assert (g >= 0).sum().item() == len(set(ids.tolist())) - (missing - fetched)
+
+
+def _resolve(monkeypatch, flag, profile):
+    import freetoken.engine.engine as eng
+    import freetoken.moe.bench_profile as bp
+
+    monkeypatch.setattr(eng, "_profile_gpu", lambda index=None: ("FAKE GPU", None))
+    monkeypatch.setattr(bp, "load_hybrid_fetch_fraction", lambda *a, **k: profile)
+    config = SimpleNamespace(moe_hybrid_max_fetch=-1, moe_hybrid_fetch_fraction=flag)
+    cache = SimpleNamespace(
+        quant_format="nvfp4", num_experts=256, hybrid_max_fetch=1, hybrid_fetch_fraction=0.0
+    )
+    eng.Engine._resolve_hybrid_fetch(SimpleNamespace(device=torch.device("cpu")), config, cache)
+    return cache.hybrid_max_fetch, cache.hybrid_fetch_fraction
+
+
+def test_fetch_fraction_flag_overrides_the_profile(monkeypatch):
+    assert _resolve(monkeypatch, -1.0, 0.28) == (256, 0.28)
+    assert _resolve(monkeypatch, 0.1, 0.28) == (256, 0.1)
+    assert _resolve(monkeypatch, 0.1, None) == (256, 0.1)
+    assert _resolve(monkeypatch, -1.0, None) == (1, 0.0)
+    # zero means no fetches at all, not the fraction-off fixed cap of num_experts
+    assert _resolve(monkeypatch, 0.0, 0.28) == (0, 0.0)
+
+
+def test_tiny_fraction_does_not_turn_into_the_fixed_cap():
+    from freetoken.moe.offload_kernels import ensure_experts_hybrid
+
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=32, cache_size=40, device=torch.device("cpu"),
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=32,
+    )
+    ensure_experts_hybrid(cache, 0, torch.arange(8, dtype=torch.int32), 32, 1e-7)
+    assert int(cache.num_missing_full.item()) == 8
+    assert int(cache.num_indices.item()) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

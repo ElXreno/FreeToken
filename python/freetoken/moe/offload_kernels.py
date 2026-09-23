@@ -54,7 +54,7 @@ def ensure_experts_hybrid(
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
     pre-cap miss count (stats)."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
-    frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
+    frac_q16 = min(1 << 16, max(int(fetch_fraction > 0), round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
         return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)

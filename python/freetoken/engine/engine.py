@@ -846,10 +846,17 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
-        )
+        source = "benched PCIe/CPU bandwidth ratio"
+        if config.moe_hybrid_fetch_fraction >= 0:
+            fraction, source = min(1.0, config.moe_hybrid_fetch_fraction), "--moe-hybrid-fetch-fraction"
+        else:
+            gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+            fraction = load_hybrid_fetch_fraction(
+                cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
+            )
+        if fraction == 0:
+            cache.hybrid_max_fetch = 0  # a zero fraction would read as "no fraction, fixed cap"
+            return
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -861,7 +868,7 @@ class Engine:
         cache.hybrid_fetch_fraction = fraction
         logger.info_rank0(
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
-            "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
+            f"expert misses over PCIe ({source}), the rest on the CPU"
         )
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
@@ -1689,6 +1696,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_hybrid_fetch_fraction": -1.0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
