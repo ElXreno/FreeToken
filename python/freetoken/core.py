@@ -69,6 +69,9 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # the next chunk of this chunked prefill, created before this one drains (overlap); a commit
+    # hands it the new cache handle so it never releases the span this chunk already gave the tree
+    successor: Req | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
