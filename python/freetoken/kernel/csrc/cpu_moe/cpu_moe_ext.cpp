@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -50,6 +51,82 @@
 namespace {
 
 using bf16_t = uint16_t;
+
+inline uint64_t phase_clock() {
+#if CPU_MOE_X86
+  return __rdtsc();
+#else
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+#endif
+}
+
+double phase_ticks_per_ns() {
+#if CPU_MOE_X86
+  const auto c0 = std::chrono::steady_clock::now();
+  const uint64_t t0 = __rdtsc();
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const uint64_t t1 = __rdtsc();
+  const auto c1 = std::chrono::steady_clock::now();
+  return static_cast<double>(t1 - t0) /
+         static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count());
+#else
+  return 1.0;
+#endif
+}
+
+bool env_flag(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
+}
+
+enum WaitMode { WAIT_FUTEX = 0, WAIT_SPIN = 1, WAIT_MWAITX = 2 };
+
+int wait_mode_from_env() {
+  const char* v = std::getenv("FREETOKEN_CPU_MOE_WAIT");
+  if (v != nullptr && std::strcmp(v, "futex") == 0) return WAIT_FUTEX;
+  if (v != nullptr && std::strcmp(v, "spin") == 0) return WAIT_SPIN;
+#if CPU_MOE_X86
+  if (__builtin_cpu_supports("mwaitx")) return WAIT_MWAITX;
+#endif
+  return WAIT_FUTEX;
+}
+
+#if CPU_MOE_X86
+__attribute__((target("mwaitx"))) void mwaitx_until(const std::atomic<uint64_t>& a, uint64_t target,
+                                                     uint64_t deadline) {
+  while (a.load(std::memory_order_acquire) < target) {
+    _mm_monitorx(const_cast<std::atomic<uint64_t>*>(&a), 0, 0);
+    if (a.load(std::memory_order_acquire) >= target) return;
+    const uint64_t now = __rdtsc();
+    if (now >= deadline) return;
+    const uint64_t left = deadline - now;
+    _mm_mwaitx(2, 0xf0, left > 0xffffffffull ? 0xffffffffu : static_cast<unsigned>(left));
+  }
+}
+#endif
+
+// true once a >= target, false when the deadline passed first
+bool hot_wait(const std::atomic<uint64_t>& a, uint64_t target, int mode, uint64_t ticks) {
+  const uint64_t deadline = phase_clock() + ticks;
+  if (mode == WAIT_SPIN) {
+    while (a.load(std::memory_order_acquire) < target) {
+      if (phase_clock() >= deadline) return false;
+#if CPU_MOE_X86
+      _mm_pause();
+#endif
+    }
+    return true;
+  }
+#if CPU_MOE_X86
+  if (mode == WAIT_MWAITX) {
+    mwaitx_until(a, target, deadline);
+    return a.load(std::memory_order_acquire) >= target;
+  }
+#endif
+  return a.load(std::memory_order_acquire) >= target;
+}
 
 inline float bf16_to_f32(bf16_t v) {
   uint32_t u = static_cast<uint32_t>(v) << 16;
@@ -1314,12 +1391,70 @@ inline int ceil_log2_pos(float v) {
 // Split an interleaved bf16 row into fp32 even/odd halves (even[m]=src[2m]).
 // bf16->fp32 is exact, so this only reorders -- done once per token/route and
 // reused across every output row of the GEMV.
+#if CPU_MOE_X86
+__attribute__((target("avx512f"))) void deinterleave_bf16_f32_avx512(const bf16_t* src, float* even,
+                                                                     float* odd, int K) {
+  int m = 0;
+  const __m512i hi = _mm512_set1_epi32(static_cast<int>(0xFFFF0000u));
+  for (; m + 16 <= K / 2; m += 16) {
+    const __m512i v = _mm512_loadu_si512(src + 2 * m);
+    _mm512_storeu_ps(even + m, _mm512_castsi512_ps(_mm512_slli_epi32(v, 16)));
+    _mm512_storeu_ps(odd + m, _mm512_castsi512_ps(_mm512_and_si512(v, hi)));
+  }
+  for (; m < K / 2; ++m) {
+    even[m] = bf16_to_f32(src[2 * m]);
+    odd[m] = bf16_to_f32(src[2 * m + 1]);
+  }
+}
+#endif
+
 inline void deinterleave_bf16_f32(const bf16_t* src, float* even, float* odd, int K) {
+#if CPU_MOE_X86
+  static const bool avx512 = __builtin_cpu_supports("avx512f");
+  if (avx512) {
+    deinterleave_bf16_f32_avx512(src, even, odd, K);
+    return;
+  }
+#endif
   for (int m = 0; m < K / 2; ++m) {
     even[m] = bf16_to_f32(src[2 * m]);
     odd[m] = bf16_to_f32(src[2 * m + 1]);
   }
 }
+
+#if CPU_MOE_X86
+// quant_i8_pg16 with lround's ties-away-from-zero, bit-identical to the scalar loop
+__attribute__((target("avx512f,avx512vl"))) void quant_i8_pg16_avx512(const float* xe, const float* xo,
+                                                                     int K, int8_t* asi8, float* asb) {
+  const __m256 sign = _mm256_set1_ps(-0.0f);
+  const __m256 one = _mm256_set1_ps(1.0f);
+  const __m256 half = _mm256_set1_ps(0.5f);
+  const __m256i lo = _mm256_set1_epi32(-127), up = _mm256_set1_epi32(127);
+  for (int b = 0; b < K / 16; ++b) {
+    const __m256 e = _mm256_loadu_ps(xe + (size_t)b * 8), o = _mm256_loadu_ps(xo + (size_t)b * 8);
+    const __m256 m = _mm256_max_ps(_mm256_andnot_ps(sign, e), _mm256_andnot_ps(sign, o));
+    __m128 h = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+    h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_max_ss(h, _mm_shuffle_ps(h, h, 1));
+    const float amax = _mm_cvtss_f32(h);
+    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+    asb[b] = s;
+    const __m256 inv = _mm256_set1_ps(1.0f / s);
+    int8_t* ae = asi8 + (size_t)b * 16;
+    const __m256 vs[2] = {e, o};
+    for (int k = 0; k < 2; ++k) {
+      const __m256 x = _mm256_mul_ps(vs[k], inv);
+      const __m256 t = _mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+      const __m256 frac = _mm256_andnot_ps(sign, _mm256_sub_ps(x, t));
+      const __m256 away = _mm256_add_ps(t, _mm256_or_ps(one, _mm256_and_ps(sign, x)));
+      const __m256 r = _mm256_blendv_ps(t, away, _mm256_cmp_ps(frac, half, _CMP_GE_OQ));
+      __m256i q = _mm256_cvtps_epi32(r);
+      q = _mm256_max_epi32(_mm256_min_epi32(q, up), lo);
+      _mm_storel_epi64(reinterpret_cast<__m128i*>(ae + 8 * k), _mm256_cvtepi32_epi8(q));
+    }
+  }
+}
+#endif
 
 // DeepSeek-V4 activation FP8 round-trip (bf16 in/out): per 128-block,
 // s = 2^ceil(log2(max(|x|,1e-4)/448)); y = round_e4m3(clamp(x/s,+-448)) * s.
@@ -1593,6 +1728,21 @@ struct CpuMoeExecutor {
   std::vector<int64_t> flag_served;          // slot -> completed dispatch count (tests/debug)
   std::mutex flag_task_mtx;
 
+  // FREETOKEN_CPU_MOE_WAIT=futex|spin|mwaitx, default mwaitx where the CPU has it
+  int wait_mode = WAIT_FUTEX;
+  uint64_t hot_ticks = 0;
+  alignas(64) std::atomic<uint64_t> gen_pub{0};
+  alignas(64) std::atomic<uint64_t> done_pub{0};
+
+  // FREETOKEN_CPU_MOE_PHASES / FREETOKEN_CPU_MOE_DELAY_US, debug only
+  bool phase_on = false;
+  int64_t delay_us = 0;
+  double ticks_per_ns = 1.0;
+  std::atomic<uint64_t> first_start{0};
+  std::atomic<uint64_t> last_end{0};
+  uint64_t ph_sum[6] = {0, 0, 0, 0, 0, 0};
+  uint64_t ph_n = 0, ph_tokens = 0, ph_gap_n = 0, ph_prev_done = 0;
+
   // Portable ordering for the flag handshake: "ready observed => the DMA'd inputs that
   // preceded the bump are visible" and "y stores are visible before done". Plain
   // volatile loads lean on x86 TSO; acquire/release makes it hold on aarch64 too
@@ -1698,8 +1848,46 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
+    phase_on = env_flag("FREETOKEN_CPU_MOE_PHASES");
+    if (const char* d = std::getenv("FREETOKEN_CPU_MOE_DELAY_US")) delay_us = std::atoll(d);
+    wait_mode = wait_mode_from_env();
+    if (phase_on || delay_us > 0 || wait_mode != WAIT_FUTEX) ticks_per_ns = phase_ticks_per_ns();
+    if (wait_mode != WAIT_FUTEX) {
+      const char* s = std::getenv("FREETOKEN_CPU_MOE_SPIN_US");
+      hot_ticks = static_cast<uint64_t>((s ? std::atof(s) : 5000.0) * 1e3 * ticks_per_ns);
+    }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
+  }
+
+  void record_phase(const MoeTask* t, uint64_t t0, uint64_t t1) {
+    const uint64_t t4 = phase_clock();
+    const uint64_t s = first_start.load(std::memory_order_relaxed);
+    const uint64_t e = last_end.load(std::memory_order_relaxed);
+    ph_sum[0] += t1 - t0;
+    ph_sum[1] += s > t1 ? s - t1 : 0;
+    ph_sum[2] += e > s ? e - (s > t1 ? s : t1) : 0;
+    ph_sum[3] += t4 > e ? t4 - e : 0;
+    ph_sum[4] += t4 - t0;
+    const uint64_t gap_cap = static_cast<uint64_t>(5e6 * ticks_per_ns);
+    if (ph_prev_done != 0 && t0 > ph_prev_done && t0 - ph_prev_done < gap_cap) {
+      ph_sum[5] += t0 - ph_prev_done;
+      ++ph_gap_n;
+    }
+    ph_prev_done = t4;
+    ++ph_n;
+    ph_tokens += static_cast<uint64_t>(t->num_tokens);
+  }
+
+  pybind11::dict phase_stats() const {
+    pybind11::dict d;
+    const char* names[6] = {"prep_ns", "wake_ns", "compute_ns", "syncwake_ns", "total_ns", "gap_ns"};
+    for (int i = 0; i < 6; ++i) d[names[i]] = static_cast<double>(ph_sum[i]) / ticks_per_ns;
+    d["n"] = ph_n;
+    d["gap_n"] = ph_gap_n;
+    d["tokens"] = ph_tokens;
+    d["delay_us"] = delay_us;
+    return d;
   }
 
   // Quantize a bf16 activation row to Q8_0 (llama.cpp): per-32-block symmetric int8 in
@@ -1727,6 +1915,13 @@ struct CpuMoeExecutor {
   // [even(8),odd(8)] layout the VNNI dot expects. Done once per token/route (amortized over
   // every output row), so a scalar pass is fine relative to the GEMV.
   void quant_i8_pg16(const float* xe, const float* xo, int K, int8_t* asi8, float* asb) {
+#if CPU_MOE_X86
+    static const bool avx512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl");
+    if (avx512) {
+      quant_i8_pg16_avx512(xe, xo, K, asi8, asb);
+      return;
+    }
+#endif
     const int nb = K / 16;
     for (int b = 0; b < nb; ++b) {
       const float* xeb = xe + (size_t)b * 8;
@@ -1834,6 +2029,9 @@ struct CpuMoeExecutor {
   }
 
   const char* isa_name() const { return isa; }
+  const char* wait_mode_name() const {
+    return wait_mode == WAIT_MWAITX ? "mwaitx" : wait_mode == WAIT_SPIN ? "spin" : "futex";
+  }
 
   void barrier(int& local_sense) {
     local_sense ^= 1;
@@ -2164,6 +2362,7 @@ struct CpuMoeExecutor {
     pin_self(tid);
     uint64_t my_gen = 0;
     for (;;) {
+      if (wait_mode != WAIT_FUTEX) hot_wait(gen_pub, my_gen + 1, wait_mode, hot_ticks);
       MoeTask* t;
       {
         std::unique_lock<std::mutex> lk(task_mtx);
@@ -2172,9 +2371,15 @@ struct CpuMoeExecutor {
         my_gen = cur_gen;
         t = cur_task;
       }
+      if (phase_on) {
+        uint64_t zero = 0;
+        first_start.compare_exchange_strong(zero, phase_clock(), std::memory_order_relaxed);
+      }
       run_task_body(t);
       if (done_count.fetch_add(1) + 1 == num_threads) {
+        if (phase_on) last_end.store(phase_clock(), std::memory_order_relaxed);
         completed.store(my_gen, std::memory_order_release);
+        done_pub.store(my_gen, std::memory_order_release);
         {
           std::lock_guard<std::mutex> lk(sync_mtx);
         }
@@ -2251,12 +2456,14 @@ struct CpuMoeExecutor {
       cur_task = t;
       ++cur_gen;
       submitted.store(cur_gen, std::memory_order_release);
+      gen_pub.store(cur_gen, std::memory_order_release);
     }
     task_cv.notify_all();
   }
 
   void sync() {
     const uint64_t target = submitted.load(std::memory_order_acquire);
+    if (wait_mode != WAIT_FUTEX && hot_wait(done_pub, target, wait_mode, hot_ticks)) return;
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
   }
@@ -2343,8 +2550,21 @@ struct CpuMoeExecutor {
             t = (L < static_cast<int>(flag_task.size())) ? flag_task[L] : nullptr;
           }
           if (t != nullptr) {
+            const uint64_t t0 = phase_on ? phase_clock() : 0;
+            if (phase_on) first_start.store(0, std::memory_order_relaxed);
             submit(t);
+            const uint64_t t1 = phase_on ? phase_clock() : 0;
             sync();
+            if (delay_us > 0) {
+              const uint64_t until =
+                  phase_clock() + static_cast<uint64_t>(static_cast<double>(delay_us) * 1e3 * ticks_per_ns);
+              while (phase_clock() < until) {
+#if CPU_MOE_X86
+                _mm_pause();
+#endif
+              }
+            }
+            if (phase_on) record_phase(t, t0, t1);
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
@@ -2432,13 +2652,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))
+      .def("phase_stats", &CpuMoeExecutor::phase_stats)
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
-      .def("isa_name", &CpuMoeExecutor::isa_name);
+      .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("wait_mode_name", &CpuMoeExecutor::wait_mode_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));

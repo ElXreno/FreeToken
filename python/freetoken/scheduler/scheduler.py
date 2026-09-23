@@ -613,6 +613,10 @@ class Scheduler(SchedulerIOMixin):
         self._moe_stats_count += 1
         if self._moe_stats_count % self.status_reporter.decode_log_interval != 0:
             return self._moe_stats_last
+        if ENV.CPU_MOE_PHASES and self.engine.cpu_moe_executor is not None:
+            line = self.engine.cpu_moe_executor.phase_report()
+            if line:
+                logger.info_rank0(line)
         s = cache.decode_miss_stats()
         calls = int(s["layer_calls"])
         cur = (

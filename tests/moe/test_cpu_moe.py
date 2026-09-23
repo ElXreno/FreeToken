@@ -661,3 +661,21 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+@pytest.mark.parametrize("env", [None, "futex", "spin", "mwaitx"])
+def test_cpu_moe_wait_mode_defaults_to_mwaitx_where_the_cpu_has_it(monkeypatch, env):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    with open("/proc/cpuinfo") as f:
+        has_mwaitx = " mwaitx" in f.read()
+    if env is None:
+        monkeypatch.delenv("FREETOKEN_CPU_MOE_WAIT", raising=False)
+    else:
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_WAIT", env)
+    ex = CpuMoeExecutor(
+        _make_cache(2, 4, 64, 32), top_k=2, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=1, device=torch.device("cuda"),
+    )
+    fallback = "mwaitx" if has_mwaitx else "futex"
+    assert ex.wait_mode == {None: fallback, "mwaitx": fallback}.get(env, env)

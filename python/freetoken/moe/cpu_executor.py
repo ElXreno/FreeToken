@@ -246,6 +246,7 @@ class CpuMoeExecutor:
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
+        self.wait_mode = self._ext.wait_mode_name()
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
@@ -317,7 +318,7 @@ class CpuMoeExecutor:
 
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
+            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} wait={self.wait_mode} fmt={fmt} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
@@ -644,6 +645,24 @@ class CpuMoeExecutor:
         for i in dead:
             self._done[i] = 1  # after err: unblock the stream into a checked failure
             suspects.pop(i, None)
+
+    def phase_report(self) -> str | None:
+        """Per-dispatch phase times of the flag path since the last report (FREETOKEN_CPU_MOE_PHASES)."""
+        stats = getattr(self._ext, "phase_stats", None)
+        if stats is None:
+            return None
+        cur = stats()
+        prev = getattr(self, "_phase_prev", None)
+        self._phase_prev = cur
+        d = {k: cur[k] - (prev[k] if prev else 0) for k in cur if k != "delay_us"}
+        n = max(d["n"], 1)
+        us = {k: d[k] / n / 1e3 for k in ("prep_ns", "wake_ns", "compute_ns", "syncwake_ns", "total_ns")}
+        gap = d["gap_ns"] / max(d["gap_n"], 1) / 1e3
+        return (
+            f"cpu moe phases (us/dispatch): prep {us['prep_ns']:.1f} wake {us['wake_ns']:.1f} "
+            f"compute {us['compute_ns']:.1f} syncwake {us['syncwake_ns']:.1f} total {us['total_ns']:.1f} "
+            f"gap {gap:.1f}, {d['n']} dispatches, {d['tokens'] / n:.2f} tok, delay {cur['delay_us']} us"
+        )
 
     def raise_if_unhealthy(self) -> None:
         """Raise if the flag watchdog fired (a doorbell stayed unanswered because the
