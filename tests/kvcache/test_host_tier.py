@@ -112,6 +112,33 @@ def test_kv_roundtrip_and_split():
         tier.close()
 
 
+def _assert_extents_sane(arena: HostArena, live) -> None:
+    ext = sorted(arena.free_extents)
+    for (a, sa), (b, _) in zip(ext, ext[1:]):
+        assert a + sa <= b, f"free extents overlap: {ext}"
+    for off, size in ext:
+        for ref in live:
+            assert off + size <= ref.offset or off >= ref.offset + ref.nbytes, f"free extent {off}+{size} overlaps live {ref}"
+    assert sum(size for _, size in ext) + arena.used == arena.capacity
+
+
+def test_split_halves_free_exactly_the_extent_they_came_from():
+    with tempfile.TemporaryDirectory() as d:
+        kv = FakeKVPool(layers=10, pages=64, heads=2, head_dim=256)
+        tier, _, _ = make_tier(d, capacity=64 * ALIGN, kv=kv)
+        assert tier.row_bytes == 10240
+        node = tier.put_kv(torch.arange(0, 3, dtype=torch.int32))
+        neighbour = tier.put_kv(torch.arange(3, 4, dtype=torch.int32))
+        head, tail = tier.split_kv(node, 1)
+        head_a, head_b = tier.split_kv(head, 0)
+        for ref in (tail, head_b, head_a):
+            tier.free(ref)
+        _assert_extents_sane(tier.arena, [neighbour])
+        tier.free(neighbour)
+        assert tier.arena.free_extents == [[0, tier.arena.capacity]] and tier.arena.used == 0
+        tier.close()
+
+
 def test_kv_roundtrip_spans_several_staging_chunks():
     for dtype in (torch.uint8, torch.float8_e4m3fn, torch.bfloat16):
         with tempfile.TemporaryDirectory() as d:
