@@ -394,3 +394,94 @@ def test_validity_key_follows_the_ablation_that_shaped_the_cached_states():
         with open(table, "wb") as f:
             f.write(b"direction table v2")
         assert base != key(ablate_direction=table, ablate_layer=20, ablate_alpha=0.6)
+
+
+def _crash_setup(d):
+    kv, lin = FakeKVPool(pages=1024), FakeLinearPool()
+    probe, _, _ = make_tier(d, kv=kv, lin=lin)
+    snap_bytes, row_bytes = probe.snap_bytes, probe.row_bytes
+    probe.close()
+    for name in os.listdir(d):
+        os.unlink(os.path.join(d, name))
+    per = (snap_bytes + ALIGN - 1) // ALIGN * ALIGN + (64 * row_bytes + ALIGN - 1) // ALIGN * ALIGN
+    tier, _, _ = make_tier(d, capacity=3 * per, kv=kv, lin=lin)
+    return tier, kv, lin
+
+
+def _reload_and_read(d, kv, lin, tokens):
+    tier = make_tier(d, kv=kv, lin=lin)[0]
+    cache = TieredHybridRadixCache(DEVICE, 1, tier)
+    cache.import_nodes(tier.take_loaded_nodes())
+    m = cache.match_prefix(tokens)
+    if m.cached_len == 0:
+        tier.close()
+        return None
+    cache.inc_lock(m.node)
+    cache.promote(m.node, Alloc(900))
+    got = kv.rows(torch.cat([n.value for n in cache._path(m.node)]))
+    tier.close()
+    return got
+
+
+def test_an_unclean_stop_never_serves_an_extent_rewritten_after_the_last_flush():
+    with tempfile.TemporaryDirectory() as d:
+        tier, kv, lin = _crash_setup(d)
+        cache = TieredHybridRadixCache(DEVICE, 1, tier)
+        first = torch.arange(0, 64, dtype=torch.int32)
+        kv.randomize(first)
+        want = kv.rows(first)
+        commit(cache, tier, ids(64, 10_000), first, 1)
+        tier.save_meta(cache.export_nodes())
+        for i in range(1, 5):
+            slots = torch.arange(i * 64, i * 64 + 64, dtype=torch.int32)
+            kv.randomize(slots)
+            commit(cache, tier, ids(64, 10_000 * (i + 1)), slots, 1)
+        assert cache.host_evictions >= 1
+        tier.close()
+        got = _reload_and_read(d, kv, lin, ids(64, 10_000))
+        assert got is None or torch.equal(got, want)
+
+
+def test_a_flush_after_the_rewrite_still_restores_the_live_tree():
+    with tempfile.TemporaryDirectory() as d:
+        tier, kv, lin = _crash_setup(d)
+        cache = TieredHybridRadixCache(DEVICE, 1, tier)
+        commit(cache, tier, ids(64, 10_000), torch.arange(0, 64, dtype=torch.int32), 1)
+        tier.save_meta(cache.export_nodes())
+        last = None
+        for i in range(1, 5):
+            slots = torch.arange(i * 64, i * 64 + 64, dtype=torch.int32)
+            kv.randomize(slots)
+            last = (i, kv.rows(slots))
+            commit(cache, tier, ids(64, 10_000 * (i + 1)), slots, 1)
+        tier.save_meta(cache.export_nodes())
+        tier.close()
+        i, want = last
+        assert torch.equal(_reload_and_read(d, kv, lin, ids(64, 10_000 * (i + 1))), want)
+        assert _reload_and_read(d, kv, lin, ids(64, 10_000)) is None
+
+
+def test_a_tree_stored_under_another_key_is_dropped_before_its_extents_are_reused():
+    with tempfile.TemporaryDirectory() as d:
+        tier, kv, lin = make_tier(d, key={"model": "a"})
+        cache = TieredHybridRadixCache(DEVICE, 1, tier)
+        first = torch.arange(0, 64, dtype=torch.int32)
+        kv.randomize(first)
+        want = kv.rows(first)
+        commit(cache, tier, ids(64, 10_000), first, 1)
+        tier.save_meta(cache.export_nodes())
+        tier.close()
+        other, _, _ = make_tier(d, key={"model": "b"}, kv=kv, lin=lin)
+        slots = torch.arange(64, 128, dtype=torch.int32)
+        kv.randomize(slots)
+        other.put_kv(slots)
+        other.close()
+        back = make_tier(d, key={"model": "a"}, kv=kv, lin=lin)[0]
+        c2 = TieredHybridRadixCache(DEVICE, 1, back)
+        c2.import_nodes(back.take_loaded_nodes())
+        m = c2.match_prefix(ids(64, 10_000))
+        if m.cached_len:
+            c2.inc_lock(m.node)
+            c2.promote(m.node, Alloc(900))
+            assert torch.equal(kv.rows(torch.cat([n.value for n in c2._path(m.node)])), want)
+        back.close()
