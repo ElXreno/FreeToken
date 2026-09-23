@@ -253,7 +253,7 @@ class TieredHybridRadixCache(HybridRadixCache):
             out.append({
                 "parent": ids[id(n.parent)],
                 "tokens": encode_tokens(n._key),
-                "kv": [n.host_kv.offset, n.host_kv.nbytes],
+                "kv": [n.host_kv.offset, n.host_kv.nbytes, n.host_kv.released()],
                 "snap": [n.host_snap.offset, n.host_snap.nbytes] if n.host_snap is not None else None,
                 "ts": n.timestamp,
             })

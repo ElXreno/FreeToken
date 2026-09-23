@@ -117,8 +117,7 @@ class RadixTreeNode:
         # sub-span of it; the snapshot sits on the end boundary and stays with the suffix.
         if self.host_kv is not None:
             row = self.host_kv.nbytes // self._length
-            new_node.host_kv = type(self.host_kv)(self.host_kv.offset, pos * row)
-            self.host_kv = type(self.host_kv)(self.host_kv.offset + pos * row, (self._length - pos) * row)
+            new_node.host_kv, self.host_kv = self.host_kv.split(pos * row)
 
         if self.resident:
             self.set_key_value(self._key[pos:], self._value[pos:])
