@@ -234,14 +234,15 @@ def _prefill_config(M: int) -> Dict[str, int]:
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
     # over (BLOCK_M, BLOCK_N, num_warps, num_stages) for 256-expert top-8 shapes (H 2048,
     # I 512). BLOCK_KB stays 32: it fixes the K accumulation order, so outputs are identical.
+    # The e2m1 decode keeps the kernel on ALUs, so one stage (more resident CTAs) beats pipelining.
     if M <= 64:
         return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
                     GROUP_SIZE_M=1, num_warps=8, num_stages=4)
     if M < 1024:
         return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                    GROUP_SIZE_M=8, num_warps=8, num_stages=3)
-    return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=4, num_stages=4)
+                    GROUP_SIZE_M=8, num_warps=8, num_stages=1)
+    return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=256, BLOCK_SIZE_KB=32,
+                GROUP_SIZE_M=8, num_warps=4, num_stages=1)
 
 
 def _prefill_gemm(

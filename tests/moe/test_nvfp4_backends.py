@@ -553,7 +553,7 @@ def test_arithmetic_e2m1_decode_is_the_lut_bit_for_bit():
 
 
 @cuda
-@pytest.mark.parametrize("m", [100, 1500])
+@pytest.mark.parametrize("m", [100, 1500, 4096])
 def test_prefill_tile_configs_give_identical_outputs(m):
     from freetoken.moe import fused_nvfp4 as F
 
