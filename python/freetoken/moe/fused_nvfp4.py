@@ -232,12 +232,16 @@ def fused_experts_decode_nvfp4_serial(
 def _prefill_config(M: int) -> Dict[str, int]:
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
-    # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
+    # over (BLOCK_M, BLOCK_N, num_warps, num_stages) for 256-expert top-8 shapes (H 2048,
+    # I 512). BLOCK_KB stays 32: it fixes the K accumulation order, so outputs are identical.
     if M <= 64:
         return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
                     GROUP_SIZE_M=1, num_warps=8, num_stages=4)
-    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=8, num_stages=4)
+    if M < 1024:
+        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
+                    GROUP_SIZE_M=8, num_warps=8, num_stages=3)
+    return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32,
+                GROUP_SIZE_M=8, num_warps=4, num_stages=4)
 
 
 def _prefill_gemm(

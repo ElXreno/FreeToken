@@ -534,10 +534,9 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert cache.gate_up_alpha.shape == (total,)
 
 
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
-
-from freetoken.kernel.triton.nvfp4_fused_moe import _e2m1_scaled_down  # noqa: E402
+import triton
+import triton.language as tl
+from freetoken.kernel.triton.nvfp4_fused_moe import _e2m1_scaled_down
 
 
 @triton.jit
@@ -551,3 +550,27 @@ def test_arithmetic_e2m1_decode_is_the_lut_bit_for_bit():
     out = torch.empty(16, device="cuda")
     _e2m1_table_kernel[(1,)](out)
     assert torch.equal(out.cpu().view(torch.int32), _E2M1.view(torch.int32))
+
+
+@cuda
+@pytest.mark.parametrize("m", [100, 1500])
+def test_prefill_tile_configs_give_identical_outputs(m):
+    from freetoken.moe import fused_nvfp4 as F
+
+    torch.manual_seed(0)
+    experts, n, k, top_k = 16, 256, 512, 4
+    packed = torch.randint(0, 256, (experts, n, k // 2), device="cuda", dtype=torch.uint8)
+    scale = (torch.rand(experts, n, k // 16, device="cuda") * 2 + 0.25).to(torch.float8_e4m3fn)
+    glob = (torch.rand(experts, n, device="cuda") * 0.01 + 0.001).to(torch.float16)
+    a = (torch.randn(m, k, device="cuda") * 0.5).to(torch.bfloat16)
+    tw, ids = torch.topk(torch.softmax(torch.randn(m, experts, device="cuda"), -1), top_k, dim=-1)
+    ids, tw = ids.to(torch.int32), tw.reshape(-1).contiguous()
+    base, tuned = F._prefill_config(1), F._prefill_config(m)
+    assert base != tuned
+    outs = []
+    for cfg in (base, tuned):
+        sorted_ids, expert_ids, ntpp = F.moe_align_block_size(ids, cfg["BLOCK_SIZE_M"], experts)
+        c = torch.empty((m, top_k, n), device="cuda", dtype=torch.bfloat16)
+        F._prefill_gemm(a, packed, scale, glob, c, tw, sorted_ids, expert_ids, ntpp, ids.numel(), top_k, False, cfg)
+        outs.append(c)
+    assert torch.equal(outs[0], outs[1])
