@@ -14,6 +14,8 @@ from flashlib.kernels.slot_cache import lru_ensure
 _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
+# the hybrid kernel also writes the CPU route ids and accumulates the decode stats
+HYBRID_FUSED = os.getenv("FREETOKEN_HYBRID_FUSED", "1") != "0"
 
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -41,7 +43,8 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0,
+    cpu_ids: torch.Tensor | None = None, fused_stats: bool = False,
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -52,12 +55,17 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats). ``cpu_ids`` receives the raw id of every route left to the
+    CPU (-1 elsewhere); ``fused_stats`` accumulates the decode stats in the same launch."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(int(fetch_fraction > 0), round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
-        return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        raw = expert_ids.clone()
+        _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        if cpu_ids is not None:
+            cpu_ids.copy_(torch.where(expert_ids >= 0, raw.new_full((), -1), raw))
+        return
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16, cpu_ids, fused_stats)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -95,7 +103,8 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    cpu_ids: torch.Tensor | None = None, fused_stats: bool = False,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -112,15 +121,23 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        cache.hybrid_stats,
+        cache.decode_freq,
+        cpu_ids if cpu_ids is not None else expert_ids,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
         int(frac_q16),
+        cache.num_layers,
         cache.num_experts,
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
+        BLOCK_A=max(16, triton.next_power_of_2(expert_ids.numel())),
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        STATS=fused_stats,
+        FREQ=fused_stats and cache.collect_decode_freq,
+        CPU_IDS=cpu_ids is not None,
         num_warps=num_warps,
     )
 
@@ -185,7 +202,8 @@ def _ensure_experts_hybrid_cpu(
     # Overflow misses keep slot_for_id == -1, so the rewrite below yields -1 for them.
     flat = expert_ids.view(-1)
     for i in range(flat.numel()):
-        flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+        e = int(flat[i].item())
+        flat[i] = int(cache.slot_for_id[layer_id, e].item()) if e >= 0 else -1
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
@@ -300,15 +318,23 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    stats_ptr,
+    freq_ptr,
+    cpu_ids_ptr,
     layer_id,
     num_active,
     max_fetch,
     fetch_frac_q16,
+    num_layers,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    STATS: tl.constexpr = False,
+    FREQ: tl.constexpr = False,
+    CPU_IDS: tl.constexpr = False,
+    BLOCK_A: tl.constexpr = 16,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -333,10 +359,13 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+    off_a = tl.arange(0, BLOCK_A)
+    a_mask = off_a < num_active
+    ids = tl.load(expert_ids_ptr + off_a, mask=a_mask, other=-1)
+    match = ids[:, None] == off_e[None, :]
+    is_active = tl.max(match.to(tl.int32), axis=0) > 0
+    if FREQ:
+        tl.atomic_add(freq_ptr + base + ids, 1, mask=a_mask & (ids >= 0))
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -355,8 +384,17 @@ def _ensure_experts_hybrid_kernel(
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
+    if STATS:
+        n_active = tl.sum((is_active & e_mask).to(tl.int64))
+        k = tl.arange(0, 8)
+        miss64, fetch64 = num_missing.to(tl.int64), num_fetch.to(tl.int64)
+        val = tl.where((k % 4) == 0, miss64, tl.where((k % 4) == 1, n_active, tl.where(k == 3, fetch64, 1)))
+        val = tl.where(k == 6, fetch64, tl.where(k == 7, 1, val))
+        off = tl.where(k < 4, k, 4 + (k - 4) * num_layers + layer_id)
+        tl.atomic_add(stats_ptr + off, val.to(tl.int64))
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
+    slot_final = slot
 
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
     # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
@@ -375,10 +413,8 @@ def _ensure_experts_hybrid_kernel(
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
         u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            ei = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | (oid == base + ei)
+        hit_slots = tl.max(tl.where(match, slot[None, :], -1), axis=1)
+        owner_active = tl.max(((hit_slots[:, None] == off_c[None, :]) & (hit_slots[:, None] >= 0)).to(tl.int32), axis=0) > 0
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -396,12 +432,13 @@ def _ensure_experts_hybrid_kernel(
             tl.store(evict_slots_ptr + i, victim)
             tl.store(src_indices_ptr + i, e)  # layer-local row
             u = tl.where(off_c == victim, 9223372036854775807, u)
+            slot_final = tl.where(off_e == e, victim, slot_final)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
-        tl.store(expert_ids_ptr + i, s)
+    s = tl.max(tl.where(match, slot_final[None, :], -1), axis=1)
+    tl.store(expert_ids_ptr + off_a, s, mask=a_mask)
+    if CPU_IDS:
+        tl.store(cpu_ids_ptr + off_a, tl.where(s >= 0, -1, ids), mask=a_mask)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.

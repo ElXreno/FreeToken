@@ -24,6 +24,8 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+# measurement only, wrong output: drop the CPU routes to price the whole CPU path
+_HYBRID_DROP_CPU = os.getenv("FREETOKEN_HYBRID_DROP_CPU", "0") == "1"
 
 
 class MoELayer(BaseOP):
@@ -313,13 +315,24 @@ class OffloadMoELayer(MoELayer):
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+        from freetoken.moe.offload_kernels import HYBRID_FUSED
+
+        if HYBRID_FUSED and topk_ids.is_cuda:
+            cpu_ids = torch.empty_like(topk_ids)  # the kernel writes the raw id of every CPU route
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids, cpu_ids=cpu_ids)
+        else:
+            raw = topk_ids.clone()  # raw expert ids for the CPU partial
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
+            cpu_ids = torch.where(topk_ids >= 0, raw.new_full((), -1), raw).contiguous()
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
+        if _HYBRID_DROP_CPU:
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache, hidden_states, topk_weights, topk_ids, views=cache.bank_views(), n=None,
+                alphas=cache.alphas_for_slots(self.layer_id), is_prefill=False,
+            )
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the

@@ -152,6 +152,75 @@ def test_tiny_fraction_does_not_turn_into_the_fixed_cap():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_hybrid_cpu_routes_gpu_match_cpu_reference():
+    from freetoken.moe.offload_kernels import ensure_experts_hybrid
+
+    torch.manual_seed(0)
+    num_experts, cache_size, top_k = 32, 40, 8
+
+    def make():
+        return OffloadMoeCache(
+            num_layers=2, num_experts=num_experts, cache_size=cache_size,
+            device=torch.device("cuda"), quant_format="bf16", decode_target="hybrid",
+            hybrid_max_fetch=num_experts,
+        )
+
+    gpu, ref = make(), make()
+    for step in range(64):
+        ids = torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(2)]).to(torch.int32)
+        g, c = ids.clone().cuda(), ids.clone()
+        g_cpu, c_cpu = torch.empty_like(g), torch.empty_like(c)
+        ensure_experts_hybrid(gpu, step % 2, g, num_experts, 0.3, cpu_ids=g_cpu)
+        ensure_experts_hybrid(ref, step % 2, c, num_experts, 0.3, cpu_ids=c_cpu)
+        assert int(gpu.num_indices.item()) == int(ref.num_indices.item())
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(g_cpu.cpu(), c_cpu)
+        assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())
+        missing = int(ref.num_missing_full.item())
+        uniq = len(set(ids.view(-1).tolist()))
+        on_cpu = missing - int(ref.num_indices.item())
+        assert len(set(c_cpu[c_cpu >= 0].tolist())) == on_cpu
+        assert len(set(c[c >= 0].tolist())) == uniq - on_cpu
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_hybrid_bookkeeping_matches_the_reference(monkeypatch):
+    import freetoken.moe.offload_kernels as ok
+
+    torch.manual_seed(0)
+    num_experts, cache_size, top_k, rows = 32, 40, 8, 2
+
+    def make():
+        cache = OffloadMoeCache(
+            num_layers=2, num_experts=num_experts, cache_size=cache_size,
+            device=torch.device("cuda"), quant_format="bf16", decode_target="hybrid",
+            hybrid_max_fetch=num_experts, hybrid_fetch_fraction=0.3,
+        )
+        cache.collect_stats = cache.collect_decode_freq = True
+        return cache
+
+    monkeypatch.setattr(ok, "HYBRID_FUSED", True)
+    fused, ref = make(), make()
+    ref.collect_decode_freq = False
+    freq = torch.zeros_like(ref.decode_freq, device="cpu")
+    for step in range(64):
+        layer = step % 2
+        ids = torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(rows)]).to(torch.int32)
+        g, c = ids.clone().cuda(), ids.clone()
+        g_cpu = torch.full_like(g, 7)
+        fused.ensure_experts_hybrid(layer, g, cpu_ids=g_cpu)
+        fused.record_decode_stats_hybrid(layer)
+        ref.ensure_experts_hybrid(layer, c)
+        ref.record_decode_stats_hybrid(layer)
+        freq[layer] += torch.bincount(ids.view(-1).long(), minlength=num_experts).to(freq.dtype)
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(g_cpu.cpu(), torch.where(c >= 0, -1, ids))
+    assert torch.equal(fused.hybrid_stats.cpu(), ref.hybrid_stats.cpu())
+    assert torch.equal(fused.decode_freq.cpu(), freq)
+    assert int(fused.stat_calls.item()) == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hybrid_fixed_cap_unchanged():
     # fraction 0 (no profile / explicit --moe-hybrid-max-fetch) keeps the fixed cap.
     cache = OffloadMoeCache(
