@@ -594,3 +594,49 @@ def test_a_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, qu
     (tmp_path / "config.json").write_text(json.dumps(_config_json(True, quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+def _quantize_nvfp4_bucketize(weight):
+    rows, k = weight.shape
+    blocks = weight.float().reshape(rows, k // 16, 16)
+    glob = (blocks.abs().amax() / 2688.0).clamp(min=torch.finfo(torch.float32).tiny)
+    scale = (blocks.abs().amax(-1) / 6.0 / glob).to(torch.float8_e4m3fn)
+    step = (scale.float() * glob).clamp(min=torch.finfo(torch.float32).tiny)
+    q = blocks / step[..., None]
+    codes = torch.bucketize(q.abs(), torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])).to(torch.uint8)
+    codes = (codes | (q.signbit().to(torch.uint8) << 3)).reshape(rows, k)
+    return codes[:, 0::2] | (codes[:, 1::2] << 4), scale, glob.to(torch.float16)
+
+
+def _ties():
+    # amax 2.625 = 2688 * 2**-10: step is exactly 0.4375
+    mids = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]) * 0.4375
+    row = torch.cat([mids, -mids, torch.tensor([2.625, -2.625])])
+    return torch.stack([row, row.flip(0)]).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("weight", [
+    pytest.param(_ties(), id="exact midpoints and saturation"),
+    pytest.param(torch.randn(64, 256, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16) * 0.02, id="random"),
+    pytest.param(torch.zeros(4, 32, dtype=torch.bfloat16), id="all zero"),
+])
+def test_draft_head_quantizer_matches_the_bucketize_reference_bit_for_bit(weight):
+    from freetoken.models.qwen3_5_moe.weight import _quantize_nvfp4
+
+    got, want = _quantize_nvfp4(weight), _quantize_nvfp4_bucketize(weight)
+    assert torch.equal(got[0], want[0])
+    assert torch.equal(got[1].view(torch.uint8), want[1].view(torch.uint8))
+    assert torch.equal(got[2], want[2])
+
+
+def test_background_pieces_keep_order_and_surface_errors():
+    from freetoken.models.qwen3_5_moe.weight import _in_background
+
+    assert list(_in_background(iter(range(5)))) == [0, 1, 2, 3, 4]
+
+    def broken():
+        yield 1
+        raise ValueError("draft head: incomplete expert tensors")
+
+    with pytest.raises(ValueError, match="incomplete"):
+        list(_in_background(broken()))

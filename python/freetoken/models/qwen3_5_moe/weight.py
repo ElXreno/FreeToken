@@ -413,7 +413,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
                 workers=workers,
                 chunk=chunk,
             ),
-            _mtp_expert_pieces(model_path, config),
+            _in_background(_mtp_expert_pieces(model_path, config)),
         )
     if kind is not QuantKind.FP8_BLOCK:
         return None
@@ -460,9 +460,9 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-# e2m1 magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6; bucketize against the midpoints yields the
-# code directly, and values past the last one saturate at 6 the way the cast does.
-_E2M1_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+# e2m1 magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6; counting the midpoints strictly below a value
+# (what bucketize returns) yields the code directly, and values past the last one saturate at 6.
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _E2M1_MAX = 6.0
 _E4M3_MAX = 448.0
 _TINY = torch.finfo(torch.float32).tiny
@@ -481,14 +481,32 @@ def _quantize_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
         raise ValueError(f"NVFP4 needs an input dim divisible by 16, got {k}")
     blocks = weight.float().reshape(rows, k // 16, 16)
     # ModelOpt convention: value = e2m1 * block_scale * global, global = amax / (448 * 6)
-    glob = (blocks.abs().amax() / (_E4M3_MAX * _E2M1_MAX)).clamp(min=_TINY)
-    scale = (blocks.abs().amax(-1) / _E2M1_MAX / glob).to(torch.float8_e4m3fn)
+    amax = blocks.abs().amax(-1)
+    glob = (amax.amax() / (_E4M3_MAX * _E2M1_MAX)).clamp(min=_TINY)
+    scale = (amax / _E2M1_MAX / glob).to(torch.float8_e4m3fn)
     step = (scale.float() * glob).clamp(min=_TINY)
     q = blocks / step[..., None]
-    codes = torch.bucketize(q.abs(), _E2M1_MIDPOINTS).to(torch.uint8)
+    mag = q.abs()
+    codes = (mag > _E2M1_MIDPOINTS[0]).to(torch.uint8)
+    for mid in _E2M1_MIDPOINTS[1:]:
+        codes += mag > mid
     codes = (codes | (q.signbit().to(torch.uint8) << 3)).reshape(rows, k)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     return packed.contiguous(), scale, glob.to(torch.float16)
+
+
+def _in_background(pieces: Iterator) -> Iterator:
+    """Drain ``pieces`` on a worker thread from now on, so it overlaps the model's own expert load."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(1, thread_name_prefix="mtp-experts")
+    done = pool.submit(list, pieces)
+    pool.shutdown(wait=False)
+
+    def drain() -> Iterator:
+        yield from done.result()
+
+    return drain()
 
 
 def _mtp_expert_pieces(model_path: str, config):
