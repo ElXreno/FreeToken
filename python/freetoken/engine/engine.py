@@ -496,6 +496,7 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention backend initialization ========================
+        self.ctx.max_forward_len = getattr(config, "max_forward_len", None)
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )

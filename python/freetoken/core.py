@@ -214,6 +214,8 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # tokens in the largest prefill forward; sizes per-chunk attention scratch
+    max_forward_len: int | None = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

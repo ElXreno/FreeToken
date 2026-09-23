@@ -13,7 +13,7 @@ from freetoken.env import ENV
 from freetoken.utils import div_even, init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
-from .fi_blocked import MAX_REQS, QCAP, BlockedFp8Prefill, BlockedReq
+from .fi_blocked import MAX_REQS, QCAP, BlockedFp8Prefill, BlockedReq, scratch_bytes
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -117,6 +117,19 @@ class FlashInferBackend(BaseAttnBackend):
         padded_batch = -(-2 * sm_count // max(1, kv_local))
         tmp_v_bound = qo_local * padded_batch * cta_tile_q * config.head_dim * 4
         workspace_bytes = max(256 * 1024 * 1024, tmp_v_bound + 32 * 1024 * 1024)
+        blocked_on = bool(
+            ENV.FI_BLOCKED_PREFILL.value
+            and tp_size == 1
+            and self.kvcache.dtype == torch.float8_e4m3fn
+            and not getattr(self.kvcache, "_scales", None)
+        )
+        # the blocked path holds a whole prefill chunk, and the wrappers need only the bound
+        blocked_qcap = max(QCAP, ctx.max_forward_len or 0)
+        blocked_head = -(-(tmp_v_bound + 32 * 1024 * 1024) // (1 << 20)) << 20
+        if blocked_on:
+            workspace_bytes = blocked_head + scratch_bytes(
+                blocked_qcap, qo_local, kv_local, config.head_dim, self.q_dtype
+            )
         self.float_workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.uint8, device=self.device
         )
@@ -137,16 +150,12 @@ class FlashInferBackend(BaseAttnBackend):
         self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
 
         self.blocked_prefill: BlockedFp8Prefill | None = None
-        if (
-            ENV.FI_BLOCKED_PREFILL.value
-            and tp_size == 1
-            and self.kvcache.dtype == torch.float8_e4m3fn
-            and not getattr(self.kvcache, "_scales", None)
-        ):
+        if blocked_on:
             try:
                 self.blocked_prefill = BlockedFp8Prefill(
                     self.float_workspace_buffer, self.int_workspace_buffer,
                     qo_local, kv_local, config.head_dim, self.q_dtype,
+                    qcap=blocked_qcap, head_bytes=blocked_head,
                 )
                 logger.info_rank0(
                     f"fp8 KV prefill runs blockwise in bf16 past a "
@@ -303,7 +312,7 @@ class FlashInferBackend(BaseAttnBackend):
             and not batch.n_decode_rows
             and len(reqs) <= MAX_REQS
             and 0 < min(seqlens_q)
-            and max_seqlen_q <= QCAP
+            and max_seqlen_q <= self.blocked_prefill.qcap
         ):
             prefixes = [k - q for q, k in zip(seqlens_q, seqlens_k, strict=True)]
             if max(prefixes) >= ENV.FI_BLOCKED_PREFILL.value:

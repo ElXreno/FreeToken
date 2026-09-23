@@ -79,3 +79,34 @@ def test_blocked_matches_the_fp8_kernel(blocked, reqs):
     # both outputs are bf16; two roundings with a different summation order land near 4e-3
     assert rel < 1e-2, rel
     assert torch.isfinite(got).all()
+
+
+def _tight_head() -> int:
+    """The engine's head: flashinfer's split-KV bound for this geometry on this GPU + 32 MiB."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    bound = HQ * -(-2 * sms // HKV) * 64 * D * 4
+    return -(-(bound + (32 << 20)) // (1 << 20)) << 20
+
+
+@pytest.fixture(scope="module")
+def blocked4096():
+    from freetoken.attention.fi_blocked import BlockedFp8Prefill, scratch_bytes
+
+    head = _tight_head()
+    ws = torch.empty(head + scratch_bytes(4096, HQ, HKV, D, torch.bfloat16), dtype=torch.uint8, device="cuda")
+    return BlockedFp8Prefill(ws, torch.empty(8 << 20, dtype=torch.uint8, device="cuda"),
+                             HQ, HKV, D, torch.bfloat16, qcap=4096, head_bytes=head)
+
+
+@pytest.mark.parametrize(
+    "reqs",
+    [[(20000, 4096)], [(2 * 16384 + 3000, 4096)], [(9000, 2048), (12000, 2048)]],
+    ids=["tail-4096", "two-blocks-4096", "two-requests-2048"],
+)
+def test_a_4096_chunk_runs_blocked_in_a_workspace_sized_to_it(blocked4096, reqs):
+    from freetoken.attention.fi_blocked import scratch_bytes
+
+    assert blocked4096.qcap == 4096
+    # the whole float workspace, head included, stays under the old flat 256 MiB
+    assert _tight_head() + scratch_bytes(4096, HQ, HKV, D, torch.bfloat16) < 256 << 20
+    test_blocked_matches_the_fp8_kernel(blocked4096, reqs)
