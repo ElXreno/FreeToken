@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
 
 BLOCK = 16384  # past keys per block; 16k and 32k measured the same, the smaller one fits
-QCAP = 2048  # query rows per request the scratch holds; longer chunks take the fp8 kernel
+QCAP = 2048  # least query rows per request the scratch holds; the engine raises it to its chunk
 MAX_REQS = 4
 HEAD_BYTES = 128 << 20  # float workspace kept for the wrappers' own split-KV temporaries
 INT_SLICE = 1 << 20
@@ -54,6 +54,21 @@ def _align(n: int) -> int:
     return (n + 255) & ~255
 
 
+def _scratch_sizes(qcap: int, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype):
+    kv_rows = BLOCK + qcap
+    kv16 = kv_rows * num_kv_heads * head_dim * dtype.itemsize
+    kv8 = kv_rows * num_kv_heads * head_dim
+    out = qcap * num_qo_heads * head_dim * dtype.itemsize
+    lse = qcap * num_qo_heads * 4
+    return kv_rows, kv16, kv8, out, lse
+
+
+def scratch_bytes(qcap: int, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
+    """Float workspace the blocked path takes past the wrappers' head."""
+    _, kv16, kv8, out, lse = _scratch_sizes(qcap, num_qo_heads, num_kv_heads, head_dim, dtype)
+    return 2 * _align(kv16) + 2 * _align(kv8) + _align(out) + _align(lse)
+
+
 class BlockedFp8Prefill:
     def __init__(
         self,
@@ -63,23 +78,22 @@ class BlockedFp8Prefill:
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        qcap: int = QCAP,
+        head_bytes: int = HEAD_BYTES,
     ) -> None:
         from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
 
         self.hq, self.hkv, self.d, self.dtype = num_qo_heads, num_kv_heads, head_dim, dtype
-        kv_rows = BLOCK + QCAP
-        kv16 = kv_rows * num_kv_heads * head_dim * dtype.itemsize
-        kv8 = kv_rows * num_kv_heads * head_dim
-        out = QCAP * num_qo_heads * head_dim * dtype.itemsize
-        lse = QCAP * num_qo_heads * 4
-        need = HEAD_BYTES + 2 * _align(kv16) + 2 * _align(kv8) + _align(out) + _align(lse)
+        self.qcap = qcap
+        kv_rows, kv16, kv8, out, lse = _scratch_sizes(qcap, num_qo_heads, num_kv_heads, head_dim, dtype)
+        need = head_bytes + scratch_bytes(qcap, num_qo_heads, num_kv_heads, head_dim, dtype)
         if float_ws.numel() < need or int_ws.numel() < 2 * MAX_REQS * INT_SLICE:
             raise ValueError(
                 f"workspace too small for blocked fp8 prefill: float {float_ws.numel()} < {need} "
                 f"or int {int_ws.numel()} < {2 * MAX_REQS * INT_SLICE}"
             )
 
-        off = HEAD_BYTES
+        off = head_bytes
 
         def take(nbytes: int, dt: torch.dtype, *shape: int) -> torch.Tensor:
             nonlocal off
@@ -91,10 +105,10 @@ class BlockedFp8Prefill:
         self.v = take(kv16, dtype, kv_rows, num_kv_heads, head_dim)
         self.k8 = take(kv8, torch.uint8, kv_rows, num_kv_heads, head_dim)
         self.v8 = take(kv8, torch.uint8, kv_rows, num_kv_heads, head_dim)
-        self.o = take(out, dtype, QCAP, num_qo_heads, head_dim)
-        self.s = take(lse, torch.float32, QCAP, num_qo_heads)
+        self.o = take(out, dtype, qcap, num_qo_heads, head_dim)
+        self.s = take(lse, torch.float32, qcap, num_qo_heads)
 
-        head = float_ws[:HEAD_BYTES]
+        head = float_ws[:head_bytes]
         self.pool: list[BatchPrefillWithRaggedKVCacheWrapper] = []
         for i in range(2 * MAX_REQS):
             w = BatchPrefillWithRaggedKVCacheWrapper(head, kv_layout="NHD", backend="fa2")
@@ -170,4 +184,4 @@ class BlockedFp8Prefill:
         return o
 
 
-__all__ = ["BLOCK", "MAX_REQS", "QCAP", "BlockedFp8Prefill", "BlockedReq"]
+__all__ = ["BLOCK", "MAX_REQS", "QCAP", "BlockedFp8Prefill", "BlockedReq", "scratch_bytes"]
