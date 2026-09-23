@@ -263,8 +263,28 @@ class HostTier:
         self.write_failures = 0
         loaded = self._load_meta_file()
         free = loaded["free"] if loaded is not None else None
+        # a stored tree we did not load points at extents this run treats as free
+        self._meta_live = os.path.exists(self.meta_path)
+        if loaded is None:
+            self._retire_meta()
         self.arena = HostArena(self.arena_path, capacity, free)
         self._loaded = loaded
+
+    def _retire_meta(self) -> None:
+        """Drop the stored tree, durably, before an extent it points at can be rewritten: after an
+        unclean stop it would hand another prefix's bytes back as this one's."""
+        if not self._meta_live:
+            return
+        try:
+            os.unlink(self.meta_path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._meta_live = False
 
     # ---------------------------------------------------------------- allocation
     def _alloc(self, nbytes: int) -> HostRef | None:
@@ -277,6 +297,7 @@ class HostTier:
 
     def free(self, ref: HostRef | None) -> None:
         if ref is not None:
+            self._retire_meta()
             self.arena.free(ref)
             self.dirty = True
 
@@ -373,6 +394,7 @@ class HostTier:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.meta_path)
+        self._meta_live = True
         self.dirty = False
         self.last_flush = time.time()
 
