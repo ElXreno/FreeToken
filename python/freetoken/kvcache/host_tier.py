@@ -16,6 +16,7 @@ import mmap
 import os
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, NamedTuple
 
 import torch
@@ -24,6 +25,7 @@ FORMAT_VERSION = 1
 ALIGN = 4096
 STAGE_ROWS = 1024
 WRITEBACK_BYTES = 64 << 20
+MAX_PENDING_BYTES = 1 << 30
 SYNC_FILE_RANGE_WRITE = 2
 _BITS_DTYPE = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
 
@@ -85,6 +87,8 @@ class HostArena:
                 e[1] = min(e[1], self.capacity - e[0])
         self.used = self.capacity - sum(size for _, size in self.free_extents)
         self._dirty_lo, self._dirty_hi, self._dirty_bytes = self.capacity, 0, 0
+        self._writer = ThreadPoolExecutor(1, thread_name_prefix="arena-writer")
+        self._pending: list[tuple[int, int, int, Future]] = []
 
     def alloc(self, nbytes: int) -> HostRef | None:
         need = _round_up(max(nbytes, 1), ALIGN)
@@ -102,6 +106,7 @@ class HostArena:
         off, size = ref.offset, ref.released()
         if size == 0:
             return
+        self._wait(off, off + size)
         self.used -= size
         ext = self.free_extents
         lo, hi = 0, len(ext)
@@ -123,23 +128,58 @@ class HostArena:
         return torch.frombuffer(self.mm, dtype=torch.uint8, count=ref.nbytes, offset=ref.offset)
 
     def write(self, ref: HostRef, src: torch.Tensor) -> None:
+        """A device source lands asynchronously: the copy into pinned staging is queued on the
+        current stream and the page-faulting copy into the file mapping runs on the writer thread,
+        so the scheduler never waits on it. Reads, frees and flushes of the range wait for it."""
         src = src.contiguous()
         n = src.numel() * src.element_size()
         assert n <= ref.nbytes, f"host write {n} > extent {ref.nbytes}"
-        self.view(ref)[:n].view(src.dtype).view(src.shape).copy_(src)
+        dst = self.view(ref)[:n]
+        if not src.is_cuda:
+            dst.view(src.dtype).view(src.shape).copy_(src)
+            return
+        staging = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+        staging.copy_(src.reshape(-1).view(torch.uint8), non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        self._submit(ref.offset, ref.offset + n, n, self._land, done, staging, dst)
+
+    @staticmethod
+    def _land(done: torch.cuda.Event, staging: torch.Tensor, dst: torch.Tensor) -> None:
+        done.synchronize()
+        dst.copy_(staging)
+
+    def _submit(self, lo: int, hi: int, nbytes: int, fn: Callable[..., None], *args: Any) -> None:
+        self._pending = [p for p in self._pending if not p[3].done()]
+        while self._pending and sum(p[2] for p in self._pending) + nbytes > MAX_PENDING_BYTES:
+            self._pending.pop(0)[3].result()
+        self._pending.append((lo, hi, nbytes, self._writer.submit(fn, *args)))
+
+    def _wait(self, lo: int = 0, hi: int | None = None) -> None:
+        """Block until every queued write overlapping [lo, hi) has landed; re-raise its error."""
+        hi = self.capacity if hi is None else hi
+        for a, b, _, fut in self._pending:
+            if a < hi and lo < b:
+                fut.result()
+        self._pending = [p for p in self._pending if not p[3].done()]
 
     def read(self, ref: HostRef, dst: torch.Tensor) -> None:
         n = dst.numel() * dst.element_size()
         assert n <= ref.nbytes, f"host read {n} > extent {ref.nbytes}"
+        self._wait(ref.offset, ref.offset + n)
         dst.copy_(self.view(ref)[:n].view(dst.dtype).view(dst.shape))
 
     def writeback(self, offset: int, nbytes: int) -> None:
-        """Start asynchronous writeback of a just-written range (no wait, no cache drop).
+        """Start asynchronous writeback of a just-written range (no wait, no cache drop), queued
+        behind the range's own landing copies on the writer thread.
 
         Without it every commit's pages stay dirty until memory pressure forces kswapd to
         write them back while the decode threads are running."""
         if _sync_file_range is None:
             return
+        self._submit(offset, offset + nbytes, 0, self._writeback_now, offset, nbytes)
+
+    def _writeback_now(self, offset: int, nbytes: int) -> None:
         self._dirty_lo = min(self._dirty_lo, offset)
         self._dirty_hi = max(self._dirty_hi, offset + nbytes)
         self._dirty_bytes += nbytes
@@ -151,11 +191,14 @@ class HostArena:
         self._dirty_lo, self._dirty_hi, self._dirty_bytes = self.capacity, 0, 0
 
     def flush(self) -> None:
+        self._wait()
         self.mm.flush()
         os.fsync(self.fd)
         self._dirty_lo, self._dirty_hi, self._dirty_bytes = self.capacity, 0, 0
 
     def close(self) -> None:
+        self._wait()
+        self._writer.shutdown(wait=True)
         self.mm.close()
         os.close(self.fd)
 
