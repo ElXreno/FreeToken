@@ -123,6 +123,7 @@ class EngineConfig:
     prefix_cache_dir: str | None = None
     prefix_cache_host_bytes: int = 32 << 30
     prefix_cache_flush_idle_seconds: float = 600.0
+    prefix_cache_chunk_snapshots: bool = False
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the

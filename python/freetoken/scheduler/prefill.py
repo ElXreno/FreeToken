@@ -236,7 +236,7 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
+            req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
@@ -247,6 +247,9 @@ class PrefillAdder:
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
+            if req is not None:
+                chunked_req.successor = req
+            return req
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource

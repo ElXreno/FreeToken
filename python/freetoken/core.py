@@ -69,6 +69,9 @@ class Req:
     mtp_drafted: int = 0
     verify_draft: int | None = None  # head's guess at the token after the last committed one
     verify_slot: int | None = None  # GDN slot the verify step's second token writes its state to
+    # the next chunk of this chunked prefill, created before this one drains (overlap); a commit
+    # hands it the new cache handle so it never releases the span this chunk already gave the tree
+    successor: Req | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

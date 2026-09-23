@@ -108,6 +108,7 @@ class Scheduler(SchedulerIOMixin):
             host_tier=host_tier,
         )
         self._prefix_cache_flush_idle = config.prefix_cache_flush_idle_seconds
+        self._chunk_snapshots = config.prefix_cache_chunk_snapshots
         self._last_activity = time.monotonic()
         if host_tier is not None:
             restored = self.cache_manager.load_host_tier()
@@ -421,14 +422,14 @@ class Scheduler(SchedulerIOMixin):
                 if req in new_finished_reqs:
                     continue  # an accepted pair whose first token already ended the request
                 if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
+                    # intermediate chunks commit only on the tiered cache (see Req.successor)
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this
                         # drain point frees the chunk's pages/slots exactly once.
                         self._free_req_resources(req)
+                    elif self._chunk_snapshots and self.cache_manager.is_tiered and req.table_idx != -1:
+                        self.cache_manager.cache_req(req, finished=False)
                     continue
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free

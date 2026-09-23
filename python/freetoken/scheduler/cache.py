@@ -428,6 +428,10 @@ class CacheManager:
             self.page_table[req.table_idx, old_cached:prefix_len].copy_(canonical[old_cached:prefix_len])
         req.cache_handle = handle
         req.mamba_last_track_seqlen = None
+        nxt = req.successor
+        while nxt is not None:
+            nxt.cache_handle = handle
+            nxt = nxt.successor
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.

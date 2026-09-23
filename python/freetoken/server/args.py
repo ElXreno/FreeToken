@@ -505,6 +505,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefix-cache-chunk-snapshots",
+        action="store_true",
+        default=ServerArgs.prefix_cache_chunk_snapshots,
+        help="With --prefix-cache-dir: commit the GDN state at every prefill chunk boundary, so a "
+        "new prompt that shares a long prefix with a cached one resumes from the deepest shared "
+        "chunk instead of prefilling from scratch.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,
