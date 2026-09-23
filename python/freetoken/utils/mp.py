@@ -76,6 +76,10 @@ class ZmqPullQueue(Generic[T]):
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
 
+    def wait(self, timeout_ms: int) -> bool:
+        """True once a message is ready, False when ``timeout_ms`` passed without one."""
+        return self.socket.poll(timeout=timeout_ms) != 0
+
     def stop(self):
         self.socket.close()
         self.context.term()
