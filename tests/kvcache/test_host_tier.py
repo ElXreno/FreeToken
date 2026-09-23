@@ -313,6 +313,20 @@ def test_a_device_write_lands_before_a_read_of_its_range(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_write_issued_under_inference_mode_lands():
+    with tempfile.TemporaryDirectory() as d:
+        arena = HostArena(os.path.join(d, "a.bin"), 64 * ALIGN)
+        ref = arena.alloc(4 * ALIGN)
+        src = torch.randint(0, 255, (4 * ALIGN,), dtype=torch.uint8, device="cuda")
+        with torch.inference_mode():
+            arena.write(ref, src)
+            out = torch.empty(4 * ALIGN, dtype=torch.uint8)
+            arena.read(ref, out)
+        assert torch.equal(out, src.cpu())
+        arena.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_freed_extent_is_reused_only_after_its_pending_write_landed(monkeypatch):
     _slow_landing(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
