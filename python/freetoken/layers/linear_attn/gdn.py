@@ -119,18 +119,18 @@ class GatedDeltaNet(BaseOP):
         out = causal_conv1d_verify(x, pool.conv_states[li], self._conv_weight(), fla.cache_indices, fla.verify_scratch.conv_window[li])
         return out.transpose(1, 2).reshape(total, -1)
 
-    def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
+    def _write_track_snapshot(self, pool, li: int, conv_rows: torch.Tensor,
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
         SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
         state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
-        Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
+        Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary, gathered
+        as ``conv_in[fla.track_conv_src]`` before the projection output is released."""
         rec = pool.recurrent_states[li]
         rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
         cv = pool.conv_states[li]
-        # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
-        conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
+        conv_win = conv_rows.transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -187,31 +187,38 @@ class GatedDeltaNet(BaseOP):
                 disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
             )[0]  # [total, num_v, V]
         else:
-            from freetoken.kernel.fla import chunk_gated_delta_rule
+            from .gdn_prefill import chunk_gated_delta_rule_owned
 
+            track = fla.track_dst is not None
+            conv_rows = conv_in[fla.track_conv_src] if track else None
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
-            # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
+            # the projection output and the conv output die before the chunk kernel allocates
+            z = z.contiguous()
+            qkvz = ba = proj = conv_in = a = b = None
+            # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
+            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            # handed over without a local reference, so the chunk op can drop each one early
+            qkv = [
+                qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype).contiguous(),
+                kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype).contiguous(),
+                vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype).contiguous(),
+            ]
+            mixed = qf = kf = vf = None
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
-            o, _, h = chunk_gated_delta_rule(
-                q=q, k=k, v=v, g=g, beta=beta, scale=self.head_k_dim ** -0.5,
-                initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices.to(torch.int32),
-                cu_seqlens=fla.cu_seqlens.to(torch.int64), head_first=False,
-                use_qk_l2norm_in_kernel=True,
+            o, h = chunk_gated_delta_rule_owned(
+                qkv, g, beta, initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices,
+                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
             core_out = o[0]  # [total, num_v_heads, head_v_dim]
-            if fla.track_dst is not None:
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+            if track:
+                self._write_track_snapshot(pool, li, conv_rows, h, fla)
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
