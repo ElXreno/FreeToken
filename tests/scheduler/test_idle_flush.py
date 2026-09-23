@@ -83,3 +83,17 @@ def test_a_clean_or_untiered_cache_never_wakes_the_idle_loop():
     s.cache_manager.is_tiered = False
     s.cache_manager.host_tier.dirty = True
     assert Scheduler.idle_wait_ms(s) is None
+
+
+def test_a_failing_flush_keeps_the_scheduler_serving_and_retries_after_another_idle_period():
+    import errno
+
+    s, _ = _sched(dirty=True, idle_for=10.0)
+
+    def full(idle_seconds, min_idle):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    s.cache_manager.maybe_flush_host_meta = full
+    Scheduler.run_idle_tick(s)
+    assert s.cache_manager.host_tier.dirty
+    assert Scheduler.idle_wait_ms(s) >= 2900
