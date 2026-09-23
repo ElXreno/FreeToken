@@ -354,3 +354,29 @@ def test_device_commits_round_trip_through_the_tier():
         assert torch.equal(kv.rows(dst), want_kv)
         assert torch.equal(lin.recurrent_states[:, 5], want_rec)
         tier.close()
+
+
+def test_validity_key_follows_the_ablation_that_shaped_the_cached_states():
+    from types import SimpleNamespace
+
+    from freetoken.kvcache.host_tier import build_validity_key
+
+    with tempfile.TemporaryDirectory() as d:
+        table = os.path.join(d, "direction.safetensors")
+        with open(table, "wb") as f:
+            f.write(b"direction table v1")
+
+        def key(**ablation):
+            cfg = SimpleNamespace(model_path=d, page_size=1, kv_cache_scales=None, ablate_direction=None,
+                                  ablate_layer=0, ablate_alpha=1.0)
+            vars(cfg).update(ablation)
+            return build_validity_key(cfg, FakeKVPool(), None)
+
+        base = key(ablate_direction=table, ablate_layer=20, ablate_alpha=0.6)
+        assert base == key(ablate_direction=table, ablate_layer=20, ablate_alpha=0.6)
+        assert base != key()
+        assert base != key(ablate_direction=table, ablate_layer=20, ablate_alpha=0.5)
+        assert base != key(ablate_direction=table, ablate_layer=19, ablate_alpha=0.6)
+        with open(table, "wb") as f:
+            f.write(b"direction table v2")
+        assert base != key(ablate_direction=table, ablate_layer=20, ablate_alpha=0.6)
