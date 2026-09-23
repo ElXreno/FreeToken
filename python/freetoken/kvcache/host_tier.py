@@ -48,6 +48,19 @@ ARENA_NAME = "arena.bin"
 class HostRef(NamedTuple):
     offset: int
     nbytes: int
+    # arena bytes this ref gives back on free; None = nbytes rounded up to ALIGN (whole allocations)
+    reserved: int | None = None
+
+    def released(self) -> int:
+        return _round_up(max(self.nbytes, 1), ALIGN) if self.reserved is None else self.reserved
+
+    def split(self, head: int) -> tuple[HostRef, HostRef]:
+        """Two refs over [0, head) and [head, nbytes) that together release exactly this ref's extent."""
+        total = self.released()
+        return (
+            HostRef(self.offset, head, head),
+            HostRef(self.offset + head, self.nbytes - head, total - head),
+        )
 
 
 def _round_up(n: int, a: int) -> int:
@@ -82,11 +95,13 @@ class HostArena:
                 else:
                     self.free_extents[i] = [off + need, size - need]
                 self.used += need
-                return HostRef(off, nbytes)
+                return HostRef(off, nbytes, need)
         return None
 
     def free(self, ref: HostRef) -> None:
-        off, size = ref.offset, _round_up(max(ref.nbytes, 1), ALIGN)
+        off, size = ref.offset, ref.released()
+        if size == 0:
+            return
         self.used -= size
         ext = self.free_extents
         lo, hi = 0, len(ext)
@@ -249,8 +264,7 @@ class HostTier:
             yield start, m, HostRef(ref.offset + start * self.row_bytes, m * self.row_bytes)
 
     def split_kv(self, ref: HostRef, pos: int) -> tuple[HostRef, HostRef]:
-        head = pos * self.row_bytes
-        return HostRef(ref.offset, head), HostRef(ref.offset + head, ref.nbytes - head)
+        return ref.split(pos * self.row_bytes)
 
     # ---------------------------------------------------------------- GDN snapshots
     def put_snap(self, slot: int) -> HostRef | None:
