@@ -45,6 +45,14 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
 
 
 @triton.jit
+def _e2m1_scaled_down(code):
+    """e2m1 code -> its value * 2**-14 as fp32, exact: sign to fp16 bit 15, exponent and
+    mantissa to bits 11..9, so 0.5 lands on the fp16 subnormal 2**-15. No LUT gather."""
+    bits = ((code & 0x8) << 12) | ((code & 0x7) << 9)
+    return bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
 def _decode_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 2] uint8
@@ -306,16 +314,15 @@ def _prefill_nvfp4_moe_kernel(
 
         p_ptrs = packed_base + byte_idx[:, None] * stride_pkb
         bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
-        lo = bytes_ & 0xF
-        hi = (bytes_ >> 4) & 0xF
         sblk = byte_idx // 8
         s_ptrs = scale_base + sblk[:, None] * stride_sblk
         if e4m3_native_cx():
             scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
         else:
             scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
+        scale = scale * 16384.0
+        b_lo = _e2m1_scaled_down(bytes_ & 0xF) * scale  # [BLOCK_KB, BLOCK_N]
+        b_hi = _e2m1_scaled_down((bytes_ >> 4) & 0xF) * scale
 
         a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
         a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)

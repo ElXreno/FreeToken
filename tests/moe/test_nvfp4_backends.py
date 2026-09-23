@@ -532,3 +532,22 @@ def test_b12x_pack_keeps_per_layer_banks_and_flat_alphas():
     assert len(cache.bank_sources["gate_up"]) == L
     assert sum(t.shape[0] for t in cache.bank_sources["gate_up"]) == total
     assert cache.gate_up_alpha.shape == (total,)
+
+
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
+from freetoken.kernel.triton.nvfp4_fused_moe import _e2m1_scaled_down  # noqa: E402
+
+
+@triton.jit
+def _e2m1_table_kernel(out_ptr):
+    code = tl.arange(0, 16)
+    tl.store(out_ptr + code, _e2m1_scaled_down(code) * 16384.0)
+
+
+@cuda
+def test_arithmetic_e2m1_decode_is_the_lut_bit_for_bit():
+    out = torch.empty(16, device="cuda")
+    _e2m1_table_kernel[(1,)](out)
+    assert torch.equal(out.cpu().view(torch.int32), _E2M1.view(torch.int32))
