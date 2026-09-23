@@ -197,11 +197,22 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not self._small_prefill_as_decode(hidden_states.shape[0]):
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
         return self._maybe_all_reduce(final_hidden_states)
+
+    def _small_prefill_as_decode(self, rows: int) -> bool:
+        """A prefill chunk this small runs the hybrid decode path (cache hits on the GPU, misses
+        on the CPU) instead of streaming every expert of every layer over PCIe."""
+        cache = self.offload_cache
+        return (
+            cache is not None
+            and rows <= cache.small_prefill_rows
+            and cache.decode_target == "hybrid"
+            and not cache.is_cpu_layer(self.layer_id)
+        )
 
     def routed_forward(
         self,

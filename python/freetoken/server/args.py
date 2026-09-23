@@ -901,6 +901,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hybrid-small-prefill",
+        type=int,
+        default=ServerArgs.moe_hybrid_small_prefill,
+        help=(
+            "Prefill chunks of at most this many tokens take the hybrid decode path (cache hits "
+            "on the GPU, misses on the CPU) instead of streaming every expert over PCIe. 0 streams "
+            "every chunk."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

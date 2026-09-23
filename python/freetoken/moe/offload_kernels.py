@@ -133,7 +133,7 @@ def _ensure_experts_hybrid_gpu(
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
-        BLOCK_A=max(16, triton.next_power_of_2(expert_ids.numel())),
+        BLOCK_A=min(32, max(16, triton.next_power_of_2(expert_ids.numel()))),
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
         STATS=fused_stats,
         FREQ=fused_stats and cache.collect_decode_freq,
@@ -359,13 +359,15 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    off_a = tl.arange(0, BLOCK_A)
-    a_mask = off_a < num_active
-    ids = tl.load(expert_ids_ptr + off_a, mask=a_mask, other=-1)
-    match = ids[:, None] == off_e[None, :]
-    is_active = tl.max(match.to(tl.int32), axis=0) > 0
-    if FREQ:
-        tl.atomic_add(freq_ptr + base + ids, 1, mask=a_mask & (ids >= 0))
+    tile = tl.arange(0, BLOCK_A)
+    active_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for t in tl.range(0, num_active, BLOCK_A):
+        a_mask = (t + tile) < num_active
+        ids = tl.load(expert_ids_ptr + t + tile, mask=a_mask, other=-1)
+        active_count = tl.maximum(active_count, tl.max((ids[:, None] == off_e[None, :]).to(tl.int32), axis=0))
+        if FREQ:
+            tl.atomic_add(freq_ptr + base + ids, 1, mask=a_mask & (ids >= 0))
+    is_active = active_count > 0
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -413,8 +415,10 @@ def _ensure_experts_hybrid_kernel(
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
         u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        hit_slots = tl.max(tl.where(match, slot[None, :], -1), axis=1)
-        owner_active = tl.max(((hit_slots[:, None] == off_c[None, :]) & (hit_slots[:, None] >= 0)).to(tl.int32), axis=0) > 0
+        tl.debug_barrier()  # active_mask above is read back across threads
+        own_e = oid - base
+        in_layer = c_mask & (own_e >= 0) & (own_e < num_experts)
+        owner_active = in_layer & (tl.load(active_mask_ptr + own_e, mask=in_layer, other=0) > 0)
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -435,10 +439,13 @@ def _ensure_experts_hybrid_kernel(
             slot_final = tl.where(off_e == e, victim, slot_final)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    s = tl.max(tl.where(match, slot_final[None, :], -1), axis=1)
-    tl.store(expert_ids_ptr + off_a, s, mask=a_mask)
-    if CPU_IDS:
-        tl.store(cpu_ids_ptr + off_a, tl.where(s >= 0, -1, ids), mask=a_mask)
+    for t in tl.range(0, num_active, BLOCK_A):
+        a_mask = (t + tile) < num_active
+        ids = tl.load(expert_ids_ptr + t + tile, mask=a_mask, other=-1)
+        s = tl.max(tl.where(ids[:, None] == off_e[None, :], slot_final[None, :], -1), axis=1)
+        tl.store(expert_ids_ptr + t + tile, s, mask=a_mask)
+        if CPU_IDS:
+            tl.store(cpu_ids_ptr + t + tile, tl.where(s >= 0, -1, ids), mask=a_mask)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.

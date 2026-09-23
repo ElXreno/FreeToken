@@ -821,6 +821,7 @@ class Engine:
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+            cache.small_prefill_rows = config.moe_hybrid_small_prefill
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -890,7 +891,7 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, config.moe_hybrid_small_prefill, 1)
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1697,6 +1698,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_hybrid_fetch_fraction": -1.0,
+    "moe_hybrid_small_prefill": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",

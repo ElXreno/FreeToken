@@ -152,11 +152,12 @@ def test_tiny_fraction_does_not_turn_into_the_fixed_cap():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_hybrid_cpu_routes_gpu_match_cpu_reference():
+@pytest.mark.parametrize(("rows", "num_experts"), [(2, 32), (12, 256)])
+def test_hybrid_cpu_routes_gpu_match_cpu_reference(rows, num_experts):
     from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
     torch.manual_seed(0)
-    num_experts, cache_size, top_k = 32, 40, 8
+    cache_size, top_k = num_experts + 8, 8
 
     def make():
         return OffloadMoeCache(
@@ -167,7 +168,7 @@ def test_hybrid_cpu_routes_gpu_match_cpu_reference():
 
     gpu, ref = make(), make()
     for step in range(64):
-        ids = torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(2)]).to(torch.int32)
+        ids = torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(rows)]).to(torch.int32)
         g, c = ids.clone().cuda(), ids.clone()
         g_cpu, c_cpu = torch.empty_like(g), torch.empty_like(c)
         ensure_experts_hybrid(gpu, step % 2, g, num_experts, 0.3, cpu_ids=g_cpu)
