@@ -413,7 +413,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
                 workers=workers,
                 chunk=chunk,
             ),
-            _in_background(_mtp_expert_pieces(model_path, config)),
+            _in_background(_mtp_expert_pieces(model_path, config, _quantize_device())),
         )
     if kind is not QuantKind.FP8_BLOCK:
         return None
@@ -481,9 +481,10 @@ def _quantize_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
         raise ValueError(f"NVFP4 needs an input dim divisible by 16, got {k}")
     blocks = weight.float().reshape(rows, k // 16, 16)
     # ModelOpt convention: value = e2m1 * block_scale * global, global = amax / (448 * 6)
+    # 0-d tensor divisors: CUDA turns a python-scalar divisor into a reciprocal multiply
     amax = blocks.abs().amax(-1)
-    glob = (amax.amax() / (_E4M3_MAX * _E2M1_MAX)).clamp(min=_TINY)
-    scale = (amax / _E2M1_MAX / glob).to(torch.float8_e4m3fn)
+    glob = (amax.amax() / blocks.new_tensor(_E4M3_MAX * _E2M1_MAX)).clamp(min=_TINY)
+    scale = (amax / blocks.new_tensor(_E2M1_MAX) / glob).to(torch.float8_e4m3fn)
     step = (scale.float() * glob).clamp(min=_TINY)
     q = blocks / step[..., None]
     mag = q.abs()
@@ -493,6 +494,11 @@ def _quantize_nvfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
     codes = (codes | (q.signbit().to(torch.uint8) << 3)).reshape(rows, k)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     return packed.contiguous(), scale, glob.to(torch.float16)
+
+
+def _quantize_device() -> torch.device | None:
+    """The loading rank's GPU, resolved on the caller's thread: a worker thread starts on device 0."""
+    return torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
 
 
 def _in_background(pieces: Iterator) -> Iterator:
@@ -509,8 +515,9 @@ def _in_background(pieces: Iterator) -> Iterator:
     return drain()
 
 
-def _mtp_expert_pieces(model_path: str, config):
-    """One piece per draft-head expert, quantized on the way in, on the head's bank layer."""
+def _mtp_expert_pieces(model_path: str, config, device: torch.device | None = None):
+    """One piece per draft-head expert, quantized on the way in (on ``device`` when given), on the
+    head's bank layer."""
     from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
 
@@ -538,7 +545,10 @@ def _mtp_expert_pieces(model_path: str, config):
         with safetensors.safe_open(os.path.join(folder, shard), framework="pt", device="cpu") as f:
             for name in by_shard[shard]:
                 expert, role = wanted[name]
-                packed, scale, glob = _quantize_nvfp4(f.get_tensor(name))
+                weight = f.get_tensor(name)
+                if device is not None:
+                    weight = weight.to(device)
+                packed, scale, glob = (x.cpu() for x in _quantize_nvfp4(weight))
                 piece = pending.setdefault(expert, {})
                 piece[role] = packed.unsqueeze(0)
                 piece[f"{role}_scale"] = scale.unsqueeze(0)
@@ -546,6 +556,8 @@ def _mtp_expert_pieces(model_path: str, config):
                 if len(piece) == 3 * len(_MTP_PROJ_ROLE):
                     del pending[expert]
                     yield bank_layer, expert, expert + 1, piece
+    if device is not None and device.type == "cuda":
+        torch.cuda.empty_cache()
     if pending:
         raise ValueError(f"draft head: incomplete expert tensors for {sorted(pending)[:8]}")
 

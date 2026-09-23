@@ -618,12 +618,15 @@ def _ties():
 @pytest.mark.parametrize("weight", [
     pytest.param(_ties(), id="exact midpoints and saturation"),
     pytest.param(torch.randn(64, 256, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16) * 0.02, id="random"),
+    pytest.param(torch.randn(1024, 2048, generator=torch.Generator().manual_seed(1)).to(torch.bfloat16) * 0.02, id="expert-sized random"),
     pytest.param(torch.zeros(4, 32, dtype=torch.bfloat16), id="all zero"),
 ])
-def test_draft_head_quantizer_matches_the_bucketize_reference_bit_for_bit(weight):
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA"))])
+def test_draft_head_quantizer_matches_the_bucketize_reference_bit_for_bit(weight, device):
     from freetoken.models.qwen3_5_moe.weight import _quantize_nvfp4
 
-    got, want = _quantize_nvfp4(weight), _quantize_nvfp4_bucketize(weight)
+    got = [x.cpu() for x in _quantize_nvfp4(weight.to(device))]
+    want = _quantize_nvfp4_bucketize(weight)
     assert torch.equal(got[0], want[0])
     assert torch.equal(got[1].view(torch.uint8), want[1].view(torch.uint8))
     assert torch.equal(got[2], want[2])
