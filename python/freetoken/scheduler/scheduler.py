@@ -200,6 +200,21 @@ class Scheduler(SchedulerIOMixin):
         if stats is not None:
             logger.info_rank0(f"prefix cache host tier flushed: {stats}")
 
+    def idle_wait_ms(self) -> int | None:
+        """Until a dirty host tier is due for its idle flush; None when there is nothing to flush."""
+        cm = self.cache_manager
+        if not cm.is_tiered or not cm.host_tier.dirty:
+            return None
+        left = self._prefix_cache_flush_idle - (time.monotonic() - self._last_activity)
+        return max(1, int(left * 1000) + 1)
+
+    def run_idle_tick(self) -> None:
+        stats = self.cache_manager.maybe_flush_host_meta(
+            time.monotonic() - self._last_activity, self._prefix_cache_flush_idle
+        )
+        if stats is not None:
+            logger.info_rank0(f"prefix cache host tier flushed: {stats}")
+
     @torch.inference_mode()
     def rebuild_cache(
         self,

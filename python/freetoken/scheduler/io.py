@@ -67,6 +67,13 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
+    def idle_wait_ms(self) -> int | None:
+        """How long an idle scheduler may block before ``run_idle_tick``; None blocks until a message."""
+        return None
+
+    def run_idle_tick(self) -> None:
+        pass
+
     def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
@@ -80,6 +87,8 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
+            while (wait := self.idle_wait_ms()) is not None and not self._recv_from_tokenizer.wait(wait):
+                self.run_idle_tick()
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
