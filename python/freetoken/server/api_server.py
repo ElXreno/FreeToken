@@ -950,14 +950,19 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    if config.default_min_p is not None:
+        if not 0.0 <= config.default_min_p <= 1.0:
+            raise ValueError(f"--default-min-p must be within [0, 1], got {config.default_min_p}")
+        _MODEL_SAMPLING = {**_MODEL_SAMPLING, "min_p": config.default_min_p}
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
-        "Default sampling config (source=%s): temperature=%s, top_k=%s, top_p=%s",
+        "Default sampling config (source=%s): temperature=%s, top_k=%s, top_p=%s, min_p=%s",
         "model" if _MODEL_SAMPLING else "framework",
         _MODEL_SAMPLING.get("temperature", 0.0),
         _MODEL_SAMPLING.get("top_k", -1),
         _MODEL_SAMPLING.get("top_p", 1.0),
+        _MODEL_SAMPLING.get("min_p", 0.0),
     )
 
     if run_shell:

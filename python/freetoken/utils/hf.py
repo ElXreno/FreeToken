@@ -129,7 +129,7 @@ def load_generation_sampling(model_path: str) -> dict[str, Any]:
     if getattr(gc, "do_sample", None) is False:
         return {"temperature": 0.0}
     out: dict[str, Any] = {}
-    for key in ("temperature", "top_k", "top_p"):
+    for key in ("temperature", "top_k", "top_p", "min_p"):
         val = getattr(gc, key, None)
         if val is not None:
             out[key] = val
