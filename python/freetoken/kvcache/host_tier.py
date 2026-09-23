@@ -423,6 +423,10 @@ def build_validity_key(config, kv_pool, linear_pool) -> dict[str, Any]:
     if scales:
         with open(scales, "rb") as f:
             key["kv_scales"] = hashlib.sha256(f.read()).hexdigest()
+    direction = getattr(config, "ablate_direction", None)
+    if direction:
+        with open(direction, "rb") as f:
+            key["ablate"] = [hashlib.sha256(f.read()).hexdigest(), config.ablate_layer, config.ablate_alpha]
     if linear_pool is not None:
         key["conv"] = [list(linear_pool.conv_states.shape[2:]), str(linear_pool.conv_states.dtype),
                        int(linear_pool.conv_states.shape[0])]
