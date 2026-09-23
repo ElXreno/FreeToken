@@ -194,11 +194,7 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
-        stats = self.cache_manager.maybe_flush_host_meta(
-            time.monotonic() - self._last_activity, self._prefix_cache_flush_idle
-        )
-        if stats is not None:
-            logger.info_rank0(f"prefix cache host tier flushed: {stats}")
+        self.run_idle_tick()
 
     def idle_wait_ms(self) -> int | None:
         """Until a dirty host tier is due for its idle flush; None when there is nothing to flush."""
@@ -209,9 +205,15 @@ class Scheduler(SchedulerIOMixin):
         return max(1, int(left * 1000) + 1)
 
     def run_idle_tick(self) -> None:
-        stats = self.cache_manager.maybe_flush_host_meta(
-            time.monotonic() - self._last_activity, self._prefix_cache_flush_idle
-        )
+        try:
+            stats = self.cache_manager.maybe_flush_host_meta(
+                time.monotonic() - self._last_activity, self._prefix_cache_flush_idle
+            )
+        except OSError as e:
+            # a full or failing disk must not take serving down: retry after another idle period
+            logger.warning_rank0(f"prefix cache host tier flush failed, retrying later: {e!r}")
+            self._last_activity = time.monotonic()
+            return
         if stats is not None:
             logger.info_rank0(f"prefix cache host tier flushed: {stats}")
 
