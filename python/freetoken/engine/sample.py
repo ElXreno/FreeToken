@@ -17,6 +17,7 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    min_p: torch.Tensor | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -39,9 +40,14 @@ def sample_impl(
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     sampling = sampling_module()
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+    if min_p is not None:
+        floor = probs.amax(dim=-1, keepdim=True) * min_p[:, None]
+        probs = torch.where(probs >= floor, probs, 0.0)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
     if top_k is None and top_p is None:
         return sampling.sampling_from_probs(probs)
 
@@ -93,16 +99,19 @@ class Sampler:
             for p, g in zip(params, is_greedy)
         ]
         temperatures = make_device_tensor(ts, torch.float32, self.device)
-        top_k, top_p = None, None
+        min_ps = [0.0 if g else min(max(p.min_p, 0.0), 1.0) for p, g in zip(params, is_greedy)]
+        top_k, top_p, min_p = None, None, None
         if any(k != self.vocab_size for k in top_ks):
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
+        if any(p > 0.0 for p in min_ps):
+            min_p = make_device_tensor(min_ps, torch.float32, self.device)
         greedy_mask = (
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
         return BatchSamplingArgs(
-            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties
+            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties, min_p=min_p
         )
 
     @nvtx_annotate("Sampler")
@@ -115,7 +124,9 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
-                tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+                tokens = sample_impl(
+                    logits.float(), args.temperatures, args.top_k, args.top_p, args.min_p
+                )
                 if args.greedy_mask is not None:
                     # Mixed batches still run probability sampling for all rows, but
                     # greedy rows must follow argmax's deterministic tie-breaking.
@@ -144,14 +155,16 @@ class Sampler:
         def rows(t: torch.Tensor | None) -> torch.Tensor | None:
             return None if t is None else t.repeat_interleave(width)
 
-        tokens = sample_impl(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p))
+        tokens = sample_impl(
+            logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p), rows(args.min_p)
+        )
         if args.greedy_mask is not None:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
         return tokens
 
     def probs(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor | None:
-        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
+        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then min_p, then top-k, then top-p, as sample_impl applies them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
         if args.temperatures is None:
             return None
         sampling = sampling_module()
@@ -162,6 +175,10 @@ class Sampler:
         probs = sampling.softmax(logits.float(), args.temperatures.repeat_interleave(width), enable_pdl=is_sm90_supported())
         # frees the penalized copy before the renorms allocate theirs
         del logits
+        if args.min_p is not None:
+            floor = probs.amax(dim=-1, keepdim=True) * args.min_p.repeat_interleave(width)[:, None]
+            probs = torch.where(probs >= floor, probs, 0.0)
+            probs = probs / probs.sum(dim=-1, keepdim=True)
         if args.top_k is not None:
             probs = sampling.top_k_renorm_probs(probs, args.top_k.repeat_interleave(width))
         if args.top_p is not None:

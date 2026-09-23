@@ -19,6 +19,8 @@ class SamplingParams:
     temperature: float = 0.0
     top_k: int = -1
     top_p: float = 1.0
+    # drop tokens whose probability is below min_p times the most likely one's
+    min_p: float = 0.0
     ignore_eos: bool = False
     max_tokens: int = 1024
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one

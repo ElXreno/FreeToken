@@ -72,6 +72,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
+    min_p: float | None = None
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
@@ -113,6 +114,7 @@ class CompletionRequest(BaseModel):
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
+    min_p: float | None = None
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
