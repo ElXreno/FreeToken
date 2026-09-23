@@ -1029,6 +1029,11 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        if getattr(self, "_mtp_graphs", None):
+            # the draft graphs keep pointers into the pools a rebuild frees, and nothing re-captures them
+            raise CacheRebuildRejected(
+                "runtime cache rebuild is not supported with the MTP draft head; restart to resize"
+            )
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the

@@ -217,6 +217,15 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
+        if getattr(self.cache_manager, "is_tiered", False) and (
+            num_pages is not None or num_mamba_slots is not None or num_swa_pages is not None
+        ):
+            from freetoken.engine.engine import CacheRebuildRejected
+
+            # the host tier keeps views of the KV and GDN pools a resize reallocates
+            raise CacheRebuildRejected(
+                "the prefix-cache host tier maps the KV and GDN pools; restart to resize them"
+            )
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
