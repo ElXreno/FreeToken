@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -77,9 +78,9 @@ class Qwen3_5MoE(BaseOP):
         # shared expert's input (HF also evaluates the shared expert first).
         router_logits = self.gate.forward(hidden_states)
         shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
-        return (routed + shared).view(num_tokens, hidden_dim)
+        return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
 
 __all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP"]
