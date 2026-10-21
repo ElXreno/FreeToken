@@ -80,6 +80,25 @@ def test_batch_memcpy_roundtrip():
 @CUDA
 @JIT
 @BATCH_API
+def test_probe_passes_behind_a_busy_stream():
+    """The server first probes from the scheduler while its stream still has queued
+    work; the probe's own zero fill must not land after the copy."""
+    from freetoken.kernel.batch_memcpy import _jit_batch_memcpy_module, _probe
+
+    fn = _jit_batch_memcpy_module().batch_memcpy
+    busy = torch.cuda.Stream()
+    with torch.cuda.stream(busy):
+        a = torch.randn(2048, 2048, device="cuda")
+        for _ in range(200):
+            a = a @ a
+            a = a / a.norm()
+        _probe(fn)
+    torch.cuda.synchronize()
+
+
+@CUDA
+@JIT
+@BATCH_API
 def test_prefill_hit_d2d_matches_sources():
     cache, sources = _make_cache()
     # layer 1 residents: two real hits in the hit region, one expert stuck in a
