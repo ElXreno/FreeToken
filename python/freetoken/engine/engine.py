@@ -582,6 +582,19 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self._seed_moe_cache()
+
+    def _seed_moe_cache(self) -> None:
+        """After every capture/warmup that resets the MoE cache, so the seeds survive into serving."""
+        cache = self.moe_offload_cache
+        if cache is None:
+            return
+        started = perf_counter_ns()
+        seeded = cache.seed_resident()
+        if seeded:
+            logger.info_rank0(
+                f"MoE cache seeded with {seeded} experts in {(perf_counter_ns() - started) / 1e9:.2f} s"
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1163,6 +1176,7 @@ class Engine:
             mrope=config.model_config.model_is_mrope,
             capture_verify=config.mtp_verify and config.model_config.mtp_draft,
         )
+        self._seed_moe_cache()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream

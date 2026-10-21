@@ -891,6 +891,38 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def seed_resident(self) -> int:
+        """Fill the free slot region with an equal share of every GPU layer's experts; returns how many.
+
+        A fresh cache stays empty until decode loads it, so the first prefills stream every
+        expert over PCIe (hit-D2D finds nothing to gather) and the first decode steps miss
+        everything. A prefill chunk reads every expert of a layer, so any resident share
+        serves it; the seeds keep usage 0, so decode evicts them before anything it loaded.
+        """
+        if self.device.type != "cuda" or not self.banks:
+            return 0
+        first = 2 * self.num_experts if self.prefill_overlap else 0
+        layers = [
+            layer_id
+            for layer_id in range(self.num_layers)
+            if layer_id not in self.cpu_layer_ids and layer_id not in self._unpinned_layers
+        ]
+        if not layers or self.cache_size <= first:
+            return 0
+        share = min(self.num_experts, (self.cache_size - first) // len(layers))
+        if share == 0:
+            return 0
+        experts = torch.arange(share, dtype=torch.int32, device=self.device)
+        slot = first
+        for layer_id in layers:
+            for per_layer, cache in self.banks:
+                cache[slot : slot + share].copy_(per_layer[layer_id][:share], non_blocking=True)
+            self.slot_for_id[layer_id, :share] = experts + slot
+            self.id_of_slot[slot : slot + share] = experts + layer_id * self.num_experts
+            slot += share
+        torch.cuda.current_stream(self.device).synchronize()
+        return slot - first
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
