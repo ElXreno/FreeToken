@@ -107,9 +107,29 @@ def test_batch_size_does_not_change_the_numeric_scheme():
 
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
 @pytest.mark.parametrize("M", [1, 4, 64, 300])
-def test_per_part_path_matches_rowwise(M: int, monkeypatch):
-    """Where row-wise ``_scaled_mm`` is unsafe a fused projection runs one tensor-wise GEMM per
-    part instead. Same scheme, so the two paths agree up to accumulation order (~7e-4)."""
+def test_per_part_path_matches_rowwise(M: int):
+    """A fused projection runs one tensor-wise GEMM per part. Row-wise ``_scaled_mm`` is the
+    same scheme, so the two agree up to accumulation order (~7e-4)."""
+    import freetoken.kernel.triton.fp8_pertensor_linear as mod
+
+    if not mod.rowwise_scaled_mm_ok():
+        pytest.skip("no safe row-wise _scaled_mm on this GPU / torch")
+    K, part_rows = 2048, [1024, 256, 256]
+    w8, scale = _quant_parts(part_rows, K, seed=M)
+    x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
+    input_scale = (x.abs().max().float() / 448.0).reshape(())
+
+    y_part = mod.fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
+    y_row = mod._scaled_mm(x, w8, scale, input_scale, False, x.dtype)
+    rel = ((y_part.float() - y_row.float()).norm() / y_row.float().norm()).item()
+    assert rel < 2e-3, rel
+
+
+@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.parametrize("M", [1, 4, 300])
+def test_fused_projection_takes_the_parts_where_rowwise_is_safe(M: int, monkeypatch):
+    """The per-part GEMMs beat the row-wise CUTLASS kernel on sm_120 at every M, so a fused
+    projection takes them even where row-wise would be allowed."""
     import freetoken.kernel.triton.fp8_pertensor_linear as mod
 
     K, part_rows = 2048, [1024, 256, 256]
@@ -118,11 +138,10 @@ def test_per_part_path_matches_rowwise(M: int, monkeypatch):
     input_scale = (x.abs().max().float() / 448.0).reshape(())
 
     monkeypatch.setattr(mod, "rowwise_scaled_mm_ok", lambda: True)
-    y_row = mod.fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
-    monkeypatch.setattr(mod, "rowwise_scaled_mm_ok", lambda: False)
-    y_part = mod.fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
-    rel = ((y_part.float() - y_row.float()).norm() / y_row.float().norm()).item()
-    assert rel < 2e-3, rel
+    y = mod.fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
+    segments = mod.weight_scale_segments(scale)
+    y_parts = mod._scaled_mm(x, w8, scale, input_scale, False, x.dtype, scale_segments=segments)
+    assert torch.equal(y, y_parts)
 
 
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
