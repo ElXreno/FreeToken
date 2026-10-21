@@ -473,3 +473,30 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+@triton.jit
+def _routed_slot_alphas_kernel(
+    slot_ptr, id_of_slot_ptr, gate_up_ptr, down_ptr, out_gate_up_ptr, out_down_ptr,
+    n, base, num_experts: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    slot = tl.load(slot_ptr + offs, mask=offs < n, other=-1)
+    routed = (offs < n) & (slot >= 0)
+    flat = tl.load(id_of_slot_ptr + slot, mask=routed, other=0)
+    idx = base + tl.maximum(flat, 0) % num_experts
+    tl.store(out_gate_up_ptr + slot, tl.load(gate_up_ptr + idx, mask=routed), mask=routed)
+    tl.store(out_down_ptr + slot, tl.load(down_ptr + idx, mask=routed), mask=routed)
+
+
+def routed_slot_alphas(cache, layer_id: int, slot_ids: torch.Tensor) -> None:
+    """Write the global scales of ``slot_ids``' experts into the per-slot buffers (same
+    values ``alphas_for_slots`` gathers for every slot, only where they are read)."""
+    flat_ids = slot_ids.reshape(-1)
+    n = flat_ids.numel()
+    _routed_slot_alphas_kernel[(1,)](
+        flat_ids, cache.id_of_slot, cache.gate_up_alpha, cache.down_alpha,
+        cache._slot_gate_up_alpha, cache._slot_down_alpha,
+        n, layer_id * cache.num_experts, cache.num_experts,
+        BLOCK=triton.next_power_of_2(max(n, 16)),
+    )

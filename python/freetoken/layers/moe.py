@@ -304,7 +304,7 @@ class OffloadMoELayer(MoELayer):
             topk_ids,
             views=cache.bank_views(),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=cache.alphas_for_slots(self.layer_id, topk_ids),
             is_prefill=False,
         )
 
@@ -341,7 +341,7 @@ class OffloadMoELayer(MoELayer):
             cache.copy_missing()
             return self._expert_gemm(
                 cache, hidden_states, topk_weights, topk_ids, views=cache.bank_views(), n=None,
-                alphas=cache.alphas_for_slots(self.layer_id), is_prefill=False,
+                alphas=cache.alphas_for_slots(self.layer_id, topk_ids), is_prefill=False,
             )
 
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
@@ -362,7 +362,7 @@ class OffloadMoELayer(MoELayer):
             topk_ids,
             views=cache.bank_views(),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=cache.alphas_for_slots(self.layer_id, topk_ids),
             is_prefill=False,
         )
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)

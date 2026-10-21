@@ -460,7 +460,7 @@ def test_b12x_decode_matches_dequant_reference():
 
     cache.ensure_experts(0, ids)
     cache.copy_missing()
-    g1, g2 = cache.alphas_for_slots(0)
+    g1, g2 = cache.alphas_for_slots(0, ids)
     gu_p, gu_s, dn_p, dn_s = cache.bank_views()
     out = b12x_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2, topk_weights, ids, "silu", False

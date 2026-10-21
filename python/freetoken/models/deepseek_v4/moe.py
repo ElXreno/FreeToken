@@ -117,7 +117,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             topk_ids,
             views=cache.bank_views(),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=cache.alphas_for_slots(self.layer_id, topk_ids),
             is_prefill=True,
         )
 

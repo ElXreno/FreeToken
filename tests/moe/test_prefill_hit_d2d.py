@@ -200,3 +200,20 @@ def test_seeded_experts_are_gathered_device_side():
     for view, (name, per_layer) in zip(views, sources.items()):
         assert torch.equal(view.cpu(), per_layer[0]), name
     assert cache.prefill_hit_rows == share > 0
+
+
+@CUDA
+def test_routed_slot_alphas_match_the_full_gather():
+    cache, sources = _make_cache()
+    total = NUM_LAYERS * E
+    cache.set_alphas(torch.rand(total), torch.rand(total))
+    cache.seed_resident()
+    for layer_id in range(NUM_LAYERS):
+        resident = (cache.slot_for_id[layer_id] >= 0).nonzero().flatten()
+        slots = cache.slot_for_id[layer_id, resident].to(torch.int32)
+        routed = torch.cat([slots, torch.tensor([-1], dtype=torch.int32, device=slots.device)]).view(-1, 1)
+        full_gu, full_dn = (t.clone() for t in cache.alphas_for_slots(layer_id))
+        gu, dn = cache.alphas_for_slots(layer_id, routed)
+        assert torch.equal(gu[slots.long()], full_gu[slots.long()])
+        assert torch.equal(dn[slots.long()], full_dn[slots.long()])
+        assert torch.equal(gu[slots.long()], cache.gate_up_alpha[layer_id * E + resident])
