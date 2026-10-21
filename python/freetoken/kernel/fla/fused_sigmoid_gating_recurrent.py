@@ -58,6 +58,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    STORE_FIRST_STEP: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -220,6 +221,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
+        # MTP verify: the state after the draft's predecessor stays in the read slot
+        if STORE_FIRST_STEP:
+            if step_idx == 0:
+                first_idx = tl.load(h0_indices + i_n)
+                if first_idx >= 0:
+                    p_first = (
+                        h0_source
+                        + first_idx * HV * K * V
+                        + i_hv * K * V
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    tl.store(p_first, b_h.to(p_first.dtype.element_ty), mask=mask_h)
+
         step_idx += 1
 
         # Update pointers for next timestep
@@ -272,6 +287,7 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    store_first_step: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -372,6 +388,7 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        STORE_FIRST_STEP=store_first_step,
         num_warps=num_warps,
         num_stages=num_stages,
     )

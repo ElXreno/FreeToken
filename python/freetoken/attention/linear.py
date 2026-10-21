@@ -68,6 +68,16 @@ def _decode_cu_seqlens(bs: int, device: torch.device) -> torch.Tensor:
     return buf
 
 
+def _verify_cu_seqlens(bs: int, device: torch.device) -> torch.Tensor:
+    """``arange(0, 2*bs+1, 2)``: an MTP verify batch as ``bs`` two-token sequences, built once per size."""
+    key = (int(bs), str(device), "verify")
+    buf = _CU_SEQLENS_CACHE.get(key)
+    if buf is None:
+        buf = torch.arange(0, 2 * bs + 1, 2, dtype=torch.int32, device=device)
+        _CU_SEQLENS_CACHE[key] = buf
+    return buf
+
+
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of

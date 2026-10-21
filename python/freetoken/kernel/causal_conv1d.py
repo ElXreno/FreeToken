@@ -48,6 +48,25 @@ def causal_conv1d_varlen(
     return x
 
 
+def causal_conv1d_verify(
+    x: torch.Tensor,                # [2 * batch, conv_dim], rows [r0 t0, r0 t1, r1 t0, ...]
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    read_indices: torch.Tensor,     # [batch] int32
+    out_indices: torch.Tensor,      # [batch] int32
+) -> torch.Tensor | None:
+    """Both tokens of an MTP verify step in one launch: the read slot ends up holding the window
+    after the first token, the out slot the one after both. ``None`` under sgl_kernel, whose
+    conv has no such mode; the caller then runs two ``causal_conv1d_decode`` passes."""
+    from freetoken.kernel.backend import is_sgl_kernel_installed
+
+    if is_sgl_kernel_installed():
+        return None
+    from freetoken.kernel.triton.causal_conv1d_triton import causal_conv1d_verify as triton_verify
+
+    return triton_verify(x, conv_state, weight, read_indices, out_indices)
+
+
 def causal_conv1d_decode(
     x: torch.Tensor,                # [batch, conv_dim] (one token per request)
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
