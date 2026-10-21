@@ -89,6 +89,7 @@ class EnvClassSingleton:
     KPROF = EnvStr("")  # "decode=200" or "prefill=4": torch.profiler capture, see kprof.py
     KPROF_SKIP = EnvInt(20)
     KPROF_OUT = EnvStr(".")
+    B12X_CACHE = EnvStr("")  # b12x compile objects: "" = $XDG_CACHE_HOME/freetoken/b12x, "off" = memory only
 
     def __new__(cls):
         # single instance
