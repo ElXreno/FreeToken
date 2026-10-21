@@ -102,11 +102,9 @@ class Qwen3_5DecoderLayer(BaseOP):
             residual = a.cut_(hidden)
             hidden = self.input_layernorm.forward(residual)
         else:
-            residual = a.add_cut_(residual, hidden)
-            hidden = self.input_layernorm.forward_into(residual, hidden)
+            a.add_cut_norm_(residual, hidden, self.input_layernorm)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
-        residual = a.add_cut_(residual, hidden)
-        hidden = self.post_attention_layernorm.forward_into(residual, hidden)
+        a.add_cut_norm_(residual, hidden, self.post_attention_layernorm)
         hidden = self.mlp.forward(hidden)
         return a.cut_sum_(hidden, residual), residual
 

@@ -47,6 +47,27 @@ def _cut_rows(x_ptr, y_ptr, r_ptr, alpha, stride_x, stride_y,
     tl.store(x_ptr + row * stride_x + offs, out.to(x_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _add_cut_norm_rows(x_ptr, y_ptr, r_ptr, w_ptr, alpha, eps, stride_x, stride_y,
+                       H: tl.constexpr, BLOCK: tl.constexpr):
+    """``x <- cut(x + y)`` (MODE 1 of ``_cut_rows``), then ``y <- rmsnorm(x) * w`` read back
+    from the rounded stream, as the Triton ``rmsnorm`` computes it."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < H
+    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
+    y = tl.load(y_ptr + row * stride_y + offs, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(r_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    s = (x + y).to(x_ptr.dtype.element_ty).to(tl.float32)
+    d = tl.sum(s * r, axis=0) * alpha
+    cut = (s - d * r).to(x_ptr.dtype.element_ty)
+    tl.store(x_ptr + row * stride_x + offs, cut, mask=mask)
+    c = cut.to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    inv = tl.math.rsqrt(tl.sum(c * c, axis=0) / H + eps)
+    tl.store(y_ptr + row * stride_y + offs, (c * inv * w).to(y_ptr.dtype.element_ty), mask=mask)
+
+
 class DirectionAblation:
     """``cut(x) = x - alpha * (x . r) r`` for a unit vector ``r`` picked from a per-layer table.
 
@@ -122,6 +143,27 @@ class DirectionAblation:
         if x.is_cuda:
             return self._launch(x, y, _ADD_CUT)
         return x.copy_(self.cut(x + y))
+
+    def add_cut_norm_(self, x: torch.Tensor, y: torch.Tensor, norm) -> None:
+        """``add_cut_(x, y)`` then ``norm.forward_into(x, y)`` in one launch where the norm
+        is the Triton ``rmsnorm``; the stream lands in ``x``, the normed stream in ``y``."""
+        from freetoken.kernel.triton.norm import _num_warps, rmsnorm
+
+        fusable = (
+            x.is_cuda and norm.rmsnorm is rmsnorm and x.dim() == 2 and x.stride(1) == 1
+            and y.shape == x.shape and y.stride(1) == 1
+        )
+        if not fusable:
+            self.add_cut_(x, y)
+            norm.forward_into(x, y)
+            return
+        if x.shape[0]:
+            h = x.shape[1]
+            _add_cut_norm_rows[(x.shape[0],)](
+                x, y, self._vector(x), norm._kernel_weight(x), self.alpha, norm.eps,
+                x.stride(0), y.stride(0), H=h, BLOCK=triton.next_power_of_2(h),
+                num_warps=_num_warps(x.shape[0]),
+            )
 
     def cut_sum_(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """``x <- x - component(x + y)``, so ``x + y`` comes out cut and ``y`` stays as it was."""
