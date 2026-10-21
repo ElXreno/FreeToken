@@ -41,6 +41,9 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--quant-backend", type=_parse_quant_backend, default=None,
                    help="kernel per quantized layer type, as for ft serve; the expert banks are packed for the "
                         "chosen MoE kernel and the server picks that kernel back up from the FTW")
+    p.add_argument("--mtp-draft", action="store_true",
+                   help="also pack the multi-token-prediction draft head (its dense weights and, when it "
+                        "routes experts, their bank layer); serve the result with --mtp-draft or --mtp-verify")
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
                    help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
@@ -60,6 +63,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
+        mtp_draft=ns.mtp_draft,
     )
     dt = time.perf_counter() - t
     c = index["counts"]
