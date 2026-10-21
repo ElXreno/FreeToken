@@ -9,6 +9,7 @@ from freetoken.layers import (
     LinearColParallelMerged,
     LinearReplicated,
     LinearRowParallel,
+    OffloadMoELayer,
     make_moe_layer,
     silu_and_mul,
 )
@@ -46,6 +47,17 @@ class Qwen3_5DenseMLP(_SharedExpert):
         super().__init__(config, config.hidden_size, config.intermediate_size, prefix=prefix)
 
 
+_SIDE_STREAM_MAX_TOKENS = 16
+_SIDE_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    stream = _SIDE_STREAMS.get(device)
+    if stream is None:
+        stream = _SIDE_STREAMS[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
 class Qwen3_5MoE(BaseOP):
     """Routed MoE (256 experts, top-8) plus a gated shared expert:
 
@@ -73,6 +85,23 @@ class Qwen3_5MoE(BaseOP):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if (
+            hidden_states.is_cuda
+            and num_tokens <= _SIDE_STREAM_MAX_TOKENS
+            and isinstance(self.experts, OffloadMoELayer)
+        ):
+            # a decode batch leaves most SMs idle: the shared expert runs beside the routed
+            # chain (router, cache fill, fused MoE), which never writes ``hidden_states``
+            main = torch.cuda.current_stream()
+            side = _side_stream(hidden_states.device)
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                shared = self.shared_expert.forward(hidden_states)
+                gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+            router_logits = self.gate.forward(hidden_states)
+            routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+            main.wait_stream(side)
+            return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
