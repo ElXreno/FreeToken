@@ -493,6 +493,9 @@ def b12x_fused_experts(
         W4A16PackedWeights,
     )
 
+    from freetoken.kernel import b12x_cache
+
+    b12x_cache.install()
     assert activation == "silu", "b12x backend supports gated silu only"
     assert not apply_router_weight_on_input
     num_experts = gate_up_q.size(0)
