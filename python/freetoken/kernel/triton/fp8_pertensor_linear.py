@@ -282,13 +282,15 @@ def _scaled_mm(
 
     A genuine per-tensor weight (one scalar repeated down ``weight_scale``) takes the
     tensor-wise path. A fused projection, whose ``weight_scale`` is piecewise-constant
-    because each part carries its own scalar, takes the row-wise path -- that keeps every
-    part's scale exact, where vLLM/SGLang instead requantize the parts onto a shared maximum
-    and eat the precision loss. Row-wise costs ~4% here (5.56 ms vs 5.39 ms per step).
+    because each part carries its own scalar, passes ``scale_segments`` and each part runs its
+    own tensor-wise GEMM over ``weight[s:e]`` (still stride-only), outputs concatenated -- that
+    keeps every part's scale exact, where vLLM/SGLang instead requantize the parts onto a
+    shared maximum and eat the precision loss. On sm_120 (torch 2.11) the parts beat the
+    row-wise CUTLASS kernel at every M measured, ~4x at decode (GDN qkv|z, 2048 -> 12288:
+    14 vs 56 us at M <= 32, 214 vs 299 us at M = 1024); on sm_89 row-wise is unsafe anyway.
 
-    Where row-wise is unsafe (:func:`rowwise_scaled_mm_ok`) ``scale_segments`` is passed and
-    each part runs its own tensor-wise GEMM over ``weight[s:e]`` (still stride-only), outputs
-    concatenated: the same W8A8 scheme, not bit-identical (accumulation order differs)."""
+    Row-wise remains for a per-row scale with parts cuBLASLt cannot take (unaligned or more
+    than a fused projection has), where :func:`rowwise_scaled_mm_ok` allows it."""
     qa = _static_quant(a, input_scale)
     wt = weight.t()  # [N, K] row-major -> [K, N] column-major, stride-only
     sa = input_scale.reshape(())
@@ -333,10 +335,12 @@ def fp8_pertensor_linear(
     N = weight.shape[0]
     w8a8 = input_scale is not None and e4m3_native()
     segments = None
-    if w8a8 and not uniform_scale and not rowwise_scaled_mm_ok():
+    if w8a8 and not uniform_scale:
         segments = scale_segments if scale_segments is not None else weight_scale_segments(weight_scale)
         if not _segments_w8a8_ok(segments):
-            w8a8 = False  # W8A16 below is exact for any per-row scale and never calls _scaled_mm
+            segments = None
+            if not rowwise_scaled_mm_ok():
+                w8a8 = False  # W8A16 below is exact for any per-row scale and never calls _scaled_mm
     if w8a8:
         out = _scaled_mm(
             x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
