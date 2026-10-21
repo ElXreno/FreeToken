@@ -7,6 +7,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from freetoken.kernel.triton.bf16_rows_linear import rows_linear, rows_linear_ok
+
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind
 from .base import LinearKernel, LinearMethod
@@ -21,6 +23,8 @@ class TorchLinearKernel(LinearKernel):
         if w.dtype != x.dtype:
             w = w.to(x.dtype)
             b = b.to(x.dtype) if b is not None else None
+        if rows_linear_ok(x, w, b):
+            return rows_linear(x, w)
         return F.linear(x, w, b)
 
 
