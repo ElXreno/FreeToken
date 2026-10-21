@@ -171,6 +171,7 @@ def convert_checkpoint(
     quant_backend: str | None = None,
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
+    mtp_draft: bool = False,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -198,7 +199,8 @@ def convert_checkpoint(
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
+                       dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend,
+                       mtp_draft=mtp_draft)
     mc = cfg.model_config
     # every MoE strategy reads the routed experts from the banks, fused included
     offload = getattr(mc, "is_moe", False)
@@ -225,7 +227,8 @@ def convert_checkpoint(
     # an FTW keeps only a GGUF's text metadata, so it cannot build an mmproj tower
     include_vision = gguf_config_source(model_path) is None
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts, include_vision=include_vision),
+                                              include_moe_experts=include_moe_experts, include_vision=include_vision,
+                                              include_mtp=mc.mtp_draft),
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
