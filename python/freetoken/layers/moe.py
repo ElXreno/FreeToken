@@ -340,8 +340,8 @@ class OffloadMoELayer(MoELayer):
         )
 
         prefetch = cache.expert_prefetch
-        if _HYBRID_SPLIT_GEMM and clamp:
-            gpu_routed = self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch)
+        if _HYBRID_SPLIT_GEMM:
+            gpu_routed = self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0 if clamp else -1)
         else:
             if prefetch is not None:
                 prefetch.before_demand(self.layer_id)
@@ -363,7 +363,7 @@ class OffloadMoELayer(MoELayer):
             prefetch.after_layer(self.layer_id)
         return out
 
-    def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch):
+    def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0):
         """The hit routes' GEMM on a side stream while the misses copy in, then the fetched routes' GEMM.
 
         One b12x launch at a time (they share a scratch workspace): the side GEMM and the main stream's copy run
@@ -373,7 +373,7 @@ class OffloadMoELayer(MoELayer):
 
         views = cache.pool_bank_views(self.layer_id)
         alphas = cache.alphas_for_slots(self.layer_id, gpu_slots)
-        hit_slots, hit_w, new_slots, new_w = split_fetched_routes(cache, gpu_slots, gpu_w)
+        hit_slots, hit_w, new_slots, new_w = split_fetched_routes(cache, gpu_slots, gpu_w, hole)
         main = torch.cuda.current_stream()
         if _HYBRID_SPLIT == "copy":
             side = cache.split_copy_stream()
