@@ -109,8 +109,9 @@ class ExpertPrefetch:
         self.scores[layer_id] = None
         if t is None:
             return
-        logits = torch.nn.functional.linear(hidden, self.predictors[layer_id]).float()
-        self.scores[layer_id] = torch.softmax(logits, dim=-1).sum(0)
+        logits = torch.nn.functional.linear(hidden, self.predictors[layer_id])
+        # one row ranks by its logits alone, softmax keeps the order
+        self.scores[layer_id] = logits[0] if logits.shape[0] == 1 else torch.softmax(logits.float(), dim=-1).sum(0)
         if self.budget == 0:
             self._hint(t, self.scores[layer_id])
 
