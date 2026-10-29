@@ -394,3 +394,28 @@ def test_validity_key_follows_the_ablation_that_shaped_the_cached_states():
         with open(table, "wb") as f:
             f.write(b"direction table v2")
         assert base != key(ablate_direction=table, ablate_layer=20, ablate_alpha=0.6)
+
+
+def test_validity_key_follows_the_ablation_mode_and_config_overrides():
+    from types import SimpleNamespace
+
+    from freetoken.kvcache.host_tier import build_validity_key
+
+    with tempfile.TemporaryDirectory() as d:
+        table = os.path.join(d, "direction.safetensors")
+        with open(table, "wb") as f:
+            f.write(b"direction table")
+
+        def key(**fields):
+            cfg = SimpleNamespace(model_path=d, page_size=1, kv_cache_scales=None, ablate_direction=None,
+                                  ablate_layer=0, ablate_alpha=1.0)
+            vars(cfg).update(fields)
+            return build_validity_key(cfg, FakeKVPool(), None)
+
+        stream = key(ablate_direction=table, ablate_alpha=1.25)
+        assert stream == key(ablate_direction=table, ablate_alpha=1.25, ablate_mode="stream")
+        assert stream != key(ablate_direction=table, ablate_alpha=1.25, ablate_mode="writers")
+        assert key(ablate_mode="writers") == key()
+        yarn = {"rope_parameters": {"rope_type": "yarn", "factor": 2.0}}
+        assert key(hf_overrides=yarn) != key()
+        assert key(hf_overrides={}) == key()

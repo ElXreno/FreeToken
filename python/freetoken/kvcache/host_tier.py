@@ -436,6 +436,12 @@ def build_validity_key(config, kv_pool, linear_pool) -> dict[str, Any]:
     if direction:
         with open(direction, "rb") as f:
             key["ablate"] = [hashlib.sha256(f.read()).hexdigest(), config.ablate_layer, config.ablate_alpha]
+        mode = getattr(config, "ablate_mode", "stream")
+        if mode != "stream":
+            key["ablate"].append(mode)
+    overrides = getattr(config, "hf_overrides", None)
+    if overrides:
+        key["hf_overrides"] = json.dumps(overrides, sort_keys=True, default=str)
     if linear_pool is not None:
         key["conv"] = [list(linear_pool.conv_states.shape[2:]), str(linear_pool.conv_states.dtype),
                        int(linear_pool.conv_states.shape[0])]
