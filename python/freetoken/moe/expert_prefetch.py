@@ -1,13 +1,13 @@
 """Next-layer expert prefetch for offload decode.
 
-At MoE layer l, after its own experts are ensured, a predictor scores layer l+1's experts from layer l's router
-input (``x_l @ P_l``: layer l+1's router by default, or trained weights), the best ``topn`` that are not resident
-are narrowed to the first ``budget``, each gets an LRU victim slot in layer l+1's pool, and the slot tables are
-updated at once, so layer l+1's ensure sees them as hits. The rows themselves are copied on a side stream with the
-same fused host-to-device kernel as ``copy_missing``; layer l+1 waits for that copy after launching its own
-demand copy and before its experts are read, so the two copies share the link instead of queueing.
-The copy overlaps layer l's expert GEMM and layer l+1's mixer. Everything is device-side with fixed shapes, so it
-captures into the decode CUDA graph like the rest of the offload path.
+At MoE layer l a predictor scores layer l+1's experts from layer l's router input (``x_l @ P_l``: layer l+1's
+router by default, or trained weights). Once layer l's experts are done (GPU GEMM and CPU share combined), the
+best ``topn`` that are not resident are narrowed to the first ``budget``, each gets an LRU victim slot in layer
+l+1's pool, and the slot tables are updated at once, so layer l+1's ensure sees them as hits; the CPU pool gets a
+hint for the remaining cold ones. The rows are copied on a side stream with the same fused host-to-device kernel
+as ``copy_missing``, during layer l+1's mixer, when host memory is otherwise idle; layer l+1 waits for that copy
+after launching its own demand copy and before its experts are read. Everything is device-side with fixed shapes,
+so it captures into the decode CUDA graph like the rest of the offload path.
 
 ``FREETOKEN_EXPERT_PREFETCH=<budget>`` enables it (0 or unset: off), ``FREETOKEN_EXPERT_PREFETCH_TOPN`` sets how
 many predicted experts are considered (default 16), ``FREETOKEN_EXPERT_PREFETCH_WEIGHTS=<file>`` loads trained
@@ -60,6 +60,7 @@ class ExpertPrefetch:
         self.stream = torch.cuda.Stream(device=device)
         self.done = [torch.cuda.Event() for _ in range(L)]
         self.pending = [False] * L
+        self.scores: list[torch.Tensor | None] = [None] * L
         self.evict = torch.zeros(L, budget, dtype=torch.int32, device=device)
         self.src = torch.zeros(L, budget, dtype=torch.int32, device=device)
         self.num = torch.zeros(L, 1, dtype=torch.int64, device=device)
@@ -78,18 +79,31 @@ class ExpertPrefetch:
         return t
 
     def issue(self, layer_id: int, hidden: torch.Tensor) -> None:
+        self.score(layer_id, hidden)
+        self.launch(layer_id)
+
+    def score(self, layer_id: int, hidden: torch.Tensor) -> None:
+        """Score layer ``layer_id + 1``'s experts from this layer's router input (before the expert GEMM may overwrite it)."""
         t = self.targets(layer_id)
+        self.scores[layer_id] = None
         if t is None:
             return
-        cache = self.cache
         logits = torch.nn.functional.linear(hidden, self.predictors[layer_id]).float()
-        score = torch.softmax(logits, dim=-1).sum(0)
+        self.scores[layer_id] = torch.softmax(logits, dim=-1).sum(0)
+
+    def launch(self, layer_id: int) -> None:
+        """Once this layer's experts are done: fetch the next layer's best cold experts and hint the CPU pool at the
+        rest, so both move bytes while the next layer's mixer runs and the host memory bus is otherwise idle."""
+        score = self.scores[layer_id]
+        if score is None:
+            return
+        t = layer_id + 1
         if self.budget > 0:
             self._fetch(t, score)
-        if getattr(cache.cpu_executor, "prefetch_hint", None) is not None:
+        if getattr(self.cache.cpu_executor, "prefetch_hint", None) is not None:
             from freetoken.moe.cpu_prefetch_hint import write_cpu_prefetch_hint
 
-            write_cpu_prefetch_hint(cache, t, score)
+            write_cpu_prefetch_hint(self.cache, t, score)
 
     def _fetch(self, t: int, score: torch.Tensor) -> None:
         cache = self.cache
