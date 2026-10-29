@@ -199,6 +199,20 @@ class Nvfp4B12xFormat final : public MoeFormat {
 
   int row_block() const override { return kTileN; }
 
+  int expert_ranges(int layer, int e, const void** ptrs, size_t* lens) const override {
+    const size_t H = p.H, I = p.I;
+    const size_t gu = 2 * I * (H / 2), gus = 2 * I * (H / 16), dn = H * (I / 2), dns = H * (I / 16);
+    ptrs[0] = static_cast<const uint8_t*>(tbl_at(gate_up_, layer)) + e * gu;
+    lens[0] = gu;
+    ptrs[1] = static_cast<const uint8_t*>(tbl_at(gu_scale_, layer)) + e * gus;
+    lens[1] = gus;
+    ptrs[2] = static_cast<const uint8_t*>(tbl_at(down_, layer)) + e * dn;
+    lens[2] = dn;
+    ptrs[3] = static_cast<const uint8_t*>(tbl_at(dn_scale_, layer)) + e * dns;
+    lens[3] = dns;
+    return 4;
+  }
+
   void prep_input(int tok, const bf16_t* x) override {
     if (path_ == Path::Scalar) {
       for (int i = 0; i < p.H; ++i) xf_[(size_t)tok * p.H + i] = bf16_to_f32(x[i]);

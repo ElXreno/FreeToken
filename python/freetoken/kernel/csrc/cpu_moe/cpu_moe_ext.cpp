@@ -148,6 +148,23 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> flag_served{0};  // completed doorbells (tests, watchdog)
   std::map<uint64_t, HostTask> host_tasks;  // host-function userData, keyed by doorbell word (graph-stable)
 
+  // Cache prefetch of the next layer's predicted CPU experts, run on the pool between layers.
+  static constexpr int kMaxHint = 32;
+  static constexpr size_t kPfChunk = 64 << 10;
+  const int32_t* hint = nullptr;  // [num_layers][2 + kMaxHint]: stamp, count, expert ids
+  std::vector<int32_t> hint_seen;
+  bool cur_prefetch = false;
+  bool pf_inflight = false;
+  int pf_mode = 1;  // 0 load, 1 prefetcht1, 2 prefetcht2, 3 prefetcht0
+  std::vector<const uint8_t*> pf_ptr;
+  std::vector<size_t> pf_len;
+  std::vector<int64_t> pf_first;
+  alignas(64) std::atomic<int64_t> pf_next{0};
+  int64_t pf_total = 0;
+  std::atomic<bool> pf_abort{false};
+  std::atomic<int64_t> pf_tasks{0}, pf_bytes{0}, pf_aborted{0};
+  std::atomic<uint64_t> pf_sink{0};
+
   CpuMoeExecutor(int num_threads_, int num_layers_, int num_experts_, int top_k_,
                  int hidden_size, int inter_size, int max_tokens_, int activation_id,
                  int apply_router_weight_on_input, std::vector<FormatSpec> formats,
@@ -289,7 +306,107 @@ struct CpuMoeExecutor {
     }
   }
 
+  void touch(const uint8_t* p, size_t n) {
+#if CPU_MOE_X86
+    if (pf_mode == 1) {
+      for (size_t i = 0; i < n; i += 64) _mm_prefetch(reinterpret_cast<const char*>(p + i), _MM_HINT_T1);
+      return;
+    }
+    if (pf_mode == 2) {
+      for (size_t i = 0; i < n; i += 64) _mm_prefetch(reinterpret_cast<const char*>(p + i), _MM_HINT_T2);
+      return;
+    }
+    if (pf_mode == 3) {
+      for (size_t i = 0; i < n; i += 64) _mm_prefetch(reinterpret_cast<const char*>(p + i), _MM_HINT_T0);
+      return;
+    }
+#endif
+    uint64_t acc = 0;
+    for (size_t i = 0; i < n; i += 64) acc += *reinterpret_cast<const volatile uint64_t*>(p + i);
+    pf_sink.fetch_add(acc, std::memory_order_relaxed);
+  }
+
+  void do_prefetch() {
+    const auto ranges = static_cast<int64_t>(pf_ptr.size());
+    for (;;) {
+      if (pf_abort.load(std::memory_order_relaxed)) return;
+      const int64_t c = pf_next.fetch_add(1, std::memory_order_relaxed);
+      if (c >= pf_total) return;
+      const int64_t r = std::upper_bound(pf_first.begin(), pf_first.begin() + ranges, c) - pf_first.begin() - 1;
+      const size_t off = static_cast<size_t>(c - pf_first[r]) * kPfChunk;
+      touch(pf_ptr[r] + off, std::min(kPfChunk, pf_len[r] - off));
+    }
+  }
+
+  void set_prefetch_hint(uintptr_t ptr, int mode) {
+    hint = reinterpret_cast<const int32_t*>(ptr);
+    hint_seen.assign(num_layers, -1);
+    pf_mode = mode;
+  }
+
+  // false when the hint of `layer` is stale or names nothing
+  bool submit_prefetch(int layer) {
+    if (!hint || layer < 0 || layer >= num_layers) return false;
+    const int32_t* h = hint + static_cast<size_t>(layer) * (2 + kMaxHint);
+    const int32_t stamp = __atomic_load_n(h, __ATOMIC_ACQUIRE);
+    if (stamp == hint_seen[layer]) return false;
+    hint_seen[layer] = stamp;
+    const int n = std::min<int>(__atomic_load_n(h + 1, __ATOMIC_RELAXED), kMaxHint);
+    const MoeFormat& fmt = *fmts[layer_fmt[layer]];
+    pf_ptr.clear();
+    pf_len.clear();
+    pf_first.clear();
+    int64_t chunks = 0;
+    for (int i = 0; i < n; ++i) {
+      const int e = __atomic_load_n(h + 2 + i, __ATOMIC_RELAXED);
+      if (e < 0 || e >= num_experts) continue;
+      const void* ptrs[kMaxRanges];
+      size_t lens[kMaxRanges];
+      const int k = fmt.expert_ranges(layer, e, ptrs, lens);
+      for (int j = 0; j < k; ++j) {
+        pf_first.push_back(chunks);
+        pf_ptr.push_back(static_cast<const uint8_t*>(ptrs[j]));
+        pf_len.push_back(lens[j]);
+        chunks += static_cast<int64_t>((lens[j] + kPfChunk - 1) / kPfChunk);
+        pf_bytes.fetch_add(static_cast<int64_t>(lens[j]), std::memory_order_relaxed);
+      }
+    }
+    if (chunks == 0) return false;
+    pf_total = chunks;
+    pf_next.store(0, std::memory_order_relaxed);
+    pf_abort.store(false, std::memory_order_relaxed);
+    done_count.store(0, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lk(task_mtx);
+      cur_prefetch = true;
+      ++cur_gen;
+      submitted.store(cur_gen, std::memory_order_release);
+    }
+    task_cv.notify_all();
+    pf_tasks.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  // a real task takes the pool: stop the prefetch
+  void retire_prefetch(bool spin) {
+    if (!pf_inflight) return;
+    if (pf_next.load(std::memory_order_relaxed) < pf_total) {
+      pf_abort.store(true, std::memory_order_relaxed);
+      pf_aborted.fetch_add(1, std::memory_order_relaxed);
+    }
+    sync(spin);
+    pf_inflight = false;
+  }
+
+  void prefetch_now(int layer) {
+    if (submit_prefetch(layer)) sync();
+  }
+
   void run_task_body(const MoeTask& t) {
+    if (cur_prefetch) {
+      do_prefetch();
+      return;
+    }
     int local_sense = 0;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
@@ -371,6 +488,7 @@ struct CpuMoeExecutor {
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;
+      cur_prefetch = false;
       ++cur_gen;
       submitted.store(cur_gen, std::memory_order_release);
     }
@@ -460,6 +578,8 @@ struct CpuMoeExecutor {
       const uint64_t word = gpu_sync->cpu_poll();
       if (word != 0) {
         const MoeTask t = from_word(word);
+        const bool spin = coord_pinned && spin_wait.load(std::memory_order_relaxed);
+        retire_prefetch(spin);
         if (has_routes(t)) {
           submit(t);
           sync(coord_pinned && spin_wait.load(std::memory_order_relaxed));
@@ -470,6 +590,7 @@ struct CpuMoeExecutor {
         // Release: the workers' y stores are visible before the GPU sees done.
         gpu_sync->cpu_done();
         flag_served.fetch_add(1, std::memory_order_relaxed);
+        if (hint) pf_inflight = submit_prefetch(static_cast<int>(t.layer) + 1);
         last_active = coord_clock::now();
         empty_polls = 0;
         sleep_us = 100;
@@ -555,6 +676,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flag_combine", &CpuMoeExecutor::flag_combine, py::arg("stream"), py::arg("out"), py::arg("num_tokens"),
            py::arg("accumulate"))
       .def("poison_flag", &CpuMoeExecutor::poison_flag)
+      .def("set_prefetch_hint", &CpuMoeExecutor::set_prefetch_hint, py::arg("ptr"), py::arg("mode"))
+      .def("prefetch_now", &CpuMoeExecutor::prefetch_now, py::arg("layer_id"), py::call_guard<py::gil_scoped_release>())
+      .def("prefetch_stats",
+           [](const CpuMoeExecutor& e) {
+             return py::make_tuple(e.pf_tasks.load(), e.pf_bytes.load(), e.pf_aborted.load());
+           })
+      .def_property_readonly_static("prefetch_hint_width", [](py::object) { return 2 + CpuMoeExecutor::kMaxHint; })
       .def("isa_name", &CpuMoeExecutor::isa_name)
       .def("set_spin_wait",
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
