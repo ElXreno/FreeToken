@@ -49,6 +49,10 @@ std::unique_ptr<MoeFormat> make_fp8_block_format(const MoeParams& p, const Forma
 std::unique_ptr<MoeFormat> make_gguf_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_gguf_scaled_format(const MoeParams& p, const FormatArgs& a);
 void set_ggml_cpu(uintptr_t addr);
+void quant_act_b12x(const bf16_t* x, int K, int32_t* a4, float* asb);
+#if CPU_MOE_X86
+void quant_act_b12x_avx2(const bf16_t* x, int K, int32_t* a4, float* asb);
+#endif
 void bind_locked_fetch(pybind11::module_& m);
 
 namespace {
@@ -163,6 +167,24 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // intermediate-row prep phase (prep_inter)
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
+  std::vector<int> p1_route;  // tok * top_k + k of each routed (token, route), in pass-1 order
+  std::vector<int> prev_experts;
+  int prev_layer = -1;
+
+  // the input prep on the workers, kInChunk blocks per item (FREETOKEN_CPU_MOE_SPLIT_PREP)
+  static constexpr int kInChunk = 16;
+  int in_blocks = 0;
+  int64_t in_total = 0;
+  alignas(64) std::atomic<int64_t> in_next{0};
+
+  // flow: one queue, no barriers, see run_flow()
+  int flow_p1 = 0, flow_p2 = 2;
+  bool task_flow = false;
+  int flow_p1_per = 0, flow_p2_per = 0;
+  int64_t flow_p1_total = 0, flow_total = 0;
+  alignas(64) std::atomic<int64_t> flow_next{0};
+  std::unique_ptr<std::atomic<int>[]> route_left, route_ready, blk_left;
+  AlignedVector<float> partial;
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -181,7 +203,10 @@ struct CpuMoeExecutor {
 
   // Cache prefetch of the next layer's predicted CPU experts, run on the pool between layers.
   static constexpr int kMaxHint = 32;
-  static constexpr size_t kPfChunk = 64 << 10;
+  const size_t kPfChunk = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_PF_CHUNK_KB");
+    return static_cast<size_t>((s && s[0]) ? std::max(1, atoi(s)) : 64) << 10;
+  }();
   const int32_t* hint = nullptr;  // [num_layers][2 + kMaxHint]: stamp, count, expert ids
   std::vector<int32_t> hint_seen;
   bool cur_prefetch = false;
@@ -256,6 +281,16 @@ struct CpuMoeExecutor {
         throw std::invalid_argument("CPU MoE format row block out of range");
     set_row_block(kRowBlock);
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
+    p1_route.assign(static_cast<size_t>(params.max_tokens) * params.top_k, 0);
+    if (const char* s = getenv("FREETOKEN_CPU_MOE_FLOW"); s && s[0] && s[0] != '0') {
+      flow_p1 = std::clamp(atoi(s), 1, 4);
+      if (const char* s2 = getenv("FREETOKEN_CPU_MOE_FLOW_P2")) flow_p2 = std::clamp(atoi(s2), 1, 8);
+      const size_t routes = static_cast<size_t>(params.max_tokens) * params.top_k;
+      route_left = std::make_unique<std::atomic<int>[]>(routes);
+      route_ready = std::make_unique<std::atomic<int>[]>(routes);
+      blk_left = std::make_unique<std::atomic<int>[]>(static_cast<size_t>(params.max_tokens) * params.H);
+      partial.assign(routes * params.H, 0.0f);
+    }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -324,13 +359,13 @@ struct CpuMoeExecutor {
     }
   }
 
-  // Pass 1 item p = one rb-row block of one (token, route)'s intermediate row.
+  // Pass 1 item p = one rb-row block of one routed (token, route)'s intermediate row.
   bool do_pass1(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
+    const int tk = p1_route[static_cast<size_t>(p / n_iblk)];
+    const int k = tk % top_k;
+    const int tok = tk / top_k;
     const int e = io_ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return false;
     const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
@@ -599,6 +634,34 @@ struct CpuMoeExecutor {
   static int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
   }
+  static bool shared_first() {
+    static const bool on = [] {
+      const char* s = getenv("FREETOKEN_CPU_MOE_SHARED_FIRST");
+      return s && s[0] && s[0] != '0';
+    }();
+    return on;
+  }
+  static bool env_on(const char* name) {
+    const char* s = getenv(name);
+    return s && s[0] && s[0] != '0';
+  }
+  const bool split_prep_on = env_on("FREETOKEN_CPU_MOE_SPLIT_PREP");
+  bool split_prep() const { return split_prep_on; }
+  static bool prefetch_idle_only() {
+    static const bool on = [] {
+      const char* s = getenv("FREETOKEN_CPU_MOE_PREFETCH_IDLE");
+      return s && s[0] && s[0] != '0';
+    }();
+    return on;
+  }
+  bool rung_any() const {
+    for (const auto& g : gpu_sync)
+      if (__atomic_load_n(static_cast<const int64_t*>(g->poll_address()), __ATOMIC_ACQUIRE) != 0) return true;
+    return false;
+  }
+  // worker w takes row blocks w, w + num_threads, ...: the same weight tiles every task
+  const bool static_split_on = env_on("FREETOKEN_CPU_MOE_STATIC");
+  bool static_split() const { return static_split_on; }
   int prof_task_fields() const { return kProfTask + params.max_tokens * params.top_k; }
   int prof_stride() const { return prof_task_fields() + kProfThread * num_threads; }
 
@@ -646,6 +709,68 @@ struct CpuMoeExecutor {
     prof_mark(3);
   }
 
+  // gate_up items, then down items once their route is prepped
+  void run_flow(const MoeTask& t, int64_t* tp) {
+    MoeFormat& f = *fmts[layer_fmt[t.layer]];
+    const int top_k = params.top_k, H = params.H, I = params.I, layer = static_cast<int>(t.layer);
+    bool down = false;
+    for (;;) {
+      const int64_t q = flow_next.fetch_add(1, std::memory_order_relaxed);
+      if (q >= flow_total) break;
+      const int64_t a = tp ? now_ns() : 0;
+      if (q < flow_p1_total) {
+        const int j = static_cast<int>(q / flow_p1_per);
+        const int i0 = static_cast<int>(q % flow_p1_per) * flow_p1 * rb;
+        const int n = std::min(flow_p1, (I - i0 + rb - 1) / rb);
+        const int r = p1_route[j];
+        const float w_in = apply_on_input ? io_w[r] : 1.0f;
+        f.gate_up_tiles(layer, io_ids[r], r / top_k, i0, n, w_in, g_scratch.data() + (size_t)r * I);
+        if (route_left[j].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+          if (f.preps_inter()) f.prep_inter(r, g_scratch.data() + (size_t)r * I);
+          route_ready[j].store(1, std::memory_order_release);
+        }
+        if (tp) {
+          tp[6] += now_ns() - a;
+          ++tp[8];
+        }
+        continue;
+      }
+      if (!down && tp) tp[1] = tp[2] = tp[3] = tp[4] = a;
+      down = true;
+      const int64_t q2 = q - flow_p1_total;
+      const int j = static_cast<int>(q2 / flow_p2_per), b = static_cast<int>(q2 % flow_p2_per);
+      for (int v; (v = route_ready[j].load(std::memory_order_acquire)) == 0;) wait_change(route_ready[j], v);
+      const int r = p1_route[j], tok = r / top_k;
+      const int h0 = b * flow_p2 * rb;
+      const int n = std::min(flow_p2, (H - h0 + rb - 1) / rb);
+      f.down_tiles(layer, h0, n, DownRoute{io_ids[r], r, g_scratch.data() + (size_t)r * I}, partial.data() + (size_t)r * H + h0);
+      if (blk_left[tok * flow_p2_per + b].fetch_sub(1, std::memory_order_acq_rel) == 1) flow_sum(f, tok, h0, std::min(H, h0 + n * rb));
+      if (tp) {
+        tp[7] += now_ns() - a;
+        ++tp[9];
+      }
+    }
+    if (!down && tp) tp[1] = tp[2] = tp[3] = tp[4] = now_ns();
+  }
+
+  // do_pass2's sum over a token's routes, from their down outputs in `partial`
+  void flow_sum(const MoeFormat& f, int tok, int h0, int h1) {
+    const int top_k = params.top_k, H = params.H;
+    const bool rounds_routes = f.rounds_routes();
+    bf16_t* y_row = io_y + (size_t)tok * H;
+    for (int h = h0; h < h1; ++h) {
+      float acc = 0.0f;
+      for (int k = 0; k < top_k; ++k) {
+        const size_t r = (size_t)tok * top_k + k;
+        const int e = io_ids[r];
+        if (e < 0 || e >= num_experts) continue;
+        const float v = partial[r * H + h] * (apply_on_input ? 1.0f : io_w[r]);
+        acc += rounds_routes ? bf16_to_f32(f32_to_bf16(v)) : v;
+      }
+      y_row[h] = f32_to_bf16(acc);
+    }
+  }
+
   void run_task_body(const MoeTask& t, int tid) {
     if (cur_prefetch) {
       do_prefetch();
@@ -654,9 +779,23 @@ struct CpuMoeExecutor {
     int64_t* tp = prof_cur >= 0 ? prof.data() + prof_cur * prof_stride() + prof_task_fields() + kProfThread * tid : nullptr;
     if (tp) tp[0] = now_ns();
     int local_sense = 0;
-    for (;;) {
-      int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
-      if (p >= p1_total) break;
+    if (in_total > 0) {
+      MoeFormat& f = *fmts[layer_fmt[t.layer]];
+      const int per = (in_blocks + kInChunk - 1) / kInChunk;
+      for (;;) {
+        const int64_t c = in_next.fetch_add(1, std::memory_order_relaxed);
+        if (c >= in_total) break;
+        const int tok = static_cast<int>(c / per), b0 = static_cast<int>(c % per) * kInChunk;
+        f.prep_input_range(tok, io_x + (size_t)tok * params.H, b0, std::min(in_blocks, b0 + kInChunk));
+      }
+      barrier(local_sense);
+    }
+    if (task_flow) {
+      run_flow(t, tp);
+      if (tp) tp[5] = now_ns();
+      return;
+    }
+    const auto pass1 = [&](int64_t p) {
       if (tp) {
         const int64_t a = now_ns();
         if (do_pass1(t, p)) {
@@ -665,6 +804,27 @@ struct CpuMoeExecutor {
         }
       } else {
         do_pass1(t, p);
+      }
+    };
+    const auto pass2 = [&](int64_t p) {
+      if (tp) {
+        const int64_t a = now_ns();
+        do_pass2(t, p);
+        tp[7] += now_ns() - a;
+        ++tp[9];
+      } else {
+        do_pass2(t, p);
+      }
+    };
+    const bool own = static_split();
+    if (own) {
+      for (int64_t p = 0; p < p1_total; p += n_iblk)
+        for (int64_t ib = tid; ib < n_iblk; ib += num_threads) pass1(p + ib);
+    } else {
+      for (;;) {
+        const int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p1_total) break;
+        pass1(p);
       }
     }
     if (tp) tp[1] = now_ns();
@@ -675,8 +835,9 @@ struct CpuMoeExecutor {
     if (prt_total > 0) {
       MoeFormat& f = *fmts[layer_fmt[t.layer]];
       for (;;) {
-        int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
-        if (r >= prt_total) break;
+        const int64_t i = prt_next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= prt_total) break;
+        const int r = p1_route[static_cast<size_t>(i)];
         f.prep_inter(r, g_scratch.data() + (size_t)r * params.I);
       }
       if (tp) tp[3] = now_ns();
@@ -685,16 +846,14 @@ struct CpuMoeExecutor {
       tp[3] = tp[2];
     }
     if (tp) tp[4] = now_ns();
-    for (;;) {
-      int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
-      if (p >= p2_total) break;
-      if (tp) {
-        const int64_t a = now_ns();
-        do_pass2(t, p);
-        tp[7] += now_ns() - a;
-        ++tp[9];
-      } else {
-        do_pass2(t, p);
+    if (own) {
+      for (int64_t p = 0; p < p2_total; p += n_hblk)
+        for (int64_t hb = tid; hb < n_hblk; hb += num_threads) pass2(p + hb);
+    } else {
+      for (;;) {
+        const int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p2_total) break;
+        pass2(p);
       }
     }
     if (tp) tp[5] = now_ns();
@@ -741,9 +900,41 @@ struct CpuMoeExecutor {
     const int num_tokens = static_cast<int>(t.num_tokens);
     MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
     set_row_block(fmt.row_block());
-    p1_total = static_cast<int64_t>(num_tokens) * params.top_k * n_iblk;
+    int routed = 0;
+    for (int r = 0; r < num_tokens * params.top_k; ++r)
+      if (io_ids[r] >= 0 && io_ids[r] < num_experts) p1_route[routed++] = r;
+    const auto in_prev = [&](int r) {
+      return std::find(prev_experts.begin(), prev_experts.end(), io_ids[r]) != prev_experts.end();
+    };
+    if (shared_first() && static_cast<int>(t.layer) == prev_layer)
+      std::stable_partition(p1_route.begin(), p1_route.begin() + routed, in_prev);
+    prev_layer = static_cast<int>(t.layer);
+    prev_experts.clear();
+    for (int i = 0; i < routed; ++i) prev_experts.push_back(io_ids[p1_route[i]]);
+    p1_total = static_cast<int64_t>(routed) * n_iblk;
     p2_total = static_cast<int64_t>(num_tokens) * n_hblk;
-    prt_total = fmt.preps_inter() ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
+    prt_total = fmt.preps_inter() ? routed : 0;
+    task_flow = flow_p1 > 0 && fmt.has_tiles();
+    if (task_flow) {
+      flow_p1_per = (n_iblk + flow_p1 - 1) / flow_p1;
+      flow_p2_per = (n_hblk + flow_p2 - 1) / flow_p2;
+      flow_p1_total = static_cast<int64_t>(routed) * flow_p1_per;
+      flow_total = flow_p1_total + static_cast<int64_t>(routed) * flow_p2_per;
+      flow_next.store(0, std::memory_order_relaxed);
+      for (int j = 0; j < routed; ++j) {
+        route_left[j].store(flow_p1_per, std::memory_order_relaxed);
+        route_ready[j].store(0, std::memory_order_relaxed);
+      }
+      for (int tok = 0; tok < num_tokens; ++tok) {
+        int n = 0;
+        for (int k = 0; k < params.top_k; ++k) {
+          const int e = io_ids[tok * params.top_k + k];
+          n += e >= 0 && e < num_experts;
+        }
+        for (int b = 0; b < flow_p2_per; ++b) blk_left[tok * flow_p2_per + b].store(n, std::memory_order_relaxed);
+        if (n == 0) std::memset(io_y + (size_t)tok * params.H, 0, sizeof(bf16_t) * params.H);
+      }
+    }
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -752,7 +943,11 @@ struct CpuMoeExecutor {
     bar_sense.store(0, std::memory_order_relaxed);
     // Prepare the per-token input once, up front.
     // Single-threaded: tiny for decode, and done before the workers are woken below.
-    for (int tok = 0; tok < num_tokens; ++tok) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
+    in_blocks = split_prep() ? fmt.prep_input_blocks() : 0;
+    in_total = in_blocks > 0 ? static_cast<int64_t>(num_tokens) * ((in_blocks + kInChunk - 1) / kInChunk) : 0;
+    in_next.store(0, std::memory_order_relaxed);
+    if (in_total == 0)
+      for (int tok = 0; tok < num_tokens; ++tok) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;
@@ -885,7 +1080,8 @@ struct CpuMoeExecutor {
         gpu_sync[slot]->cpu_done();
         prof_end();
         flag_served.fetch_add(1, std::memory_order_relaxed);
-        if (hint) pf_inflight = submit_prefetch(static_cast<int>(t.layer) + 1);
+        // a rung doorbell would retire the prefetch at once
+        if (hint && !(prefetch_idle_only() && rung_any())) pf_inflight = submit_prefetch(static_cast<int>(t.layer) + 1);
         last_active = coord_clock::now();
         empty_polls = 0;
         sleep_us = 100;
@@ -1046,6 +1242,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("max_generic_act_id", []() { return static_cast<int>(freetoken::cpu_moe::ACT_SWIGLU_CLAMP); });
   // The ggml-cpu variant the gguf format calls: the kernel table address that freetoken.kernel.ggml_cpu.select() returns.
   m.def("set_ggml_cpu", &freetoken::cpu_moe::set_ggml_cpu, py::arg("api"));
+  // the b12x activation quant of a bf16 row: (packed int8 x4, block scales)
+  m.def(
+      "b12x_quant_act",
+      [](const torch::Tensor& x, bool simd) {
+        TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 1 && x.is_contiguous() && x.size(0) % 16 == 0);
+        const int K = static_cast<int>(x.size(0));
+        torch::Tensor a4 = torch::empty({K / 4}, torch::kInt32), asb = torch::empty({K / 16}, torch::kFloat32);
+        const auto* src = reinterpret_cast<const freetoken::cpu_moe::bf16_t*>(x.data_ptr());
+#if CPU_MOE_X86
+        if (simd) {
+          TORCH_CHECK(__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"), "needs AVX2");
+          freetoken::cpu_moe::quant_act_b12x_avx2(src, K, a4.data_ptr<int32_t>(), asb.data_ptr<float>());
+          return py::make_tuple(a4, asb);
+        }
+#endif
+        TORCH_CHECK(!simd, "no SIMD quant on this ISA");
+        freetoken::cpu_moe::quant_act_b12x(src, K, a4.data_ptr<int32_t>(), asb.data_ptr<float>());
+        return py::make_tuple(a4, asb);
+      },
+      py::arg("x"), py::arg("simd"));
   m.def("weight_formats", []() {
     py::list names;
     for (const auto& f : freetoken::cpu_moe::kFormats) names.append(f.first);

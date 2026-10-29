@@ -114,6 +114,9 @@ class MoeFormat {
   virtual std::string isa_name() const = 0;
   // Once per input row x[tok] before pass 1.
   virtual void prep_input(int /*tok*/, const bf16_t* /*x*/) {}
+  // prep_input over blocks [b0, b1) of x; 0 blocks: whole rows only
+  virtual int prep_input_blocks() const { return 0; }
+  virtual void prep_input_range(int /*tok*/, const bf16_t* /*x*/, int /*b0*/, int /*b1*/) {}
   // Whether pass 2 needs prep_inter on every intermediate row.
   virtual bool preps_inter() const { return false; }
   virtual void prep_inter(int64_t /*r*/, bf16_t* /*g*/) {}
@@ -128,6 +131,10 @@ class MoeFormat {
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
   // Round each router-weighted down output to bf16 before the sum over routes.
   virtual bool rounds_routes() const { return false; }
+  // n row blocks from i0 (gate_up) or h0 (down, one route), bitwise gate_up's and down's values
+  virtual bool has_tiles() const { return false; }
+  virtual void gate_up_tiles(int /*layer*/, int /*e*/, int /*tok*/, int /*i0*/, int /*n*/, float /*w_in*/, bf16_t* /*g*/) const {}
+  virtual void down_tiles(int /*layer*/, int /*h0*/, int /*n*/, const DownRoute& /*route*/, float* /*out*/) const {}
   // Byte ranges of expert e for the cache prefetch (<= kMaxRanges); 0 = none.
   virtual int expert_ranges(int /*layer*/, int /*e*/, const void** /*ptrs*/, size_t* /*lens*/) const { return 0; }
 

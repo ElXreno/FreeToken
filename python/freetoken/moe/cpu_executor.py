@@ -49,6 +49,8 @@ logger = init_logger(__name__)
 _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # Pool threads spin up to 50 ms before they park. FREETOKEN_CPU_MOE_SPIN=0 opts out.
 _SPIN_WAIT = os.getenv("FREETOKEN_CPU_MOE_SPIN", "1") != "0"
+# with an explicit thread count: "auto" or a CPU number
+_COORD_CORE = os.getenv("FREETOKEN_CPU_MOE_COORD_CORE", "").strip().lower()
 # FREETOKEN_CPU_MOE_PREFETCH: cache prefetch of the hinted next-layer experts
 _PREFETCH_MODES = {"1": 0, "t1": 1, "t2": 2, "t0": 3, "load": 0}
 # ds_fp4 runs its input FP8 round-trip on the GPU when it can; tests turn this off to compare against the CPU round-trip.
@@ -289,6 +291,10 @@ class CpuMoeExecutor:
             coord_core = core_ids[-1]
             nthreads -= 1
             core_ids = core_ids[:-1]
+        elif self._flag_sync and _COORD_CORE == "auto":
+            coord_core = next((c for c in physical_core_cpus() if c not in core_ids), -1)
+        elif self._flag_sync and _COORD_CORE.isdigit():
+            coord_core = int(_COORD_CORE)
         self._coord_core = coord_core
         alloc_io = (
             (lambda *shape, dtype: torch.empty(*shape, dtype=dtype))
