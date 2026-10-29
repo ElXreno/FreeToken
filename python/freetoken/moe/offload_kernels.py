@@ -24,6 +24,8 @@ if _hybrid_fetch_round not in _HYBRID_FETCH_ROUNDING:
     raise ValueError(f"FREETOKEN_HYBRID_FETCH_ROUND={_hybrid_fetch_round!r}: expected one of {sorted(_HYBRID_FETCH_ROUNDING)}")
 _HYBRID_FETCH_ROUND = _HYBRID_FETCH_ROUNDING[_hybrid_fetch_round]
 _HYBRID_FETCH_SEED = 0
+# >0: evict by hit frequency decayed with this time constant in ensure steps (LFU-decay), else LRU
+_HYBRID_LFU_TAU = float(os.getenv("FREETOKEN_HYBRID_LFU_TAU", "0") or 0)
 # Phase 2 of the hybrid ensure kernel scans a pool wider than this in tiles of this width.
 _HYBRID_EVICT_CHUNK = 8192
 
@@ -161,6 +163,8 @@ def _ensure_experts_hybrid_gpu(
     num_warps = 8 if chunk >= 4096 else 4
     ready = getattr(cache, "_ce_ready_pool", None)
     p = cache.pool_of_layer[layer_id]
+    lfu = _HYBRID_LFU_TAU > 0 and num_slots <= chunk
+    freq, last = cache.pool_lfu(layer_id) if lfu else (id_of_slot, id_of_slot)
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -187,6 +191,9 @@ def _ensure_experts_hybrid_gpu(
         cache.num_experts,
         num_slots,
         _HYBRID_FETCH_SEED,
+        freq,
+        last,
+        _HYBRID_LFU_TAU if lfu else 1.0,
         BLOCK_E=block_e,
         CHUNK=chunk,
         SMALL=num_slots <= chunk,
@@ -195,6 +202,7 @@ def _ensure_experts_hybrid_gpu(
         CLAMP=clamp,
         STATS=cache.collect_stats,
         PENDING=ready is not None,
+        LFU=lfu,
         num_warps=num_warps,
     )
 
@@ -326,6 +334,9 @@ def _ensure_experts_hybrid_kernel(
     num_experts: tl.constexpr,
     cache_size,
     seed,
+    freq_ptr,
+    last_ptr,
+    lfu_tau,
     BLOCK_E: tl.constexpr,
     CHUNK: tl.constexpr,
     SMALL: tl.constexpr,
@@ -334,6 +345,7 @@ def _ensure_experts_hybrid_kernel(
     CLAMP: tl.constexpr,
     STATS: tl.constexpr,
     PENDING: tl.constexpr,
+    LFU: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -408,7 +420,16 @@ def _ensure_experts_hybrid_kernel(
     num_fetch = tl.minimum(tl.minimum(num_missing, tl.minimum(max_fetch, fetch_cap)), cache_size - tl.sum(is_hit.to(tl.int32)))
     tl.store(num_missing_full_ptr, (num_missing + num_pend).to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
-    tl.store(usage_ptr + slot, step, mask=is_hit)
+    if LFU:
+        # key = last step + tau * log2(decayed hits): argmin by key is argmin by decayed frequency
+        f0 = tl.load(freq_ptr + slot, mask=is_hit, other=0.0)
+        t0 = tl.load(last_ptr + slot, mask=is_hit, other=0)
+        f1 = f0 * tl.exp2(-(step - t0).to(tl.float32) / lfu_tau) + 1.0
+        tl.store(freq_ptr + slot, f1, mask=is_hit)
+        tl.store(last_ptr + slot, step + tl.zeros_like(t0), mask=is_hit)
+        tl.store(usage_ptr + slot, step + (lfu_tau * tl.log2(f1)).to(tl.int64), mask=is_hit)
+    else:
+        tl.store(usage_ptr + slot, step, mask=is_hit)
 
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
     # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
@@ -432,11 +453,20 @@ def _ensure_experts_hybrid_kernel(
                 rd = tl.load(ready_ptr + off_k, mask=off_k < cache_size, other=0, volatile=True)
                 gn = tl.load(gen_ptr + off_k, mask=off_k < cache_size, other=0)
                 u_reg = tl.where(rd != gn, 9223372036854775807, u_reg)
+            if LFU:
+                # a hit's key need not top the pool's: keep this step's hits out by hand
+                hit_slot = tl.where(is_hit, slot, -1)
+                for j in tl.range(num_active):
+                    hs = tl.max(tl.where(off_e == tl.load(expert_ids_ptr + j), hit_slot, -1), axis=0)
+                    u_reg = tl.where(off_k == hs, 9223372036854775807, u_reg)
         for i in tl.range(num_fetch):
             if SMALL:
                 victim = tl.argmin(u_reg, axis=0).to(tl.int32)
                 best_u = tl.min(u_reg, axis=0)
-                u_reg = tl.where(off_k == victim, tl.maximum(u_reg, step), u_reg)
+                if LFU:
+                    u_reg = tl.where(off_k == victim, 9223372036854775807, u_reg)
+                else:
+                    u_reg = tl.where(off_k == victim, tl.maximum(u_reg, step), u_reg)
             else:
                 best_u = tl.full((), 9223372036854775807, tl.int64)
                 best_s = tl.full((), 0, tl.int32)
@@ -453,7 +483,9 @@ def _ensure_experts_hybrid_kernel(
                     best_s = tl.where(take, carg, best_s)
                     best_u = tl.where(take, cmin, best_u)
                 victim = best_s
-            if PENDING:
+            if LFU:
+                free = best_u < 140737488355328
+            elif PENDING:
                 # every usage but this step's hits and victims lies below step
                 free = best_u < step
             else:
@@ -468,6 +500,9 @@ def _ensure_experts_hybrid_kernel(
             tl.store(id_of_slot_ptr + victim, base + e, mask=free)
             tl.store(slot_for_id_ptr + base + e, victim, mask=free)
             tl.store(usage_ptr + victim, step, mask=free)
+            if LFU:
+                tl.store(freq_ptr + victim, 1.0, mask=free)
+                tl.store(last_ptr + victim, step, mask=free)
             if PENDING:
                 tl.store(gen_ptr + victim, tl.load(gen_ptr + victim) + 1, mask=free)
             tl.store(evict_slots_ptr + n, victim, mask=free)
