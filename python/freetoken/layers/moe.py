@@ -344,17 +344,28 @@ class OffloadMoELayer(MoELayer):
         self.hybrid_done()
         return out
 
-    def _hybrid_gpu(self, cache: OffloadMoeCache, hidden_states: torch.Tensor, gpu_slots: torch.Tensor, gpu_w: torch.Tensor) -> torch.Tensor:
-        """The GPU share of a hybrid decode on the current stream: the miss copy and the GEMMs of the hit and fetched routes."""
+    def _hybrid_gpu(
+        self, cache: OffloadMoeCache, hidden_states: torch.Tensor, gpu_slots: torch.Tensor, gpu_w: torch.Tensor,
+        staged: torch.cuda.Event | None = None, gemm_after: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
+        """The GPU share of a hybrid decode on the current stream: the miss copy and the GEMMs of the hit and fetched
+        routes. ``staged`` is recorded once nothing reads the cache's copy staging (evict_slots and the like) any more;
+        the GEMMs wait for ``gemm_after``, as expert GEMMs run one at a time (a resident grid and a shared workspace)."""
         clamp = not self.skips_inactive_slots
         prefetch = self._prefetch(cache)
         if _HYBRID_SPLIT_GEMM:
-            return self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0 if clamp else -1)
+            return self._split_hybrid_gemm(
+                cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0 if clamp else -1, staged=staged, gemm_after=gemm_after,
+            )
         if prefetch is not None:
             prefetch.before_demand(self.layer_id)
         cache.copy_missing()
+        if staged is not None:
+            staged.record()
         if prefetch is not None:
             prefetch.after_demand(self.layer_id, hidden_states)
+        if gemm_after is not None:
+            torch.cuda.current_stream().wait_event(gemm_after)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -383,7 +394,8 @@ class OffloadMoELayer(MoELayer):
     def hybrid_route(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Staged hybrid decode, on the current stream: the routing and the capped-fetch ensure, which claims slots
         for the fetched misses. Returns (weights, GPU slots, GPU weights, CPU ids): the CPU pool's submit reads the
-        weights and the CPU ids, ``hybrid_gpu`` the slots. Another call's GEMM must be done with the slots first."""
+        weights and the CPU ids, ``hybrid_gpu`` the slots. Another call's ``hybrid_gpu`` must have recorded its
+        ``staged`` event first."""
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states, gating_output=router_logits, topk=self.top_k, renormalize=self.renormalize,
         )
@@ -392,11 +404,16 @@ class OffloadMoELayer(MoELayer):
         )
         return topk_weights, gpu_slots, gpu_w, cpu_ids
 
-    def hybrid_gpu(self, hidden_states: torch.Tensor, routes: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    def hybrid_gpu(
+        self, hidden_states: torch.Tensor, routes: tuple[torch.Tensor, ...],
+        staged: torch.cuda.Event | None = None, gemm_after: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
         """Staged hybrid decode, on the current stream after ``hybrid_route``: the GPU experts' output, which the
-        CPU pool's sync adds its share to."""
+        CPU pool's sync adds its share to. Another call's ``hybrid_route`` may run once ``staged`` is recorded: it
+        claims the least recently used slots, never the ones this call routes to. The GEMMs wait for ``gemm_after``,
+        the end of the other call's GEMMs."""
         _, gpu_slots, gpu_w, _ = routes
-        return self._hybrid_gpu(self.offload_cache, hidden_states, gpu_slots, gpu_w)
+        return self._hybrid_gpu(self.offload_cache, hidden_states, gpu_slots, gpu_w, staged, gemm_after)
 
     def hybrid_done(self) -> None:
         """After the merged output: the next layer's prefetch, as at the end of ``_decode_hybrid``."""
@@ -409,7 +426,7 @@ class OffloadMoELayer(MoELayer):
         """The next-layer prefetch, run by a staggered verify's first row only: one row predicts for both."""
         return cache.expert_prefetch if not get_global_ctx().batch.verify_row else None
 
-    def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0):
+    def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0, staged=None, gemm_after=None):
         """The hit routes' GEMM on a side stream while the misses copy in, then the fetched routes' GEMM.
 
         One b12x launch at a time (they share a scratch workspace): the side GEMM and the main stream's copy run
@@ -423,12 +440,17 @@ class OffloadMoELayer(MoELayer):
         main = torch.cuda.current_stream()
         demand = getattr(cache, "demand_copy", None)
         if _HYBRID_SPLIT == "copy" and demand is not None and demand.serves(self.layer_id):
-            demand.publish(self.layer_id)
+            lane = get_global_ctx().batch.verify_row or 0
+            demand.publish(self.layer_id, lane)
+            if staged is not None:
+                staged.record()
             if prefetch is not None:
                 prefetch.before_demand(self.layer_id)
                 prefetch.after_demand(self.layer_id, hidden_states)
+            if gemm_after is not None:
+                main.wait_event(gemm_after)
             hit_out = self._expert_gemm(cache, hidden_states, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
-            demand.wait(self.layer_id)
+            demand.wait(self.layer_id, lane)
             new_out = self._expert_gemm(cache, hidden_states, new_w, new_slots, views=views, n=None, alphas=alphas, is_prefill=False)
             return hit_out + new_out
         if _HYBRID_SPLIT == "copy":
@@ -438,8 +460,12 @@ class OffloadMoELayer(MoELayer):
                 if prefetch is not None:
                     prefetch.before_demand(self.layer_id)
                 cache.copy_missing()
+                if staged is not None:
+                    staged.record()
             if prefetch is not None:
                 prefetch.after_demand(self.layer_id, hidden_states)
+            if gemm_after is not None:
+                main.wait_event(gemm_after)
             hit_out = self._expert_gemm(cache, hidden_states, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
             main.wait_stream(side)
             new_out = self._expert_gemm(cache, hidden_states, new_w, new_slots, views=views, n=None, alphas=alphas, is_prefill=False)
@@ -448,11 +474,15 @@ class OffloadMoELayer(MoELayer):
         side = cache.split_gemm_stream()
         side.wait_stream(main)
         with torch.cuda.stream(side):
+            if gemm_after is not None:
+                side.wait_event(gemm_after)
             hit_out = self._expert_gemm(cache, x_side, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
         x_side.record_stream(side)
         if prefetch is not None:
             prefetch.before_demand(self.layer_id)
         cache.copy_missing()
+        if staged is not None:
+            staged.record()
         if prefetch is not None:
             prefetch.after_demand(self.layer_id, hidden_states)
         main.wait_stream(side)
