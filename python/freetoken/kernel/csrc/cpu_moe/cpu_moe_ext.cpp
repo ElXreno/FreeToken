@@ -236,7 +236,7 @@ struct CpuMoeExecutor {
       bar_count.store(0);
       bar_sense.store(local_sense);
     } else {
-      while (bar_sense.load() != local_sense) cpu_relax();
+      for (int v; (v = bar_sense.load()) != local_sense;) wait_change(bar_sense, v);
     }
   }
 
@@ -326,7 +326,7 @@ struct CpuMoeExecutor {
       if (gen == my_gen && spin_wait.load(std::memory_order_relaxed)) {
         unsigned polls = 0;
         while (gen == my_gen) {
-          cpu_relax();
+          wait_change(submitted, my_gen);
           if (stop.load(std::memory_order_relaxed)) return;
           if ((++polls & 1023u) == 0 && wclk::now() - last_active > kSpinWindow) break;
           gen = submitted.load(std::memory_order_acquire);
@@ -384,8 +384,8 @@ struct CpuMoeExecutor {
       using sclk = std::chrono::steady_clock;
       const auto t0 = sclk::now();
       unsigned polls = 0;
-      while (completed.load(std::memory_order_acquire) < target) {
-        cpu_relax();
+      for (uint64_t c; (c = completed.load(std::memory_order_acquire)) < target;) {
+        wait_change(completed, c);
         if ((++polls & 1023u) == 0 && sclk::now() - t0 > kSpinWindow) break;
       }
       if (completed.load(std::memory_order_acquire) >= target) return;
