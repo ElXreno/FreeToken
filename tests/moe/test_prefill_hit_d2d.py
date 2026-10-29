@@ -178,3 +178,35 @@ def test_prefill_hit_d2d_noop_without_spare_slots():
     torch.cuda.synchronize()
     for view, (name, per_layer) in zip(views, sources.items()):
         assert torch.equal(view.cpu(), per_layer[0]), name
+
+
+@CUDA
+def test_seed_resident_fills_the_free_region_consistently():
+    cache, sources = _make_cache()
+    stable = cache._pool_stable_from[0]
+    assert stable == 2 * E
+    seeded = cache.seed_resident()
+    share = (CACHE_SIZE - stable) // NUM_LAYERS
+    assert seeded == share * NUM_LAYERS > 0
+    assert int((cache.slot_for_id >= 0).sum()) == seeded
+    for slot in range(stable, stable + seeded):
+        layer_id, expert_id = divmod(int(cache.id_of_slot[slot]), E)
+        assert int(cache.slot_for_id[layer_id, expert_id]) == slot
+        for name, per_layer in sources.items():
+            assert torch.equal(cache.bank_caches[name][slot].cpu(), per_layer[layer_id][expert_id]), (slot, name)
+    assert int((cache.id_of_slot[:stable] >= 0).sum()) == 0
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_seeded_experts_are_gathered_device_side():
+    cache, sources = _make_cache()
+    share = cache.seed_resident() // NUM_LAYERS
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    views = cache.wait_prefill_layer(0)
+    torch.cuda.synchronize()
+    for view, (name, per_layer) in zip(views, sources.items()):
+        assert torch.equal(view.cpu(), per_layer[0]), name
+    assert cache.prefill_hit_rows == share > 0

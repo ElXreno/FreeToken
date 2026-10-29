@@ -1114,6 +1114,46 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def seed_resident(self) -> int:
+        """Fill every pool's free slot region with an equal share of each of its GPU layers' experts; returns how many.
+
+        A fresh cache stays empty until decode loads it, so the first prefills stream every
+        expert over PCIe (hit-D2D finds nothing to gather) and the first decode steps miss
+        everything. A prefill chunk reads every expert of a layer, so any resident share
+        serves it; the seeds keep usage 0, so decode evicts them before anything it loaded.
+        Slots below a pool's stable index overlap the prefill staging and are left alone.
+        """
+        if self.device.type != "cuda" or not self.banks:
+            return 0
+        seeded = 0
+        for pool, size in enumerate(self.pool_sizes):
+            first = self._pool_stable_from[pool]
+            layers = [
+                layer_id
+                for layer_id in range(self.num_layers)
+                if self.pool_of_layer[layer_id] == pool
+                and layer_id not in self.cpu_layer_ids
+                and layer_id not in self._unpinned_layers
+            ]
+            if not layers or size <= first:
+                continue
+            share = min(self.num_experts, (size - first) // len(layers))
+            if share == 0:
+                continue
+            experts = torch.arange(share, dtype=torch.int32, device=self.device)
+            id_of_slot, _ = self.pool_state(layers[0])
+            views = self.pool_bank_views(layers[0])
+            slot = first
+            for layer_id in layers:
+                for (per_layer, _), view in zip(self.banks, views, strict=True):
+                    view[slot : slot + share].copy_(per_layer[layer_id][:share], non_blocking=True)
+                self.slot_for_id[layer_id, :share] = experts + slot
+                id_of_slot[slot : slot + share] = experts + layer_id * self.num_experts
+                slot += share
+            seeded += slot - first
+        torch.cuda.current_stream(self.device).synchronize()
+        return seeded
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
