@@ -612,6 +612,46 @@ def test_b12x_decode_matches_dequant_reference():
 
 
 @cuda
+@pytest.mark.parametrize("rows", [1, 2, 4])
+def test_b12x_split_launches_with_negative_holes_sum_to_the_full_launch(rows):
+    """Splitting the routes by this step's fetches with -1 holes: each b12x decode launch reads only its own
+    routes, the two sum to the single launch, and a launch with every route a hole adds nothing."""
+    from freetoken.layers.quantization.moe.nvfp4 import _b12x_unusable_reason, b12x_fused_experts
+    from freetoken.moe.offload_kernels import split_fetched_routes
+
+    device = torch.device("cuda")
+    reason = _b12x_unusable_reason(torch.cuda.get_device_capability(device))
+    if reason is not None:
+        pytest.skip(f"b12x not runnable here: {reason}")
+
+    cache, ref_sources = _packed_cache(device, "b12x", seed=8)
+    torch.manual_seed(3)
+    hidden = torch.randn(rows, H, dtype=torch.bfloat16, device=device) / 4
+    topk_weights = torch.rand(rows, TOPK, dtype=torch.float32, device=device)
+    ids = torch.randint(0, E, (rows, TOPK), dtype=torch.int32, device=device)
+    ids[:, 1] = (ids[:, 0] + 1 + ids[:, 1] % (E - 1)) % E
+    ref = _ref_moe(ref_sources, 0, hidden, topk_weights, ids)
+
+    slots = ids.clone()
+    cache.ensure_experts(0, slots)
+    cache.copy_missing()
+    g1, g2 = cache.alphas_for_slots(0, slots)
+    views = cache.pool_bank_views(0)
+    gu_p, gu_s, dn_p, dn_s = views
+
+    def launch(w, s):
+        return b12x_fused_experts(hidden, gu_p, gu_s, g1, dn_p, dn_s, g2, w, s, "silu", False)
+
+    cache.evict_slots[:1].copy_(slots[0, :1])
+    cache.num_indices.fill_(1)
+    hit_s, hit_w, new_s, new_w = split_fetched_routes(cache, slots, topk_weights, -1)
+    assert bool((hit_s[0, 0] == -1) & (new_s[0, 0] == slots[0, 0]))
+    _assert_close(launch(hit_w, hit_s).float() + launch(new_w, new_s).float(), ref.float())
+    holes = torch.full_like(slots, -1)
+    assert bool((launch(topk_weights, holes) == 0).all())
+
+
+@cuda
 def test_dummy_nvfp4_banks_match_the_triton_layout():
     """--use-dummy-weight banks follow the bound kernel's layout (shapes, dtypes, pinning)."""
     from freetoken.moe.expert_banks import build_expert_banks
