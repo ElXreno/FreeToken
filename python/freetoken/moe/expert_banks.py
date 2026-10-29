@@ -237,6 +237,7 @@ def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, 
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
+_PARALLEL_PREFETCH_SHARDS = 2  # iter_expert_tensors_parallel's default prefetch
 
 
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, resident=False) -> ExpertBanks:
@@ -251,11 +252,14 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, resident=resident)
 
 
-def _host_ram_fits_parallel(model_path: str) -> bool:
+def _host_ram_fits_parallel(model_path: str, *, streamed: bool = False) -> bool:
     """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
     extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
     i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
-    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
+    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure.
+
+    ``streamed`` (the converter's layer sink writes and releases each layer as it completes): no
+    bank stays resident, so only the reader's in-flight shards (``prefetch`` ahead + the current) count."""
     avail = None
     try:
         with open("/proc/meminfo") as f:
@@ -275,6 +279,8 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
         return True
     if not sizes:
         return True
+    if streamed:
+        return avail > (_PARALLEL_PREFETCH_SHARDS + 1) * max(sizes)
     return avail > sum(sizes) + max(sizes)
 
 
@@ -403,7 +409,7 @@ def load_expert_banks(
         # it OOMs where the serial path (reclaimable file mmap) survives. Drop to serial when
         # free RAM can't cover the banks + one shard's transient. (--expert-load serial/parallel
         # bypass this by forcing ``parallel`` explicitly.)
-        if parallel and not _host_ram_fits_parallel(model_path):
+        if parallel and not _host_ram_fits_parallel(model_path, streamed=layer_sink is not None):
             logger.warning_rank0(
                 "expert banks: low free RAM -> serial build (avoids parallel-reader OOM; "
                 "override with --expert-load parallel)"
