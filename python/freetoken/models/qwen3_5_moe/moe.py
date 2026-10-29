@@ -120,8 +120,12 @@ class Qwen3_5MoE(BaseOP):
 
     def routed(self, hidden_states: torch.Tensor, dense: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         """The routed experts over ``dense``'s router logits, merged with its shared expert: ``forward`` = ``routed(x, dense(x))``."""
-        router_logits, shared, gate = dense
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        router_logits = dense[0]
+        return self.merge(self.experts.forward(hidden_states=hidden_states, router_logits=router_logits), dense)
+
+    def merge(self, routed: torch.Tensor, dense: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """The routed experts' output plus ``dense``'s gated shared expert."""
+        _, shared, gate = dense
         return shared_gate_mul_add(routed, shared, gate)
 
 
