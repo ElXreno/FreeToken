@@ -30,7 +30,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
-from freetoken.moe.routing_trace import RoutingTrace, trace_path
+from freetoken.moe.routing_trace import RoutingTrace, trace_hidden, trace_path
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -997,6 +997,7 @@ class Engine:
                 path, num_layers=config.model_config.num_moe_layers, num_experts=config.model_config.num_experts,
                 top_k=config.model_config.num_experts_per_tok,
                 max_rows=config.max_running_req * max(config.decode_rows_per_req, 4), device=self.device,
+                hidden_size=config.model_config.hidden_size if trace_hidden() else None,
             )
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers

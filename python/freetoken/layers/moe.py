@@ -276,7 +276,7 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         if cache.routing_trace is not None:
-            cache.routing_trace.record(self.layer_id, topk_ids, topk_weights)
+            cache.routing_trace.record(self.layer_id, topk_ids, topk_weights, hidden_states)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
