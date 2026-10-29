@@ -375,6 +375,16 @@ class OffloadMoELayer(MoELayer):
         alphas = cache.alphas_for_slots(self.layer_id, gpu_slots)
         hit_slots, hit_w, new_slots, new_w = split_fetched_routes(cache, gpu_slots, gpu_w, hole)
         main = torch.cuda.current_stream()
+        demand = getattr(cache, "demand_copy", None)
+        if _HYBRID_SPLIT == "copy" and demand is not None and demand.serves(self.layer_id):
+            demand.publish(self.layer_id)
+            if prefetch is not None:
+                prefetch.before_demand(self.layer_id)
+                prefetch.after_demand(self.layer_id, hidden_states)
+            hit_out = self._expert_gemm(cache, hidden_states, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
+            demand.wait(self.layer_id)
+            new_out = self._expert_gemm(cache, hidden_states, new_w, new_slots, views=views, n=None, alphas=alphas, is_prefill=False)
+            return hit_out + new_out
         if _HYBRID_SPLIT == "copy":
             side = cache.split_copy_stream()
             side.wait_stream(main)
