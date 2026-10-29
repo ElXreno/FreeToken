@@ -57,3 +57,31 @@ def test_the_two_launches_sum_to_the_single_one(monkeypatch):
     want = 2 * x + (w.unsqueeze(-1) * table[slots.long()]).sum(1)
     assert cache.copied == [True]
     torch.testing.assert_close(out, want)
+
+
+@cuda
+def test_copy_mode_runs_the_miss_copy_on_the_copy_stream_and_the_gemms_on_the_compute_stream(monkeypatch):
+    from freetoken.layers import moe as moe_mod
+
+    monkeypatch.setattr(moe_mod, "_HYBRID_SPLIT", "copy")
+    table = torch.randn(12, 8, device="cuda")
+    gemm_streams, copy_streams = [], []
+
+    def gemm(self, cache, x, w, slots, **_):
+        gemm_streams.append(torch.cuda.current_stream())
+        return x + (w.unsqueeze(-1) * table[slots.long()]).sum(1)
+
+    layer = SimpleNamespace(layer_id=0, _expert_gemm=lambda *a, **k: gemm(layer, *a, **k))
+    slots = torch.tensor([[3, 7, 0, 5], [7, 9, 2, 0]], dtype=torch.int32, device="cuda")
+    w = torch.rand(2, 4, device="cuda")
+    x = torch.randn(2, 8, device="cuda")
+    cache = _cache([7, 2])
+    copy_stream = torch.cuda.Stream(priority=-3)
+    cache.split_copy_stream = lambda: copy_stream
+    cache.copy_missing = lambda: copy_streams.append(torch.cuda.current_stream())
+    main = torch.cuda.current_stream()
+    out = moe_mod.OffloadMoELayer._split_hybrid_gemm(layer, cache, x, w, slots, None)
+    torch.cuda.synchronize()
+    assert copy_streams == [copy_stream]
+    assert gemm_streams == [main, main]
+    torch.testing.assert_close(out, 2 * x + (w.unsqueeze(-1) * table[slots.long()]).sum(1))

@@ -24,7 +24,8 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
-_HYBRID_SPLIT_GEMM = os.getenv("FREETOKEN_HYBRID_SPLIT_GEMM", "0") == "1"
+_HYBRID_SPLIT = os.getenv("FREETOKEN_HYBRID_SPLIT_GEMM", "0")
+_HYBRID_SPLIT_GEMM = _HYBRID_SPLIT in ("1", "copy")
 
 
 class MoELayer(BaseOP):
@@ -373,8 +374,21 @@ class OffloadMoELayer(MoELayer):
         views = cache.pool_bank_views(self.layer_id)
         alphas = cache.alphas_for_slots(self.layer_id, gpu_slots)
         hit_slots, hit_w, new_slots, new_w = split_fetched_routes(cache, gpu_slots, gpu_w)
-        x_side = hidden_states.clone()
         main = torch.cuda.current_stream()
+        if _HYBRID_SPLIT == "copy":
+            side = cache.split_copy_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                if prefetch is not None:
+                    prefetch.before_demand(self.layer_id)
+                cache.copy_missing()
+            if prefetch is not None:
+                prefetch.after_demand(self.layer_id, hidden_states)
+            hit_out = self._expert_gemm(cache, hidden_states, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
+            main.wait_stream(side)
+            new_out = self._expert_gemm(cache, hidden_states, new_w, new_slots, views=views, n=None, alphas=alphas, is_prefill=False)
+            return hit_out + new_out
+        x_side = hidden_states.clone()
         side = cache.split_gemm_stream()
         side.wait_stream(main)
         with torch.cuda.stream(side):
