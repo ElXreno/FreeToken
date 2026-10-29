@@ -38,15 +38,21 @@ def _hint_kernel(score_ptr, slot_for_id_ptr, step_ptr, out_ptr, base, max_n, top
                  BLOCK_E: tl.constexpr):
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    s = tl.load(score_ptr + off_e, mask=e_mask, other=float("-inf"))
+    s = tl.load(score_ptr + off_e, mask=e_mask, other=float("-inf")).to(tl.float32)
     cold = e_mask & (tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=0) == -1)
+    cs = tl.where(cold, s, float("-inf"))
     n = tl.zeros((), dtype=tl.int32)
-    for i in tl.range(topn):
-        e = tl.argmax(s, axis=0).to(tl.int32)
-        s = tl.where(off_e == e, float("-inf"), s)
-        take = (tl.sum(tl.where(off_e == e, cold.to(tl.int32), 0)) > 0) & (n < max_n)
+    live = tl.full((), 1, dtype=tl.int1)
+    # rank: how many experts the full score order puts before e
+    for i in tl.range(max_n):
+        e = tl.argmax(cs, axis=0).to(tl.int32)
+        se = tl.max(cs, axis=0)
+        rank = tl.sum(((s > se) | ((s == se) & (off_e < e))).to(tl.int32))
+        take = live & (se > float("-inf")) & (rank < topn)
         tl.store(out_ptr + 2 + n, e, mask=take)
         n = n + take.to(tl.int32)
+        live = take
+        cs = tl.where(off_e == e, float("-inf"), cs)
     tl.store(out_ptr + 1, n)
     tl.store(out_ptr, (tl.load(step_ptr) & 0x7FFFFFFF).to(tl.int32))
 
