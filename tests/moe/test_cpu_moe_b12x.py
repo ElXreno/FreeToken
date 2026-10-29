@@ -132,12 +132,12 @@ def test_cpu_b12x_simd_activation_quant_is_the_scalar_one_bitwise():
     [
         {"FLOW": "1", "FLOW_P2": "2"},
         {"FLOW": "2", "FLOW_P2": "3", "SPLIT_PREP": "1"},
-        {"STATIC": "1", "SPLIT_PREP": "1"},
+        {"FLOW": "0", "STATIC": "1", "SPLIT_PREP": "1"},
     ],
 )
 def test_cpu_b12x_work_splits_write_the_barrier_passes_bytes(monkeypatch, env):
     """The flow queue (gate_up and down items without barriers), the input prep on the workers and the static split
-    write the default passes' bytes, a token without routes included."""
+    write the barrier passes' bytes, a token without routes included."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     fp = _prepare_module(monkeypatch)
@@ -148,6 +148,7 @@ def test_cpu_b12x_work_splits_write_the_barrier_passes_bytes(monkeypatch, env):
         return CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=3,
                               max_tokens=bs, device=torch.device("cpu"))
 
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_FLOW", "0")
     base = make()
     for k, v in env.items():
         monkeypatch.setenv(f"FREETOKEN_CPU_MOE_{k}", v)
@@ -169,9 +170,32 @@ def test_cpu_b12x_work_splits_write_the_barrier_passes_bytes(monkeypatch, env):
     task, nids, thread, n = split._ext.profile_layout()
     per = outs[1][1][0, len(task) + nids:].view(n, len(thread))
     th = {name: per[:, i] for i, name in enumerate(thread)}
-    if "FLOW" in env:
+    if env.get("FLOW", "0") != "0":
         assert (th["pass1_end"] == th["barrier2"]).all()
         assert int(th["pass1_items"].sum()) == 4 * (I // 64 // int(env["FLOW"]))
         assert int(th["pass2_items"].sum()) == 4 * -(-(H // 64) // int(env["FLOW_P2"]))
     if "STATIC" in env:
         assert th["pass1_items"].tolist() == [4 * len(range(t, I // 64, n)) for t in range(n)]
+
+
+def test_cpu_b12x_runs_the_flow_queue_by_default(monkeypatch):
+    """Without FREETOKEN_CPU_MOE_FLOW a b12x task runs its gate_up and down items from one queue, with no barrier."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    fp = _prepare_module(monkeypatch)
+    monkeypatch.delenv("FREETOKEN_CPU_MOE_FLOW", raising=False)
+    L, E, H, I, top_k, bs = 2, 6, 512, 256, 3, 1
+    cache, _ = _b12x_cache(fp, L, E, H, I, seed=12)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=3,
+                        max_tokens=bs, device=torch.device("cpu"))
+    ex._io["x"][:bs].copy_(torch.randn(bs, H, dtype=torch.bfloat16))
+    ex._io["ids"][:bs].copy_(torch.tensor([[1, 3, 5]], dtype=torch.int32))
+    ex._io["w"][:bs].copy_(torch.rand(bs, top_k))
+    ex._ext.profile_start(1)
+    ex._ext.run(0, bs)
+    raw = ex._ext.profile_take()
+    task, nids, thread, n = ex._ext.profile_layout()
+    per = raw[0, len(task) + nids:].view(n, len(thread))
+    th = {name: per[:, i] for i, name in enumerate(thread)}
+    assert (th["pass1_end"] == th["barrier2"]).all()
+    assert int(th["pass1_items"].sum()) == 3 * (I // 64)

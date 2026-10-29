@@ -154,7 +154,7 @@ int b12x_pf_hint() {
 bool b12x_pf_scales() {
   static const bool v = [] {
     const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_SCALES");
-    return s && s[0] && s[0] != '0';
+    return !(s && s[0] == '0');
   }();
   return v;
 }
@@ -162,7 +162,7 @@ bool b12x_pf_scales() {
 bool b12x_pf_prologue() {
   static const bool v = [] {
     const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_PROLOGUE");
-    return s && s[0] && s[0] != '0';
+    return !(s && s[0] == '0');
   }();
   return v;
 }
@@ -171,7 +171,7 @@ bool b12x_pf_prologue() {
 int b12x_pf_far() {
   static const int v = [] {
     const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_FAR");
-    return (s && s[0]) ? atoi(s) : 0;
+    return (s && s[0]) ? atoi(s) : 12;
   }();
   return v;
 }
