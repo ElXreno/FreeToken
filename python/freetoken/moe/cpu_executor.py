@@ -230,6 +230,8 @@ class CpuMoeExecutor:
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
         by_role = {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}
+        if "nvfp4_b12x" in names:
+            by_role.update(self._host_alphas(cache))
         # every format's tables address every layer, but a format reads only its own layers' rows
         formats, shapes = [], set()
         for name, opts in specs:
@@ -397,6 +399,33 @@ class CpuMoeExecutor:
         """Per-layer table addresses keyed by canonical bank role."""
         return {role: self._make_table(layers).data_ptr() for role, layers in roles.items()}
 
+    def _host_alphas(self, cache) -> dict[str, list[torch.Tensor]]:
+        """b12x's per-expert alphas live on the GPU (``set_alphas``); the CPU reads a host copy, one ``[E]`` view per layer."""
+        out = {}
+        for role in ("gate_up_alpha", "down_alpha"):
+            alpha = getattr(cache, role, None)
+            if alpha is None:
+                raise NotImplementedError(f"CPU MoE nvfp4_b12x experts need the cache's {role}")
+            host = alpha.detach().to("cpu", torch.float32).contiguous().view(self.num_layers, self.num_experts)
+            self._banks.append(host)
+            out[role] = list(host.unbind(0))
+        return out
+
+    def _resolve_b12x_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
+        """flashinfer's SM12x W4A16 tiles read in place: gate_up [E, H/16, 4I] int32 + [E, H/16, 2I] scale bytes, down [E, I/16, 2H] + [E, I/16, H], fp32 alphas [E]."""
+        gu, gus, dn, dns = banks["gate_up"], banks["gate_up_scale"], banks["down"], banks["down_scale"]
+        assert gu[rep].dtype == torch.int32 and dn[rep].dtype == torch.int32, (gu[rep].dtype, dn[rep].dtype)
+        assert gus[rep].element_size() == 1 and dns[rep].element_size() == 1, "block scales must be 1 byte"
+        H = int(gu[rep].shape[1] * 16)
+        I = int(gu[rep].shape[2] // 4)
+        assert H % 64 == 0 and I % 64 == 0, (H, I)
+        assert tuple(gus[rep].shape[1:]) == (H // 16, 2 * I), (gus[rep].shape, H, I)
+        assert tuple(dn[rep].shape[1:]) == (I // 16, 2 * H), (dn[rep].shape, H, I)
+        assert tuple(dns[rep].shape[1:]) == (I // 16, H), (dns[rep].shape, H, I)
+        tables = self._tables(gate_up=gu, gate_up_scale=gus, down=dn, down_scale=dns,
+                              gate_up_alpha=banks["gate_up_alpha"], down_alpha=banks["down_alpha"])
+        return tables, {}, (H, I)
+
     def _resolve_fp8_block_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """Block-FP8 schema: row-major e4m3 + one bf16 scale per 128x128 block; the scale banks pad their last dim, so C++ gets the real row stride."""
         gu, gus = banks["gate_up"], banks["gate_up_scale"]
@@ -447,6 +476,9 @@ class CpuMoeExecutor:
 
         if fmt == "fp8_block":
             return self._resolve_fp8_block_banks(banks, rep)
+
+        if fmt == "nvfp4_b12x":
+            return self._resolve_b12x_banks(banks, rep)
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp32 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]

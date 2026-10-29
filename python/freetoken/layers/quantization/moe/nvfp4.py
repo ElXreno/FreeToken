@@ -545,6 +545,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
     """flashinfer's SM12x CuTe-DSL W4A16 MoE; the packed blocks reuse the native bank bytes."""
 
     name = "b12x"
+    cpu_format = "nvfp4_b12x"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if backend.is_rocm():
@@ -554,7 +555,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
         if not backend.is_flashinfer_installed():
             return "flashinfer is not installed"
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=True)
         if reason:
             return reason
         return _b12x_unusable_reason(cc)
