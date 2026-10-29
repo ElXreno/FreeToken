@@ -84,6 +84,15 @@ class ExpertPrefetch:
         cache = self.cache
         logits = torch.nn.functional.linear(hidden, self.predictors[layer_id]).float()
         score = torch.softmax(logits, dim=-1).sum(0)
+        if self.budget > 0:
+            self._fetch(t, score)
+        if getattr(cache.cpu_executor, "prefetch_hint", None) is not None:
+            from freetoken.moe.cpu_prefetch_hint import write_cpu_prefetch_hint
+
+            write_cpu_prefetch_hint(cache, t, score)
+
+    def _fetch(self, t: int, score: torch.Tensor) -> None:
+        cache = self.cache
         id_of_slot, usage = cache.pool_state(t)
         num_slots = id_of_slot.numel()
         _prefetch_select_kernel[(1,)](
