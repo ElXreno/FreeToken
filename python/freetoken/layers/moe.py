@@ -339,29 +339,70 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
+        gpu_routed = self._hybrid_gpu(cache, hidden_states, gpu_slots, gpu_w)
+        out = gpu_routed + cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending, add_to=gpu_routed)
+        self.hybrid_done()
+        return out
+
+    def _hybrid_gpu(self, cache: OffloadMoeCache, hidden_states: torch.Tensor, gpu_slots: torch.Tensor, gpu_w: torch.Tensor) -> torch.Tensor:
+        """The GPU share of a hybrid decode on the current stream: the miss copy and the GEMMs of the hit and fetched routes."""
+        clamp = not self.skips_inactive_slots
         prefetch = self._prefetch(cache)
         if _HYBRID_SPLIT_GEMM:
-            gpu_routed = self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0 if clamp else -1)
-        else:
-            if prefetch is not None:
-                prefetch.before_demand(self.layer_id)
-            cache.copy_missing()
-            if prefetch is not None:
-                prefetch.after_demand(self.layer_id, hidden_states)
-            gpu_routed = self._expert_gemm(
-                cache,
-                hidden_states,
-                gpu_w,
-                gpu_slots,
-                views=cache.pool_bank_views(self.layer_id),
-                n=None,
-                alphas=cache.alphas_for_slots(self.layer_id, gpu_slots),
-                is_prefill=False,
-            )
-        out = gpu_routed + cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending, add_to=gpu_routed)
+            return self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0 if clamp else -1)
+        if prefetch is not None:
+            prefetch.before_demand(self.layer_id)
+        cache.copy_missing()
+        if prefetch is not None:
+            prefetch.after_demand(self.layer_id, hidden_states)
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            gpu_w,
+            gpu_slots,
+            views=cache.pool_bank_views(self.layer_id),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id, gpu_slots),
+            is_prefill=False,
+        )
+
+    @property
+    def stages_hybrid(self) -> bool:
+        """Whether decode can run as ``hybrid_route``, ``hybrid_gpu`` and the CPU pool's submit and sync, issued apart."""
+        cache = self.offload_cache
+        return (
+            cache is not None
+            and cache.decode_target == "hybrid"
+            and cache.cpu_executor is not None
+            and not cache.is_cpu_layer(self.layer_id)
+            and cache.routing_trace is None
+            and _HYBRID_OVERLAP
+            and self.tp_size == 1
+        )
+
+    def hybrid_route(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Staged hybrid decode, on the current stream: the routing and the capped-fetch ensure, which claims slots
+        for the fetched misses. Returns (weights, GPU slots, GPU weights, CPU ids): the CPU pool's submit reads the
+        weights and the CPU ids, ``hybrid_gpu`` the slots. Another call's GEMM must be done with the slots first."""
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states, gating_output=router_logits, topk=self.top_k, renormalize=self.renormalize,
+        )
+        gpu_slots, gpu_w, cpu_ids = self.offload_cache.ensure_experts_hybrid(
+            self.layer_id, topk_ids, topk_weights, clamp=not self.skips_inactive_slots
+        )
+        return topk_weights, gpu_slots, gpu_w, cpu_ids
+
+    def hybrid_gpu(self, hidden_states: torch.Tensor, routes: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Staged hybrid decode, on the current stream after ``hybrid_route``: the GPU experts' output, which the
+        CPU pool's sync adds its share to."""
+        _, gpu_slots, gpu_w, _ = routes
+        return self._hybrid_gpu(self.offload_cache, hidden_states, gpu_slots, gpu_w)
+
+    def hybrid_done(self) -> None:
+        """After the merged output: the next layer's prefetch, as at the end of ``_decode_hybrid``."""
+        prefetch = self._prefetch(self.offload_cache)
         if prefetch is not None:
             prefetch.after_layer(self.layer_id)
-        return out
 
     @staticmethod
     def _prefetch(cache: OffloadMoeCache):
