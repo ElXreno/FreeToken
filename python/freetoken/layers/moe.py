@@ -286,7 +286,7 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        prefetch = cache.expert_prefetch
+        prefetch = self._prefetch(cache)
         if prefetch is not None:
             prefetch.before_demand(self.layer_id)
         cache.copy_missing()
@@ -339,7 +339,7 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
-        prefetch = cache.expert_prefetch
+        prefetch = self._prefetch(cache)
         if _HYBRID_SPLIT_GEMM:
             gpu_routed = self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0 if clamp else -1)
         else:
@@ -362,6 +362,11 @@ class OffloadMoELayer(MoELayer):
         if prefetch is not None:
             prefetch.after_layer(self.layer_id)
         return out
+
+    @staticmethod
+    def _prefetch(cache: OffloadMoeCache):
+        """The next-layer prefetch, run by a staggered verify's first row only: one row predicts for both."""
+        return cache.expert_prefetch if not get_global_ctx().batch.verify_row else None
 
     def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0):
         """The hit routes' GEMM on a side stream while the misses copy in, then the fetched routes' GEMM.
