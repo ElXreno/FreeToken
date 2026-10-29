@@ -24,6 +24,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+_HYBRID_SPLIT_GEMM = os.getenv("FREETOKEN_HYBRID_SPLIT_GEMM", "0") == "1"
 
 
 class MoELayer(BaseOP):
@@ -337,24 +338,54 @@ class OffloadMoELayer(MoELayer):
         )
 
         prefetch = cache.expert_prefetch
-        cache.copy_missing()
-        if prefetch is not None:
-            prefetch.wait(self.layer_id)
-            prefetch.score(self.layer_id, hidden_states)
-        gpu_routed = self._expert_gemm(
-            cache,
-            hidden_states,
-            gpu_w,
-            gpu_slots,
-            views=cache.pool_bank_views(self.layer_id),
-            n=None,
-            alphas=cache.alphas_for_slots(self.layer_id, gpu_slots),
-            is_prefill=False,
-        )
+        if _HYBRID_SPLIT_GEMM and clamp:
+            gpu_routed = self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch)
+        else:
+            cache.copy_missing()
+            if prefetch is not None:
+                prefetch.wait(self.layer_id)
+                prefetch.score(self.layer_id, hidden_states)
+            gpu_routed = self._expert_gemm(
+                cache,
+                hidden_states,
+                gpu_w,
+                gpu_slots,
+                views=cache.pool_bank_views(self.layer_id),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id, gpu_slots),
+                is_prefill=False,
+            )
         out = gpu_routed + cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending, add_to=gpu_routed)
         if prefetch is not None:
             prefetch.launch(self.layer_id)
         return out
+
+    def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch):
+        """The hit routes' GEMM on a side stream while the misses copy in, then the fetched routes' GEMM.
+
+        One b12x launch at a time (they share a scratch workspace): the side GEMM and the main stream's copy run
+        together, the fetched GEMM waits for both. A route masked out of a launch reads slot 0 at weight 0, like the
+        clamped CPU routes, so a copy landing in slot 0 meanwhile only ever exposes payload bytes."""
+        from freetoken.moe.offload_kernels import split_fetched_routes
+
+        views = cache.pool_bank_views(self.layer_id)
+        alphas = cache.alphas_for_slots(self.layer_id, gpu_slots)
+        hit_slots, hit_w, new_slots, new_w = split_fetched_routes(cache, gpu_slots, gpu_w)
+        x_side = hidden_states.clone()
+        main = torch.cuda.current_stream()
+        side = cache.split_gemm_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            hit_out = self._expert_gemm(cache, x_side, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
+        x_side.record_stream(side)
+        cache.copy_missing()
+        if prefetch is not None:
+            prefetch.wait(self.layer_id)
+            prefetch.score(self.layer_id, hidden_states)
+        main.wait_stream(side)
+        hit_out.record_stream(main)
+        new_out = self._expert_gemm(cache, hidden_states, new_w, new_slots, views=views, n=None, alphas=alphas, is_prefill=False)
+        return hit_out + new_out
 
     def _prefill_routed(
         self,

@@ -517,3 +517,33 @@ def routed_slot_alphas(cache, layer_id: int, slot_ids: torch.Tensor) -> None:
         n, layer_id * cache.num_experts, cache.num_experts,
         BLOCK=triton.next_power_of_2(max(n, 16)),
     )
+
+
+@triton.jit
+def _split_fetched_routes_kernel(
+    slot_ptr, w_ptr, evict_ptr, num_ptr, hit_slot_ptr, hit_w_ptr, new_slot_ptr, new_w_ptr, n, BLOCK: tl.constexpr
+):
+    offs = tl.arange(0, BLOCK)
+    lane = offs < n
+    slot = tl.load(slot_ptr + offs, mask=lane, other=0)
+    w = tl.load(w_ptr + offs, mask=lane, other=0.0)
+    num = tl.load(num_ptr).to(tl.int32)
+    fetched = tl.zeros((BLOCK,), dtype=tl.int1)
+    for j in tl.range(num):
+        fetched = fetched | (slot == tl.load(evict_ptr + j))
+    tl.store(hit_slot_ptr + offs, tl.where(fetched, 0, slot), mask=lane)
+    tl.store(hit_w_ptr + offs, tl.where(fetched, 0.0, w), mask=lane)
+    tl.store(new_slot_ptr + offs, tl.where(fetched, slot, 0), mask=lane)
+    tl.store(new_w_ptr + offs, tl.where(fetched, w, 0.0), mask=lane)
+
+
+def split_fetched_routes(cache, slots: torch.Tensor, weights: torch.Tensor):
+    """(hit slots, hit weights, fetched slots, fetched weights): a route is fetched when its slot is one this step's
+    ensure scheduled for copy (``evict_slots[:num_indices]``); each half keeps the other's routes at slot 0, weight 0."""
+    flat_s, flat_w = slots.reshape(-1).contiguous(), weights.reshape(-1).contiguous()
+    out = [torch.empty_like(flat_s), torch.empty_like(flat_w), torch.empty_like(flat_s), torch.empty_like(flat_w)]
+    n = flat_s.numel()
+    _split_fetched_routes_kernel[(1,)](
+        flat_s, flat_w, cache.evict_slots, cache.num_indices, *out, n, BLOCK=triton.next_power_of_2(max(n, 16))
+    )
+    return tuple(t.view(slots.shape) for t in out)
