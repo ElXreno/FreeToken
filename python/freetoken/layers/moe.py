@@ -284,7 +284,11 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
+        prefetch = cache.expert_prefetch
         cache.copy_missing()
+        if prefetch is not None:
+            prefetch.wait(self.layer_id)
+            prefetch.issue(self.layer_id, hidden_states)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -329,7 +333,11 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
+        prefetch = cache.expert_prefetch
         cache.copy_missing()
+        if prefetch is not None:
+            prefetch.wait(self.layer_id)
+            prefetch.issue(self.layer_id, hidden_states)
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
