@@ -952,6 +952,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hybrid-fetch-fraction",
+        type=float,
+        default=ServerArgs.moe_hybrid_fetch_fraction,
+        help=(
+            "With --moe-hybrid-max-fetch -1: fetch this share of each step's misses over PCIe on "
+            "every MoE layer instead of the benched pcie/cpu bandwidth ratio (-1, default). The "
+            "fetch sits on the GPU's critical path while the CPU share overlaps it, so a share well "
+            "below the ratio can be faster. 0 fetches nothing."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-locked-fetch",
         type=float,
         default=ServerArgs.moe_locked_fetch,
