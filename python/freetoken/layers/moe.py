@@ -2,7 +2,7 @@ import os
 from typing import TYPE_CHECKING, Iterator, Tuple
 
 import torch
-from freetoken.core import get_global_ctx
+from freetoken.core import get_global_ctx, maybe_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
@@ -424,7 +424,8 @@ class OffloadMoELayer(MoELayer):
     @staticmethod
     def _prefetch(cache: OffloadMoeCache):
         """The next-layer prefetch, run by a staggered verify's first row only: one row predicts for both."""
-        return cache.expert_prefetch if not get_global_ctx().batch.verify_row else None
+        batch = getattr(maybe_global_ctx(), "batch", None)
+        return cache.expert_prefetch if not getattr(batch, "verify_row", None) else None
 
     def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0, staged=None, gemm_after=None):
         """The hit routes' GEMM on a side stream while the misses copy in, then the fetched routes' GEMM.
@@ -440,7 +441,7 @@ class OffloadMoELayer(MoELayer):
         main = torch.cuda.current_stream()
         demand = getattr(cache, "demand_copy", None)
         if _HYBRID_SPLIT == "copy" and demand is not None and demand.serves(self.layer_id):
-            lane = get_global_ctx().batch.verify_row or 0
+            lane = getattr(getattr(maybe_global_ctx(), "batch", None), "verify_row", None) or 0
             demand.publish(self.layer_id, lane)
             if staged is not None:
                 staged.record()
