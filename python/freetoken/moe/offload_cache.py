@@ -300,6 +300,8 @@ class OffloadMoeCache:
         self.collect_decode_freq = False
         # opt-in decode routing trace (moe.routing_trace), attached by the engine before graph capture
         self.routing_trace = None
+        # opt-in prefill router-input dump (moe.prefill_dump)
+        self.prefill_dump = None
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
