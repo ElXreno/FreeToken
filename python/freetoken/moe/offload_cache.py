@@ -234,6 +234,7 @@ class OffloadMoeCache:
             device=self.device,
         )
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+        self._alloc_lfu()
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
         # lru_ensure validates these against plan = min(batch * top_k, cache_size), so num_experts elements would under-size them
@@ -398,6 +399,7 @@ class OffloadMoeCache:
 
         self._pool_id_of_slot = [cut(self.id_of_slot, b, s) for b, s in spans]
         self._pool_usage = [cut(self.usage, b, s) for b, s in spans]
+        self._pool_lfu = [(cut(self.lfu_freq, b, s), cut(self.lfu_last, b, s)) for b, s in spans]
         # rows[k][p]: bytes of one slot of pool p in bank k; before the banks exist, one unit per slot with a stage of E
         if self.banks:
             rows = [[self._row_bytes[self._pool_layout(p)][k] for p in range(len(spans))] for k in range(len(self.banks))]
@@ -462,6 +464,14 @@ class OffloadMoeCache:
         """``(id_of_slot, usage)`` views of the pool that serves ``layer_id``."""
         p = self.pool_of_layer[layer_id]
         return self._pool_id_of_slot[p], self._pool_usage[p]
+
+    def pool_lfu(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(freq, last)`` views of the pool that serves ``layer_id``: each slot's decayed hit count and its step."""
+        return self._pool_lfu[self.pool_of_layer[layer_id]]
+
+    def _alloc_lfu(self) -> None:
+        self.lfu_freq = torch.zeros(self.usage.shape, dtype=torch.float32, device=self.device)
+        self.lfu_last = torch.zeros_like(self.usage)
 
     def pool_slots(self, layer_id: int) -> int:
         return self.pool_sizes[self.pool_of_layer[layer_id]]
@@ -796,6 +806,7 @@ class OffloadMoeCache:
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
+        self._alloc_lfu()
         self._slice_pools()
         self._alloc_slot_alphas()
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
@@ -1293,6 +1304,8 @@ class OffloadMoeCache:
             self.routing_trace.marker(RESET)
         self._drain_copies()
         reset_cache(self)
+        self.lfu_freq.zero_()
+        self.lfu_last.zero_()
         if self.lend_segments:
             self.usage[self.lend_base :] = UNAVAILABLE
             for lo, _, live in self.lend_segments:
