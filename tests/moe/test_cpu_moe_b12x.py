@@ -95,3 +95,83 @@ def test_cpu_b12x_matches_the_dense_weights_it_packs(monkeypatch, bs, path):
     ref = _reference(dense, layer, x, ids, w, I)
     rel = ((got - ref).abs().max() / ref.abs().max()).item()
     assert rel < (5e-3 if path == "scalar" else 3e-2), f"{ex.isa} bs={bs} rel err {rel}"
+
+
+def test_cpu_b12x_simd_activation_quant_is_the_scalar_one_bitwise():
+    """The AVX2 activation quant writes the scalar quant's bytes and scales: ties round away from zero, and zero,
+    denormal, NaN and infinite inputs land where the scalar one puts them."""
+    from freetoken.kernel import _cpu_moe
+
+    torch.manual_seed(7)
+    K = 3072
+    x = torch.randn(K) * torch.logspace(-3, 3, K)[torch.randperm(K)]
+    # a block whose largest value is 127 quantizes with scale 1, so each k + 0.5 is a tie
+    halves = torch.arange(-127, 127).float() + 0.5
+    halves = halves[: len(halves) // 15 * 15].view(-1, 15)
+    tie = torch.cat([torch.full((halves.shape[0], 1), 127.0), halves], 1).flatten()
+    special = torch.tensor([0.0] * 16 + [-0.0] * 16 + [1e-39, -1e-39] * 8 + [float("nan")] + [1.0] * 15
+                           + [float("inf")] + [2.0] * 15 + [float("-inf"), float("nan")] * 8)
+    xs = torch.cat([x, tie, special]).to(torch.bfloat16)
+    ref = _cpu_moe.b12x_quant_act(xs, False)
+    got = _cpu_moe.b12x_quant_act(xs, True)
+    assert torch.equal(got[0], ref[0])
+    assert torch.equal(got[1].view(torch.int32), ref[1].view(torch.int32))
+    order = [i for j in range(4) for i in (2 * j, 2 * j + 1, 2 * j + 8, 2 * j + 9)]
+    blocks = ref[0].view(torch.int8).view(-1, 16)
+    q = torch.empty_like(blocks)
+    q[:, order] = blocks
+    first = K // 16
+    q_tie = q[first:first + halves.shape[0]].double()
+    v = tie.view(-1, 16).double()
+    assert torch.equal(q_tie, torch.sign(v) * torch.floor(v.abs() + 0.5))
+    assert not torch.equal(q_tie, torch.round(v))
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"FLOW": "1", "FLOW_P2": "2"},
+        {"FLOW": "2", "FLOW_P2": "3", "SPLIT_PREP": "1"},
+        {"STATIC": "1", "SPLIT_PREP": "1"},
+    ],
+)
+def test_cpu_b12x_work_splits_write_the_barrier_passes_bytes(monkeypatch, env):
+    """The flow queue (gate_up and down items without barriers), the input prep on the workers and the static split
+    write the default passes' bytes, a token without routes included."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    fp = _prepare_module(monkeypatch)
+    L, E, H, I, top_k, bs = 2, 6, 512, 256, 3, 3
+    cache, _ = _b12x_cache(fp, L, E, H, I, seed=11)
+
+    def make():
+        return CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=3,
+                              max_tokens=bs, device=torch.device("cpu"))
+
+    base = make()
+    for k, v in env.items():
+        monkeypatch.setenv(f"FREETOKEN_CPU_MOE_{k}", v)
+    split = make()
+    x = torch.randn(bs, H, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, -1, 4], [4, 2, -1], [-1, -1, -1]], dtype=torch.int32)
+    w = torch.rand(bs, top_k)
+    outs = []
+    for ex in (base, split):
+        ex._io["x"][:bs].copy_(x)
+        ex._io["ids"][:bs].copy_(ids)
+        ex._io["w"][:bs].copy_(w)
+        ex._io["y"].fill_(1.0)
+        ex._ext.profile_start(1)
+        ex._ext.run(1, bs)
+        outs.append((ex._io["y"][:bs].clone(), ex._ext.profile_take()))
+    assert torch.equal(outs[0][0].view(torch.int16), outs[1][0].view(torch.int16))
+    assert not outs[1][0][2].any()
+    task, nids, thread, n = split._ext.profile_layout()
+    per = outs[1][1][0, len(task) + nids:].view(n, len(thread))
+    th = {name: per[:, i] for i, name in enumerate(thread)}
+    if "FLOW" in env:
+        assert (th["pass1_end"] == th["barrier2"]).all()
+        assert int(th["pass1_items"].sum()) == 4 * (I // 64 // int(env["FLOW"]))
+        assert int(th["pass2_items"].sum()) == 4 * -(-(H // 64) // int(env["FLOW_P2"]))
+    if "STATIC" in env:
+        assert th["pass1_items"].tolist() == [4 * len(range(t, I // 64, n)) for t in range(n)]

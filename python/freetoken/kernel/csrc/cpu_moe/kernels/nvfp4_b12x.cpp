@@ -1,3 +1,4 @@
+#include <cfloat>
 #include <vector>
 
 #include "../format.h"
@@ -51,6 +52,8 @@ void tile_dot_scalar(const uint8_t* w, const uint8_t* s, int N, int K, int nt, c
   std::memcpy(out, acc, sizeof(acc));
 }
 
+}  // namespace
+
 // int32 j of block b holds q[2j], q[2j+1], q[2j+8], q[2j+9]
 void quant_act_b12x(const bf16_t* x, int K, int32_t* a4, float* asb) {
   for (int b = 0; b < K / 16; ++b) {
@@ -76,6 +79,51 @@ void quant_act_b12x(const bf16_t* x, int K, int32_t* a4, float* asb) {
 }
 
 #if CPU_MOE_X86
+// bitwise quant_act_b12x: lround's ties away from zero, 0 where it is undefined
+CPU_MOE_TARGET("avx2,fma")
+void quant_act_b12x_avx2(const bf16_t* x, int K, int32_t* a4, float* asb) {
+  const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+  const __m256 half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f), fmax = _mm256_set1_ps(FLT_MAX);
+  const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
+  for (int b = 0; b < K / 16; ++b) {
+    __m256 v[2];
+    __m256 amax = _mm256_setzero_ps();
+    for (int h = 0; h < 2; ++h) {
+      const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + (size_t)b * 16 + 8 * h));
+      v[h] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+      amax = _mm256_max_ps(_mm256_and_ps(v[h], abs_mask), amax);
+    }
+    alignas(32) float m[8];
+    _mm256_store_ps(m, amax);
+    float am = 0.0f;
+    for (const float e : m) am = std::max(am, e);
+    const float s = am > 0.0f ? am / 127.0f : 1.0f;
+    asb[b] = s;
+    const __m256 inv = _mm256_set1_ps(1.0f / s);
+    alignas(32) int32_t q[16];
+    for (int h = 0; h < 2; ++h) {
+      const __m256 y = _mm256_mul_ps(v[h], inv);
+      const __m256 t = _mm256_round_ps(y, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+      const __m256 frac = _mm256_and_ps(_mm256_sub_ps(y, t), abs_mask);
+      const __m256 step = _mm256_and_ps(_mm256_cmp_ps(frac, half, _CMP_GE_OQ), _mm256_or_ps(one, _mm256_andnot_ps(abs_mask, y)));
+      __m256i r = _mm256_cvttps_epi32(_mm256_add_ps(t, step));
+      r = _mm256_and_si256(r, _mm256_castps_si256(_mm256_cmp_ps(_mm256_and_ps(y, abs_mask), fmax, _CMP_LE_OQ)));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(q + 8 * h), _mm256_max_epi32(lo, _mm256_min_epi32(hi, r)));
+    }
+    int8_t* out = reinterpret_cast<int8_t*>(a4 + (size_t)b * 4);
+    for (int j = 0; j < 4; ++j) {
+      out[4 * j + 0] = static_cast<int8_t>(q[2 * j]);
+      out[4 * j + 1] = static_cast<int8_t>(q[2 * j + 1]);
+      out[4 * j + 2] = static_cast<int8_t>(q[2 * j + 8]);
+      out[4 * j + 3] = static_cast<int8_t>(q[2 * j + 9]);
+    }
+  }
+}
+#endif
+
+namespace {
+
+#if CPU_MOE_X86
 inline bool cpu_has_avxvnniint8() {
   const char* no = getenv("FREETOKEN_CPU_MOE_NO_VNNI_INT8");
   if (no && no[0] && no[0] != '0') return false;
@@ -88,6 +136,53 @@ int b12x_pf_tiles() {
     return (s && s[0]) ? atoi(s) : 2;
   }();
   return v;
+}
+
+// 0 t0, 1 t1, 2 t2, 3 nta
+int b12x_pf_hint() {
+  static const int v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_HINT");
+    if (s == nullptr) return 0;
+    if (!std::strcmp(s, "t1")) return 1;
+    if (!std::strcmp(s, "t2")) return 2;
+    if (!std::strcmp(s, "nta")) return 3;
+    return 0;
+  }();
+  return v;
+}
+
+bool b12x_pf_scales() {
+  static const bool v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_SCALES");
+    return s && s[0] && s[0] != '0';
+  }();
+  return v;
+}
+
+bool b12x_pf_prologue() {
+  static const bool v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_PROLOGUE");
+    return s && s[0] && s[0] != '0';
+  }();
+  return v;
+}
+
+// k-tiles ahead for a second, t2 prefetch; 0 none
+int b12x_pf_far() {
+  static const int v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_B12X_PF_FAR");
+    return (s && s[0]) ? atoi(s) : 0;
+  }();
+  return v;
+}
+
+inline void prefetch_line(const char* p, int hint) {
+  switch (hint) {
+    case 1: _mm_prefetch(p, _MM_HINT_T1); break;
+    case 2: _mm_prefetch(p, _MM_HINT_T2); break;
+    case 3: _mm_prefetch(p, _MM_HINT_NTA); break;
+    default: _mm_prefetch(p, _MM_HINT_T0);
+  }
 }
 
 struct TileStream {
@@ -112,14 +207,21 @@ void tiles_dot_vnni(const TileStream* st, int n, int N, int K, float* out) {
   for (int i = 0; i < n; ++i)
     for (auto& a : acc[i]) a = _mm256_setzero_ps();
   const size_t stride = (size_t)N * 8;
-  const int nkt = K / 16, pf = b12x_pf_tiles();
+  const int nkt = K / 16, pf = b12x_pf_tiles(), hint = b12x_pf_hint(), far = b12x_pf_far();
+  const bool pf_scales = b12x_pf_scales();
+  const auto fetch = [&](int i, int kt, int h) {
+    const char* t = reinterpret_cast<const char*>(st[i].w + (size_t)kt * stride);
+    for (int l = 0; l < kTileBytes; l += 64) prefetch_line(t + l, h);
+    if (pf_scales) prefetch_line(reinterpret_cast<const char*>(st[i].s + (size_t)kt * N), h);
+  };
+  if (b12x_pf_prologue())
+    for (int kt = 0; kt < std::min(pf, nkt); ++kt)
+      for (int i = 0; i < n; ++i) fetch(i, kt, hint);
   for (int kt = 0; kt < nkt; ++kt) {
-    if (pf > 0 && kt + pf < nkt) {
-      for (int i = 0; i < n; ++i) {
-        const char* t = reinterpret_cast<const char*>(st[i].w + (size_t)(kt + pf) * stride);
-        for (int l = 0; l < kTileBytes; l += 64) _mm_prefetch(t + l, _MM_HINT_T0);
-      }
-    }
+    if (far > 0 && kt + far < nkt)
+      for (int i = 0; i < n; ++i) fetch(i, kt + far, 2);
+    if (pf > 0 && kt + pf < nkt)
+      for (int i = 0; i < n; ++i) fetch(i, kt + pf, hint);
     for (int i = 0; i < n; ++i) {
       const uint8_t* tile = st[i].w + kt * stride;
       const int32_t* a4 = st[i].a4 + (size_t)kt * 4;
@@ -174,6 +276,8 @@ class Nvfp4B12xFormat final : public MoeFormat {
 #if CPU_MOE_X86
     if (cpu_has_avxvnniint8()) path_ = Path::VnniInt8;
     else if (cpu_has_avxvnni() && __builtin_cpu_supports("f16c")) path_ = Path::Vnni;
+    const char* sq = getenv("FREETOKEN_CPU_MOE_SCALAR_QUANT");
+    simd_quant_ = path_ != Path::Scalar && !(sq && sq[0] && sq[0] != '0');
 #endif
     const size_t tokens = p.max_tokens, routes = (size_t)p.max_tokens * p.top_k;
     if (path_ == Path::Scalar) {
@@ -217,8 +321,15 @@ class Nvfp4B12xFormat final : public MoeFormat {
     if (path_ == Path::Scalar) {
       for (int i = 0; i < p.H; ++i) xf_[(size_t)tok * p.H + i] = bf16_to_f32(x[i]);
     } else {
-      quant_act_b12x(x, p.H, xa_.data() + (size_t)tok * (p.H / 4), xs_.data() + (size_t)tok * (p.H / 16));
+      quant(x, p.H, xa_.data() + (size_t)tok * (p.H / 4), xs_.data() + (size_t)tok * (p.H / 16));
     }
+  }
+
+  int prep_input_blocks() const override { return path_ == Path::Scalar ? 0 : p.H / 16; }
+
+  void prep_input_range(int tok, const bf16_t* x, int b0, int b1) override {
+    quant(x + (size_t)b0 * 16, (b1 - b0) * 16, xa_.data() + (size_t)tok * (p.H / 4) + (size_t)b0 * 4,
+          xs_.data() + (size_t)tok * (p.H / 16) + b0);
   }
 
   bool preps_inter() const override { return true; }
@@ -227,8 +338,15 @@ class Nvfp4B12xFormat final : public MoeFormat {
     if (path_ == Path::Scalar) {
       for (int i = 0; i < p.I; ++i) gf_[(size_t)r * p.I + i] = bf16_to_f32(g[i]);
     } else {
-      quant_act_b12x(g, p.I, ga_.data() + (size_t)r * (p.I / 4), gs_.data() + (size_t)r * (p.I / 16));
+      quant(g, p.I, ga_.data() + (size_t)r * (p.I / 4), gs_.data() + (size_t)r * (p.I / 16));
     }
+  }
+
+  void quant(const bf16_t* x, int K, int32_t* a4, float* asb) const {
+#if CPU_MOE_X86
+    if (simd_quant_) return quant_act_b12x_avx2(x, K, a4, asb);
+#endif
+    quant_act_b12x(x, K, a4, asb);
   }
 
   void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* /*x*/, float w_in,
@@ -296,6 +414,48 @@ class Nvfp4B12xFormat final : public MoeFormat {
     }
   }
 
+  bool has_tiles() const override { return path_ != Path::Scalar; }
+
+  void gate_up_tiles(int layer, int e, int tok, int i0, int n, float w_in, bf16_t* g) const override {
+#if CPU_MOE_X86
+    const int H = p.H, I = p.I, N = 2 * I;
+    const uint8_t* w = static_cast<const uint8_t*>(tbl_at(gate_up_, layer)) + (size_t)e * N * (H / 2);
+    const uint8_t* s = static_cast<const uint8_t*>(tbl_at(gu_scale_, layer)) + (size_t)e * N * (H / 16);
+    const float k = 0x1p-127f * static_cast<const float*>(tbl_at(gu_alpha_, layer))[e];
+    const Act a = act_x(tok);
+    TileStream st[kMaxStreams];
+    for (int t = 0; t < n; ++t) {
+      const int gate_nt = i0 / kTileN + t, up_nt = (I + i0) / kTileN + t;
+      st[t] = {w + (size_t)gate_nt * kTileBytes, s + (size_t)gate_nt * kTileN, a.a4, a.asb};
+      st[n + t] = {w + (size_t)up_nt * kTileBytes, s + (size_t)up_nt * kTileN, a.a4, a.asb};
+    }
+    float v[kMaxStreams * kTileN];
+    if (path_ == Path::VnniInt8) tiles_dot_vnni<true>(st, 2 * n, N, H, v);
+    else tiles_dot_vnni<false>(st, 2 * n, N, H, v);
+    const int span = n * kTileN;
+    gated_rows(p, i0, i0 + span, w_in, g, [&](int row) { return (row < I ? v[row - i0] : v[span + row - I - i0]) * k; });
+#endif
+  }
+
+  void down_tiles(int layer, int h0, int n, const DownRoute& route, float* out) const override {
+#if CPU_MOE_X86
+    const int H = p.H, I = p.I;
+    const uint8_t* w = static_cast<const uint8_t*>(tbl_at(down_, layer)) + (size_t)route.e * H * (I / 2);
+    const uint8_t* s = static_cast<const uint8_t*>(tbl_at(dn_scale_, layer)) + (size_t)route.e * H * (I / 16);
+    const float ki = 0x1p-127f * static_cast<const float*>(tbl_at(dn_alpha_, layer))[route.e];
+    const Act a = act_g(route.r);
+    TileStream st[kMaxStreams];
+    for (int t = 0; t < n; ++t) {
+      const int nt = h0 / kTileN + t;
+      st[t] = {w + (size_t)nt * kTileBytes, s + (size_t)nt * kTileN, a.a4, a.asb};
+    }
+    float v[kMaxStreams * kTileN];
+    if (path_ == Path::VnniInt8) tiles_dot_vnni<true>(st, n, H, I, v);
+    else tiles_dot_vnni<false>(st, n, H, I, v);
+    for (int i = 0; i < n * kTileN; ++i) out[i] = v[i] * ki;
+#endif
+  }
+
  private:
   struct Act {
     const float* f;
@@ -314,6 +474,7 @@ class Nvfp4B12xFormat final : public MoeFormat {
   }
 
   Path path_ = Path::Scalar;
+  bool simd_quant_ = false;
   const uint64_t* gate_up_ = nullptr;
   const uint64_t* gu_scale_ = nullptr;
   const uint64_t* gu_alpha_ = nullptr;
