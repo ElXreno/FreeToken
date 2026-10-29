@@ -613,6 +613,44 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+def test_cpu_moe_slots_take_a_task_while_the_other_runs():
+    """A task on slot 1 is submitted from its own stream while slot 0's is in flight; both read and write their own IO
+    rows, and the pool runs them one after the other."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(3)
+    L, E, H, I, top_k, bs = 3, 8, 512, 256, 2, 1
+    cache = _make_cache(L, E, H, I)
+    dev = torch.device("cuda")
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=8,
+                        max_tokens=bs, device=dev)
+    if not ex._flag_sync:
+        pytest.skip("handshake slots need the flag handshake")
+    assert ex.slots == 2
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    inputs = [
+        (torch.randn(bs, H, device=dev, dtype=torch.bfloat16), torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32),
+         torch.rand(bs, top_k, device=dev, dtype=torch.float32))
+        for _ in streams
+    ]
+    served = ex._ext.flag_served()
+    outs = []
+    for slot, (stream, (hidden, ids, w)) in enumerate(zip(streams, inputs, strict=True)):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            pending = ex.decode_submit(slot + 1, hidden, w, ids, slot=slot)
+            if slot == 0:
+                torch.cuda._sleep(2_000_000)
+            outs.append(ex.decode_sync(pending))
+    torch.cuda.synchronize()
+    for slot, (hidden, ids, w) in enumerate(inputs):
+        ref = _reference(cache, slot + 1, hidden.cpu(), ids.cpu(), w.cpu())
+        rel = (outs[slot].float().cpu() - ref).abs().max() / ref.abs().max()
+        assert rel < 2e-2, f"slot {slot} rel err {rel}"
+    assert ex._ext.flag_served() == served + 2
+    assert not ex._ext.flag_pending()
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
