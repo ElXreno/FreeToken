@@ -103,3 +103,30 @@ def test_the_coordinator_prefetches_between_layers_without_changing_outputs(monk
     assert tasks > 0 and nbytes > 0 and aborted <= tasks
     assert not pf._ext.flag_pending()
     pf.raise_if_unhealthy()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_gpu_hint_names_the_best_cold_experts_and_follows_the_graph():
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.moe.cpu_prefetch_hint import write_cpu_prefetch_hint
+
+    width = 34
+    hint = alloc_pinned_tensor(L, width, dtype=torch.int32)
+    hint.fill_(-1)
+    slot_for_id = torch.full((L, E), -1, dtype=torch.int32, device="cuda")
+    slot_for_id[1, 5] = 0
+    cache = SimpleNamespace(num_layers=L, num_experts=E, slot_for_id=slot_for_id,
+                            step=torch.tensor([41], dtype=torch.int64, device="cuda"),
+                            cpu_executor=SimpleNamespace(prefetch_hint=hint))
+    score = torch.arange(E, dtype=torch.float32, device="cuda")
+    write_cpu_prefetch_hint(cache, 1, score, max_n=3)
+    torch.cuda.synchronize()
+    assert hint[1, :5].tolist() == [41, 3, 4, 3, 2]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        write_cpu_prefetch_hint(cache, 1, score, max_n=3)
+    score.copy_(-score)
+    cache.step.fill_(42)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert hint[1, :5].tolist() == [42, 3, 0, 1, 2]
