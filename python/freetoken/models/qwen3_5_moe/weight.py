@@ -358,7 +358,10 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
         if not config.num_mtp_moe_layers:
             return None
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+        from freetoken.models.weight import experts_scattered
 
+        if parallel is None:
+            parallel = experts_scattered(model_path)
         model_layers = None if layers is None else [i for i in layers if i != config.mtp_bank_layer]
         parts = [
             iter_nvfp4_expert_pieces(
