@@ -1014,7 +1014,8 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
-        if budget := prefetch_budget():
+        budget = prefetch_budget()
+        if budget or getattr(cache.cpu_executor, "prefetch_hint", None) is not None:
             self._attach_expert_prefetch(config, cache, budget)
         self.moe_offload_cache = cache
         return cache
