@@ -121,3 +121,22 @@ def test_routers_are_found_through_the_model_layer_list():
     routers = next_layer_routers(model)
     assert sorted(routers) == [0, 1, 2]
     assert all(w.shape == (E, D) for w in routers.values())
+
+
+@cuda
+def test_early_mode_installs_low_priority_slots_and_waits_before_the_demand_copy(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_EXPERT_PREFETCH_MODE", "early")
+    cache, pf = _setup()
+    assert pf.early
+    cache.ensure_experts(2, torch.tensor([5], dtype=torch.int32, device="cuda"))
+    cache.copy_missing()
+    pf.after_demand(0, torch.ones(1, D, dtype=torch.bfloat16, device="cuda"))
+    assert pf.pending[1]
+    pf.before_demand(1)
+    assert not pf.pending[1]
+    torch.cuda.synchronize()
+    id_of_slot, usage = cache.pool_state(1)
+    for e in (13, 14, 15):
+        s = _resident(cache, 1, e)
+        assert _rows_match(cache, 1, e), e
+        assert int(usage[s]) == 0, (e, int(usage[s]))
