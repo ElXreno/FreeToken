@@ -1331,3 +1331,24 @@ def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch)
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert not _host_ram_fits_parallel(str(tmp_path))
+
+
+def test_a_streamed_build_needs_ram_only_for_the_shards_in_flight(tmp_path, monkeypatch):
+    """The converter releases each layer as it lands: RAM below the checkpoint size still fits its in-flight shards."""
+    import builtins
+    import io
+
+    from freetoken.moe.expert_banks import _host_ram_fits_parallel
+
+    for i in range(1, 11):
+        (tmp_path / f"model-{i:05d}-of-00010.safetensors").write_bytes(b"x" * (1 << 20))
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if str(file) == "/proc/meminfo":
+            return io.StringIO(f"MemAvailable:           {5 << 10} kB\n")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert not _host_ram_fits_parallel(str(tmp_path))
+    assert _host_ram_fits_parallel(str(tmp_path), streamed=True)
