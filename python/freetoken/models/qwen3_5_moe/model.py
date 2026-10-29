@@ -142,6 +142,11 @@ class Qwen3_5DecoderLayer(BaseOP):
         hidden = self.mlp.routed(hidden, dense)
         return self._writer_cut.cut_(hidden) if self._writer_cut is not None else hidden
 
+    def merge(self, routed: torch.Tensor, dense) -> torch.Tensor:
+        """``routed`` from the routed experts' output, for a caller that ran the experts itself."""
+        hidden = self.mlp.merge(routed, dense)
+        return self._writer_cut.cut_(hidden) if self._writer_cut is not None else hidden
+
 
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):

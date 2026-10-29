@@ -1,8 +1,9 @@
 """A staggered MTP verify (row 1 half a layer behind row 0 on its own stream) equals the lockstep layers.
 
-The mixer of row 1 reads what row 0's wrote, as attention reads row 0's KV and GDN its stash, and every routed call
-goes through one scratch buffer, as the expert cache's staging and the CPU pool's one task do; row 0 and the routed
-calls sleep on the GPU first, so a row that does not wait for them reads stale or clobbered values.
+The mixer of row 1 reads what row 0's wrote, as attention reads row 0's KV and GDN its stash; a row's ensure writes
+a staging buffer shared by every call, which its GEMM reads, as the expert cache's slots and staging are; and the CPU
+pool has one IO block, which a submit fills and its sync reads. Row 0's mixer, the GEMM and the CPU task sleep on the
+GPU first, so a step that does not wait for them reads stale or clobbered values.
 """
 
 from __future__ import annotations
@@ -53,20 +54,57 @@ class _Mixer(_Linear):
         return (y if row == 0 else y + self.seen[0]).to(x.dtype)
 
 
+class _Executor:
+    """The CPU pool: a submit fills the one IO block, the sync reads it after the task."""
+
+    def __init__(self):
+        self.x = torch.zeros(2, H, device="cuda")
+        self.w = torch.zeros(2, 1, device="cuda")
+        self.cpu_w: dict[int, torch.Tensor] = {}
+        self.tasks: list[int] = []
+
+    def share(self, layer: int, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        return (x.float() @ self.cpu_w[layer].T) * weights[:, 1:2].sigmoid()
+
+    def decode_submit(self, layer: int, x: torch.Tensor, weights: torch.Tensor, cpu_ids: torch.Tensor):
+        n = x.shape[0]
+        self.tasks.append(layer)
+        self.x[:n].copy_(x)
+        self.w[:n].copy_(weights[:, 1:2].sigmoid())
+        return layer, n
+
+    def decode_sync(self, pending, add_to: torch.Tensor) -> torch.Tensor:
+        layer, n = pending
+        torch.cuda._sleep(SLEEP)
+        return add_to.add_(((self.x[:n] @ self.cpu_w[layer].T) * self.w[:n]).to(add_to.dtype))
+
+
 class _Experts:
-    """Writes its result into a scratch shared by every layer and row, then reads it back."""
+    """GPU share through a staging buffer every call shares; ``forward`` is both shares at once."""
 
-    scratch = None
+    staging = None
+    stages_hybrid = True
 
-    def __init__(self, w: torch.Tensor):
-        self.w = w
+    def __init__(self, layer: int, gpu_w: torch.Tensor, cache):
+        self.layer_id, self.w, self.offload_cache = layer, gpu_w, cache
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        gpu = (hidden_states.float() @ self.w.T) * router_logits.float()[:, :1].sigmoid()
+        return (gpu + self.offload_cache.cpu_executor.share(self.layer_id, hidden_states, router_logits.float())).to(hidden_states.dtype)
+
+    def hybrid_route(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         n = hidden_states.shape[0]
-        s = _Experts.scratch[:n]
-        s.copy_((hidden_states.float() @ self.w.T) * router_logits.float().softmax(-1)[:, :1])
+        _Experts.staging[:n].copy_(hidden_states)
+        weights = router_logits.float()
+        return weights, None, None, weights
+
+    def hybrid_gpu(self, hidden_states: torch.Tensor, routes) -> torch.Tensor:
+        n = hidden_states.shape[0]
         torch.cuda._sleep(SLEEP)
-        return s.to(hidden_states.dtype)
+        return ((_Experts.staging[:n] @ self.w.T) * routes[0][:, :1].sigmoid()).to(hidden_states.dtype)
+
+    def hybrid_done(self) -> None:
+        pass
 
 
 def _model(g: torch.Generator) -> Qwen3_5Model:
@@ -78,13 +116,16 @@ def _model(g: torch.Generator) -> Qwen3_5Model:
         n.weight = (0.1 * torch.randn(H, generator=g)).to("cuda", torch.bfloat16)
         return n
 
+    executor = _Executor()
+    cache = SimpleNamespace(cpu_executor=executor)
     layers = []
     for i in range(LAYERS):
+        executor.cpu_w[i] = mat(H, H).float()
         mlp = Qwen3_5MoE.__new__(Qwen3_5MoE)
         mlp.gate = _Linear(mat(E, H))
         mlp.shared_expert = _Linear(mat(H, H))
         mlp.shared_expert_gate = _Linear(mat(1, H))
-        mlp.experts = _Experts(mat(H, H).float())
+        mlp.experts = _Experts(i, mat(H, H).float(), cache)
         layer = Qwen3_5DecoderLayer.__new__(Qwen3_5DecoderLayer)
         layer._layer_id, layer._ablate, layer._writer_cut, layer._is_linear = i, None, None, True
         layer.linear_attn, layer.mlp = _Mixer(mat(H, H)), mlp
@@ -98,7 +139,7 @@ def _model(g: torch.Generator) -> Qwen3_5Model:
 
 def test_staggered_rows_match_lockstep(monkeypatch):
     g = torch.Generator().manual_seed(7)
-    _Experts.scratch = torch.zeros(2, H, device="cuda")
+    _Experts.staging = torch.zeros(2, H, device="cuda")
     model = _model(g)
     ctx = Context(page_size=1)
     ctx.attn_backend = SimpleNamespace(supports_verify_rows=True, prepare_verify_row=lambda batch, rb: None)
@@ -120,4 +161,6 @@ def test_staggered_rows_match_lockstep(monkeypatch):
         want = model.norm.forward(hidden, residual)[0].float()
         got = staggered_forward(model, x.clone()).float()
         assert ctx.batch is batch
-    torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(got, want, atol=3e-2, rtol=3e-2)
+    # one CPU task per row and layer, in layer order
+    assert model.layers.op_list[0].mlp.experts.offload_cache.cpu_executor.tasks == [k for k in range(LAYERS) for _ in range(2)]

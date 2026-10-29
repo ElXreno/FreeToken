@@ -1,15 +1,18 @@
 """Staggered MTP verify (``FREETOKEN_STAGGER=1``): the two rows of a one-request verify on two streams, row 1 half a
-layer behind row 0, so one row's dense part (norms, mixer, router, shared expert; VRAM bound) runs while the other
-row's routed experts wait on host memory and PCIe.
+layer behind row 0, so the CPU pool, which bounds a hybrid MoE layer, works on one row's experts while the GPU runs
+the other row's dense part (norms, mixer, router, shared expert) and its own routing, miss copy and GEMMs.
 
-Per layer k, ``D`` the dense part and ``M`` the routed experts::
+Per layer k and row r: ``D`` the dense part, ``R`` the routing and capped-fetch ensure, ``G`` the miss copy and the
+GPU experts' GEMMs, ``C`` the CPU pool's task (submit, wait, combine), ``A`` the merge with the shared expert::
 
-    D0_k ; [M0_k || D1_k] ; [M1_k || D0_k+1] ; ...
+    row r stream:  D_r,k  R_r,k  G_r,k ............ A_r,k  D_r,k+1 ...
+    CPU stream:                 C_0,k  C_1,k  C_0,k+1  C_1,k+1 ...
 
-Each row is computed as a one-row verify against the same KV and GDN state: row 1's dense part waits for row 0's,
-which wrote the KV row and the GDN stash it reads. The routed parts run one at a time, M0_k, M1_k, M0_k+1: the
-expert cache's staging, the CPU pool's one task in flight and the slots a GEMM reads belong to one call at a time.
-Whatever moves the misses (``copy_missing``) runs inside M unchanged.
+The CPU tasks run back to back in that order, one in flight (the pool has one IO block): C_1,k is submitted once
+C_0,k has combined. A row's ensure waits for the other row's last GEMM, which may read slots it evicts, and so the
+cache's staging serves one call at a time. Row 1's dense part waits for row 0's, which wrote the KV row and the GDN
+stash it reads. Each row is a one-row verify against the same KV and GDN state. Whatever moves the misses
+(``copy_missing``) runs inside G unchanged.
 """
 
 from __future__ import annotations
@@ -26,13 +29,13 @@ if TYPE_CHECKING:
     from .model import Qwen3_5Model
 
 ROWS = 2
-_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
+_STREAMS: dict[tuple[torch.device, str], torch.cuda.Stream] = {}
 
 
-def _row_stream(device: torch.device) -> torch.cuda.Stream:
-    stream = _STREAMS.get(device)
+def _stream(device: torch.device, name: str, priority: int = 0) -> torch.cuda.Stream:
+    stream = _STREAMS.get((device, name))
     if stream is None:
-        stream = _STREAMS[device] = torch.cuda.Stream(device=device)
+        stream = _STREAMS[(device, name)] = torch.cuda.Stream(device=device, priority=priority)
     return stream
 
 
@@ -46,7 +49,7 @@ def can_stagger(batch: Batch, layers) -> bool:
         and len(batch.padded_reqs) == 1
         and batch.mm_embeds is None
         and ctx.attn_backend.supports_verify_rows
-        and all(layer.splits_at_experts for layer in layers)
+        and all(layer.splits_at_experts and layer.mlp.experts.stages_hybrid for layer in layers)
     )
 
 
@@ -71,34 +74,52 @@ def staggered_forward(model: Qwen3_5Model, x: torch.Tensor) -> torch.Tensor:
     """``model``'s layers and final norm over the embedded rows ``x`` [2, hidden], staggered; returns [2, hidden]."""
     ctx = get_global_ctx()
     batch = ctx.batch
+    layers = model.layers.op_list
+    executor = layers[0].mlp.experts.offload_cache.cpu_executor
     rows = [row_batch(batch, r) for r in range(ROWS)]
-    main = torch.cuda.current_stream()
-    side = _row_stream(x.device)
+    streams = (torch.cuda.current_stream(), _stream(x.device, "row"))
+    host = _stream(x.device, "cpu", priority=-2)
     hidden = [x[r : r + 1] for r in range(ROWS)]
     residual: list[torch.Tensor | None] = [None] * ROWS
-    dense0, routed0, routed1 = torch.cuda.Event(), torch.cuda.Event(), torch.cuda.Event()
-    side.wait_stream(main)
-    first = True
+    dense0 = torch.cuda.Event()
+    routed, gemm, done = ([torch.cuda.Event() for _ in range(ROWS)] for _ in range(3))
+    # tensors one stream allocates and another reads stay referenced until the join
+    keep = []
+    for s in (streams[1], host):
+        s.wait_stream(streams[0])
     try:
-        for layer in model.layers.op_list:
-            ctx._batch = rows[0]
-            h, residual[0], pre = layer.dense(hidden[0], residual[0])
-            dense0.record(main)
-            if not first:
-                main.wait_event(routed1)
-            hidden[0] = layer.routed(h, pre)
-            routed0.record(main)
-            with torch.cuda.stream(side):
-                ctx._batch = rows[1]
-                side.wait_event(dense0)
-                h, residual[1], pre = layer.dense(hidden[1], residual[1])
-                side.wait_event(routed0)
-                hidden[1] = layer.routed(h, pre)
-                routed1.record(side)
-            first = False
+        for k, layer in enumerate(layers):
+            experts = layer.mlp.experts
+            for r, s in enumerate(streams):
+                with torch.cuda.stream(s):
+                    ctx._batch = rows[r]
+                    if r == 1:
+                        s.wait_event(dense0)
+                    h, residual[r], dense = layer.dense(hidden[r], residual[r])
+                    if r == 0:
+                        dense0.record(s)
+                    if k or r:
+                        s.wait_event(gemm[1 - r])
+                    routes = experts.hybrid_route(h, dense[0])
+                    routed[r].record(s)
+                    gpu = experts.hybrid_gpu(h, routes)
+                    gemm[r].record(s)
+                with torch.cuda.stream(host):
+                    host.wait_event(routed[r])
+                    pending = executor.decode_submit(experts.layer_id, h, routes[0], routes[3])
+                    host.wait_event(gemm[r])
+                    out = executor.decode_sync(pending, add_to=gpu)
+                    done[r].record(host)
+                with torch.cuda.stream(s):
+                    s.wait_event(done[r])
+                    hidden[r] = layer.merge(out, dense)
+                    experts.hybrid_done()
+                keep += [h, *dense, *routes, gpu, out, pending]
     finally:
         ctx._batch = batch
-    main.wait_event(routed1)
+    joined = torch.cuda.Event()
+    joined.record(streams[1])
+    streams[0].wait_event(joined)
     out = [model.norm.forward(hidden[r], residual[r])[0] for r in range(ROWS)]
     return torch.cat(out)
 
