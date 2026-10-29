@@ -37,6 +37,7 @@ namespace freetoken::cpu_moe {
 
 std::unique_ptr<MoeFormat> make_bf16_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_nvfp4_format(const MoeParams& p, const FormatArgs& a);
+std::unique_ptr<MoeFormat> make_nvfp4_b12x_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_mxfp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_ds_fp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_fp8_block_format(const MoeParams& p, const FormatArgs& a);
@@ -73,7 +74,7 @@ inline MoeTask from_word(uint64_t w) {
 const std::pair<const char*, std::unique_ptr<MoeFormat> (*)(const MoeParams&, const FormatArgs&)> kFormats[] = {
     {"bf16", make_bf16_format},     {"nvfp4", make_nvfp4_format},         {"mxfp4_triton", make_mxfp4_format},
     {"ds_fp4", make_ds_fp4_format}, {"fp8_block", make_fp8_block_format}, {"gguf", make_gguf_format},
-    {"gguf_scaled", make_gguf_scaled_format},
+    {"gguf_scaled", make_gguf_scaled_format}, {"nvfp4_b12x", make_nvfp4_b12x_format},
 };
 
 std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams& p, const FormatArgs& a) {
@@ -97,7 +98,8 @@ struct CpuMoeExecutor {
   MoeParams params;  // the formats keep a reference; declared before fmts
   std::vector<std::unique_ptr<MoeFormat>> fmts;
   std::vector<int> layer_fmt;  // [num_layers], index into fmts
-  int n_iblk = 0, n_hblk = 0;  // kRowBlock blocks per intermediate row and per output row
+  int rb = kRowBlock;           // row_block() of the current task's format
+  int n_iblk = 0, n_hblk = 0;  // rb blocks per intermediate row and per output row
 
   // Pinned IO shared by every layer and batch size (one task in flight): [max_tokens, H] x and y, [max_tokens, top_k] ids and w.
   const bf16_t* io_x;
@@ -171,11 +173,19 @@ struct CpuMoeExecutor {
     for (const int f : layer_formats)
       if (f < 0 || f >= static_cast<int>(fmts.size())) throw std::out_of_range("CPU MoE layer format index out of range");
     layer_fmt = std::move(layer_formats);
-    n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
-    n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
+    for (const auto& f : fmts)
+      if (f->row_block() < 1 || f->row_block() > kMaxRowBlock)
+        throw std::invalid_argument("CPU MoE format row block out of range");
+    set_row_block(kRowBlock);
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
+  }
+
+  void set_row_block(int r) {
+    rb = r;
+    n_iblk = (params.I + rb - 1) / rb;
+    n_hblk = (params.H + rb - 1) / rb;
   }
 
   void pin_self(int tid) {
@@ -230,7 +240,7 @@ struct CpuMoeExecutor {
     }
   }
 
-  // Pass 1 item p = one kRowBlock block of one (token, route)'s intermediate row.
+  // Pass 1 item p = one rb-row block of one (token, route)'s intermediate row.
   void do_pass1(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t ib = p % n_iblk;
@@ -240,19 +250,19 @@ struct CpuMoeExecutor {
     const int e = io_ids[static_cast<size_t>(tok) * top_k + k];
     if (e < 0 || e >= num_experts) return;
     const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
-    const int i0 = static_cast<int>(ib) * kRowBlock;
-    const int i1 = std::min(I, i0 + kRowBlock);
+    const int i0 = static_cast<int>(ib) * rb;
+    const int i1 = std::min(I, i0 + rb);
     format_of(t).gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
                          g_scratch.data() + ((size_t)tok * top_k + k) * I);
   }
 
-  // Pass 2 item p = one kRowBlock block of one token's output row, summed over its routes.
+  // Pass 2 item p = one rb-row block of one token's output row, summed over its routes.
   void do_pass2(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t hb = p % n_hblk;
     const int tok = static_cast<int>(p / n_hblk);
-    const int h0 = static_cast<int>(hb) * kRowBlock;
-    const int h1 = std::min(H, h0 + kRowBlock);
+    const int h0 = static_cast<int>(hb) * rb;
+    const int h1 = std::min(H, h0 + rb);
     DownRoute routes[kMaxTopK];
     float w_out[kMaxTopK];
     int n = 0;
@@ -264,7 +274,7 @@ struct CpuMoeExecutor {
       w_out[n] = apply_on_input ? 1.0f : io_w[r];
       ++n;
     }
-    float part[kMaxTopK * kRowBlock];
+    float part[kMaxTopK * kMaxRowBlock];
     const MoeFormat& f = format_of(t);
     if (n > 0) f.down(static_cast<int>(t.layer), h0, h1, routes, n, part);
     const bool rounds_routes = f.rounds_routes();
@@ -272,7 +282,7 @@ struct CpuMoeExecutor {
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int j = 0; j < n; ++j) {
-        const float v = part[j * kRowBlock + h - h0] * w_out[j];
+        const float v = part[j * rb + h - h0] * w_out[j];
         acc += rounds_routes ? bf16_to_f32(f32_to_bf16(v)) : v;
       }
       y_row[h] = f32_to_bf16(acc);
@@ -345,6 +355,7 @@ struct CpuMoeExecutor {
   void submit(MoeTask t) {
     const int num_tokens = static_cast<int>(t.num_tokens);
     MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
+    set_row_block(fmt.row_block());
     p1_total = static_cast<int64_t>(num_tokens) * params.top_k * n_iblk;
     p2_total = static_cast<int64_t>(num_tokens) * n_hblk;
     prt_total = fmt.preps_inter() ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
