@@ -28,14 +28,21 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
+# KV lending: allocations this large take the lowest free pages
+_LOW_FIRST_PAGES = 64
+
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False, host_tier=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False, host_tier=None,
+                 kv_lend=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+        # moe.kv_lend.KvLend: pages from its boundary up back MoE slots, off the free list
+        self.kv_lend = kv_lend
+        usable = num_pages if kv_lend is None else kv_lend.boundary
+        self.free_slots = torch.arange(usable, dtype=torch.int32, device=device) * page_size
         # Hybrid GDN models drive a second currency (GDN state snapshots in LinearStatePool)
         # through a HybridRadixCache; SWA models drive a second currency (swa-pool KV slots in
         # the HybridSWAKVCache global-paged mode) through a SWARadixCache; non-hybrid models keep
@@ -90,7 +97,12 @@ class CacheManager:
         total = self.num_pages
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
-        return total - len(self.free_slots) - evictable // self.page_size, total
+        return total - len(self.free_slots) - self.lent_pages - evictable // self.page_size, total
+
+    @property
+    def lent_pages(self) -> int:
+        """Pages past the KV lend boundary: off the free list, but KV takes them back on demand."""
+        return 0 if self.kv_lend is None else self.num_pages - self.kv_lend.boundary
 
     def _make_prefix_cache(self, device, page_size, type):
         if type == "hybrid_radix" and self.host_tier is not None:
@@ -128,7 +140,7 @@ class CacheManager:
     def available_size(self) -> int:
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
-        return evictable + len(self.free_slots) * self.page_size
+        return evictable + (len(self.free_slots) + self.lent_pages) * self.page_size
 
     @property
     def mamba_available_size(self) -> int:
@@ -664,10 +676,10 @@ class CacheManager:
         else:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        if len(self.free_slots) + cache_pages != self.num_pages:
+        if len(self.free_slots) + self.lent_pages + cache_pages != self.num_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"
-                f" free_pages({len(self.free_slots)}) +"
+                f" free_pages({len(self.free_slots)}) + lent_pages({self.lent_pages}) +"
                 f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
             )
         if self.page_size > 1:
@@ -684,7 +696,7 @@ class CacheManager:
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
+        self.free_slots = torch.arange(num_pages - self.lent_pages, dtype=torch.int32, device=device) * self.page_size
         if self.is_tiered:
             self.flush_host_meta()
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
@@ -738,13 +750,56 @@ class CacheManager:
         return self.prefix_cache.evict(need)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
-        if needed_pages > (free_pages := len(self.free_slots)):
-            evicted = self._evict((needed_pages - free_pages) * self.page_size)
+        short = needed_pages > (free_pages := len(self.free_slots))
+        if short:
+            need = (needed_pages - free_pages) * self.page_size
+            if self.kv_lend is not None:
+                if self.is_tiered:
+                    # the whole request from the lowest tree pages, so free top pages stay free
+                    low = self.prefix_cache.evict_low(needed_pages * self.page_size).kv_indices
+                    self.free_slots = torch.cat([self.free_slots, low[:: self.page_size]])
+                    need = max(0, (needed_pages - len(self.free_slots)) * self.page_size)
+                need = min(need, self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
+                           else self.prefix_cache.size_info.evictable_size)
+            evicted = self._evict(need)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
+            if needed_pages > len(self.free_slots) and self.kv_lend is not None:
+                self._take_back(needed_pages - len(self.free_slots))
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
+        if self.kv_lend is not None and (short or needed_pages >= _LOW_FIRST_PAGES):
+            self.free_slots = self.free_slots.sort().values
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         return allocated
+
+    def _take_back(self, pages: int) -> None:
+        old = self.kv_lend.boundary
+        new = self.kv_lend.grow_kv(pages)
+        if new > old:
+            fresh = torch.arange(old, new, dtype=torch.int32, device=self.free_slots.device) * self.page_size
+            self.free_slots = torch.cat([self.free_slots, fresh])
+
+    def maybe_lend(self, idle: bool = False) -> None:
+        """Lend the pages above the highest held one (less the margin) to the MoE cache; one host sync when it may pay.
+
+        ``idle`` (no request runs) first drops the VRAM copy of every tree branch but the most recent one: the host tier
+        keeps them, and a long context that went cold would otherwise hold the top pages."""
+        lend = self.kv_lend
+        if lend is None:
+            return
+        gap = lend.lend_gap()
+        if idle and self.is_tiered and gap and self.prefix_cache.stale_evictable_tokens() >= gap * self.page_size:
+            self._free(self.prefix_cache.evict_stale().kv_indices)
+        free = len(self.free_slots)
+        if not gap or free < gap:
+            return
+        boundary = lend.boundary
+        self.free_slots = self.free_slots.sort().values
+        top = torch.arange(boundary - free, boundary, dtype=torch.int32, device=self.free_slots.device) * self.page_size
+        run = int((self.free_slots == top).sum())
+        new = lend.shrink_kv(boundary - run - 1)
+        if new < boundary:
+            self.free_slots = self.free_slots[: free - (boundary - new)]
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:

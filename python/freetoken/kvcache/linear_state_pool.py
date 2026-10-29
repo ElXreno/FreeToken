@@ -97,6 +97,8 @@ class LinearStatePool:
         # verify batches only read the live state; Engine attaches this when a decode step has more than one row
         self.verify_scratch: LinearVerifyScratch | None = None
         self._free_slots: list[int] = list(range(1, num_slots))
+        # moe.kv_lend.KvLend over slots: the slots from its boundary up back borrowed MoE slots
+        self.lend = None
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
@@ -124,20 +126,40 @@ class LinearStatePool:
 
     @property
     def num_free_slots(self) -> int:
-        return len(self._free_slots)
+        lent = 0 if self.lend is None else self._num_slots - self.lend.boundary
+        return len(self._free_slots) + lent
 
     def alloc(self, n: int = 1) -> list[int]:
-        """Pop ``n`` free slot ids (LIFO). Raises if the pool is exhausted."""
+        """Pop ``n`` free slot ids (LIFO; lowest first when lending). Raises if the pool is exhausted."""
+        if n > len(self._free_slots) and self.lend is not None:
+            old = self.lend.boundary
+            new = self.lend.grow_kv(n - len(self._free_slots))
+            self._free_slots = list(range(new - 1, old - 1, -1)) + self._free_slots
         if n > len(self._free_slots):
             raise RuntimeError(
                 f"LinearStatePool exhausted: need {n}, have {len(self._free_slots)}"
             )
         return [self._free_slots.pop() for _ in range(n)]
 
+    def lend_slots_to(self, lend) -> None:
+        """Lend the slots from ``lend.boundary`` up (none held yet); later frees lend the top again."""
+        self.lend = lend
+        self._free_slots = list(range(lend.boundary - 1, 0, -1))
+
+    def _maybe_lend(self) -> None:
+        free = set(self._free_slots)
+        held = [s for s in range(self.lend.boundary) if s not in free]
+        new = self.lend.shrink_kv(max(held))
+        self._free_slots = sorted((s for s in free if s < new), reverse=True)
+
     def reclaim_all_slots(self) -> None:
         """Restore the free-list to all non-padding slots. Idle-only: the caller (e.g. a
         CacheManager rebuild that discards the tree owning donated snapshots) must guarantee no
         running request holds a slot, otherwise live state would be handed out twice."""
+        if self.lend is not None:
+            self._free_slots = list(range(self.lend.boundary - 1, 0, -1))
+            self._maybe_lend()
+            return
         self._free_slots = list(range(1, self._num_slots))
 
     def rebuild(self, num_slots: int) -> None:
@@ -178,6 +200,22 @@ class LinearStatePool:
         elif isinstance(slots, int):
             slots = [slots]
         self._free_slots.extend(int(s) for s in slots)
+        if self.lend is not None:
+            self._maybe_lend()
+
+    def move_recurrent_to_chunks(self) -> list:
+        """Reallocate the (still unused) recurrent state from one physical chunk per granule; returns the chunks in address order."""
+        from freetoken.kernel.vmm import chunked_tensor
+
+        shape, dtype = self.recurrent_states.shape, self.recurrent_states.dtype
+        nbytes = self.recurrent_states.numel() * self.recurrent_states.element_size()
+        self.recurrent_states = None
+        torch.cuda.synchronize(self._device)
+        torch.cuda.empty_cache()
+        flat, chunks = chunked_tensor(self._device, nbytes)
+        self.recurrent_states = flat.view(dtype).view(shape)
+        self.recurrent_states.zero_()
+        return chunks
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""

@@ -27,6 +27,7 @@ from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
 from freetoken.moe.host_banks import PinFailed
+from freetoken.moe.kv_lend import attach_kv_lend, gdn_lend_enabled, kv_lend_enabled
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
@@ -601,6 +602,13 @@ class Engine:
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
+
+        self.kv_lend = None
+        if self.moe_offload_cache is not None and kv_lend_enabled():
+            self.kv_lend = attach_kv_lend(
+                self.moe_offload_cache, self.kv_cache, usable_pages=self.num_pages, page_size=config.page_size,
+                linear_pool=self.linear_state_pool if gdn_lend_enabled() else None,
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -1279,6 +1287,9 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        gdn_lent = num_mamba_slots is not None and getattr(self.linear_state_pool, "lend", None) is not None
+        if self.kv_lend is not None and (moe_cache_size is not None or num_pages is not None or gdn_lent):
+            raise CacheRebuildRejected("the MoE slot cache borrows KV pages or GDN state (FREETOKEN_KV_LEND); restart to resize them")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the

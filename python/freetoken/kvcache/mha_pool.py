@@ -112,6 +112,21 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
+    def move_to_chunks(self) -> list:
+        """Reallocate the (still unused) buffer from one physical chunk per granule; returns the chunks in address order."""
+        from freetoken.kernel.vmm import chunked_tensor
+
+        shape, dtype = self._kv_buffer.shape, self._kv_buffer.dtype
+        nbytes = self._kv_buffer.numel() * self._kv_buffer.element_size()
+        self._k_buffer = self._v_buffer = self._kv_buffer = None
+        torch.cuda.synchronize(self._device)
+        torch.cuda.empty_cache()
+        flat, chunks = chunked_tensor(self._device, nbytes)
+        self._kv_buffer = flat.view(dtype).view(shape)
+        self._k_buffer = self._kv_buffer[0]
+        self._v_buffer = self._kv_buffer[1]
+        return chunks
+
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
         from .base import spec_kv_bytes_per_token

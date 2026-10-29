@@ -109,6 +109,7 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
             host_tier=host_tier,
+            kv_lend=self.engine.kv_lend,
         )
         self._prefix_cache_flush_idle = config.prefix_cache_flush_idle_seconds
         self._chunk_snapshots = config.prefix_cache_chunk_snapshots
@@ -203,6 +204,7 @@ class Scheduler(SchedulerIOMixin):
         if self._routing_trace is not None:
             self._routing_trace.flush(self.engine.stream)
         self.cache_manager.check_integrity()
+        self.cache_manager.maybe_lend(idle=True)
         self.run_idle_tick()
 
     def idle_wait_ms(self) -> int | None:
@@ -477,6 +479,8 @@ class Scheduler(SchedulerIOMixin):
                         self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        if new_finished_reqs:
+            self.cache_manager.maybe_lend()
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
