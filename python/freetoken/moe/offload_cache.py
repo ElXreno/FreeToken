@@ -812,6 +812,14 @@ class OffloadMoeCache:
             stream = self._split_gemm_stream = torch.cuda.Stream(device=self.device, priority=priority)
         return stream
 
+    def split_copy_stream(self) -> torch.cuda.Stream:
+        """Side stream of the hybrid miss copy under ``FREETOKEN_HYBRID_SPLIT_GEMM=copy``, top priority by default."""
+        stream = getattr(self, "_split_copy_stream", None)
+        if stream is None:
+            priority = int(os.environ.get("FREETOKEN_HYBRID_SPLIT_COPY_PRIORITY", "-3"))
+            stream = self._split_copy_stream = torch.cuda.Stream(device=self.device, priority=priority)
+        return stream
+
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids and layer_id not in self.locked_hybrid
