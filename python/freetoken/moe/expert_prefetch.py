@@ -58,6 +58,7 @@ class ExpertPrefetch:
         self.topn = max(topn, budget)
         self.predictors = predictors
         self.blocks = int(os.environ.get("FREETOKEN_EXPERT_PREFETCH_BLOCKS", "0") or 0)
+        self.early = os.environ.get("FREETOKEN_EXPERT_PREFETCH_MODE", "late") == "early"
         L, device = cache.num_layers, cache.device
         self.stream = torch.cuda.Stream(device=device, priority=int(os.environ.get("FREETOKEN_EXPERT_PREFETCH_PRIORITY", "-3")))
         self.done = [torch.cuda.Event() for _ in range(L)]
@@ -83,6 +84,24 @@ class ExpertPrefetch:
     def issue(self, layer_id: int, hidden: torch.Tensor) -> None:
         self.score(layer_id, hidden)
         self.launch(layer_id)
+
+    def before_demand(self, layer_id: int) -> None:
+        """Early mode: this layer's demand copy waits for the prefetch into its slots, which may be evicted at once."""
+        if self.early:
+            self.wait(layer_id)
+
+    def after_demand(self, layer_id: int, hidden: torch.Tensor) -> None:
+        """After this layer's demand copy is launched: late mode waits for the prefetch here, early mode starts the
+        next layer's prefetch here, so it runs behind the demand copy during this layer's GEMM and the next mixer."""
+        if not self.early:
+            self.wait(layer_id)
+        self.score(layer_id, hidden)
+        if self.early:
+            self.launch(layer_id)
+
+    def after_layer(self, layer_id: int) -> None:
+        if not self.early:
+            self.launch(layer_id)
 
     def score(self, layer_id: int, hidden: torch.Tensor) -> None:
         """Score layer ``layer_id + 1``'s experts from this layer's router input (before the expert GEMM may overwrite it)."""
@@ -122,6 +141,7 @@ class ExpertPrefetch:
             BLOCK_E=triton.next_power_of_2(cache.num_experts),
             BLOCK_B=triton.next_power_of_2(max(self.budget, 2)),
             CHUNK=triton.next_power_of_2(num_slots),
+            LOW=self.early,
             num_warps=8 if num_slots >= 4096 else 4,
         )
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
@@ -169,6 +189,7 @@ def _prefetch_select_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_B: tl.constexpr,
     CHUNK: tl.constexpr,
+    LOW: tl.constexpr,
 ):
     """Take the best-scored of the top ``topn`` experts that are not resident, at most ``budget``, give each the
     least-used slot of the pool and stamp it two steps ahead: the next layer's ensure (one step on) then sees a
@@ -201,7 +222,7 @@ def _prefetch_select_kernel(
         tl.store(slot_for_id_ptr + old_id, -1, mask=take & (old_id >= 0))
         tl.store(id_of_slot_ptr + victim, base + e, mask=take)
         tl.store(slot_for_id_ptr + base + e, victim, mask=take)
-        tl.store(usage_ptr + victim, step + 2, mask=take)
+        tl.store(usage_ptr + victim, 0 if LOW else step + 2, mask=take)
         tl.store(evict_ptr + n, victim, mask=take)
         tl.store(src_ptr + n, e, mask=take)
         n = n + take.to(tl.int32)

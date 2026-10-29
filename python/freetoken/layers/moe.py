@@ -286,10 +286,11 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         prefetch = cache.expert_prefetch
+        if prefetch is not None:
+            prefetch.before_demand(self.layer_id)
         cache.copy_missing()
         if prefetch is not None:
-            prefetch.wait(self.layer_id)
-            prefetch.score(self.layer_id, hidden_states)
+            prefetch.after_demand(self.layer_id, hidden_states)
         out = self._expert_gemm(
             cache,
             hidden_states,
@@ -301,7 +302,7 @@ class OffloadMoELayer(MoELayer):
             is_prefill=False,
         )
         if prefetch is not None:
-            prefetch.launch(self.layer_id)
+            prefetch.after_layer(self.layer_id)
         return out
 
     def _decode_hybrid(
@@ -341,10 +342,11 @@ class OffloadMoELayer(MoELayer):
         if _HYBRID_SPLIT_GEMM and clamp:
             gpu_routed = self._split_hybrid_gemm(cache, hidden_states, gpu_w, gpu_slots, prefetch)
         else:
+            if prefetch is not None:
+                prefetch.before_demand(self.layer_id)
             cache.copy_missing()
             if prefetch is not None:
-                prefetch.wait(self.layer_id)
-                prefetch.score(self.layer_id, hidden_states)
+                prefetch.after_demand(self.layer_id, hidden_states)
             gpu_routed = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -357,7 +359,7 @@ class OffloadMoELayer(MoELayer):
             )
         out = gpu_routed + cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending, add_to=gpu_routed)
         if prefetch is not None:
-            prefetch.launch(self.layer_id)
+            prefetch.after_layer(self.layer_id)
         return out
 
     def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch):
@@ -378,10 +380,11 @@ class OffloadMoELayer(MoELayer):
         with torch.cuda.stream(side):
             hit_out = self._expert_gemm(cache, x_side, hit_w, hit_slots, views=views, n=None, alphas=alphas, is_prefill=False)
         x_side.record_stream(side)
+        if prefetch is not None:
+            prefetch.before_demand(self.layer_id)
         cache.copy_missing()
         if prefetch is not None:
-            prefetch.wait(self.layer_id)
-            prefetch.score(self.layer_id, hidden_states)
+            prefetch.after_demand(self.layer_id, hidden_states)
         main.wait_stream(side)
         hit_out.record_stream(main)
         new_out = self._expert_gemm(cache, hidden_states, new_w, new_slots, views=views, n=None, alphas=alphas, is_prefill=False)
