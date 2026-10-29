@@ -804,6 +804,13 @@ class OffloadMoeCache:
         )
         self.cpu_executor = executor
 
+    def split_gemm_stream(self) -> torch.cuda.Stream:
+        """Side stream of the hybrid split GEMM, one per cache."""
+        stream = getattr(self, "_split_gemm_stream", None)
+        if stream is None:
+            stream = self._split_gemm_stream = torch.cuda.Stream(device=self.device)
+        return stream
+
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids and layer_id not in self.locked_hybrid
