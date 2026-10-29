@@ -26,6 +26,8 @@ namespace freetoken::cpu_moe {
 //   - NUMA: a single node is assumed. Multi-socket machines would split each
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int kRowBlock = 32;
+// Largest row_block() a format may ask for: a tiled layout whose tile spans more output rows reads each tile once.
+constexpr int kMaxRowBlock = 64;
 
 struct MoeParams {
   int top_k = 0, max_tokens = 0;
@@ -114,11 +116,13 @@ class MoeFormat {
   // Whether pass 2 needs prep_inter on every intermediate row.
   virtual bool preps_inter() const { return false; }
   virtual void prep_inter(int64_t /*r*/, bf16_t* /*g*/) {}
-  // Pass 1: g[i] for i in [i0, i1) (at most kRowBlock rows), expert e of `layer` on token tok.
+  // Output rows per work item of both passes: kRowBlock, or up to kMaxRowBlock for a layout tiled wider.
+  virtual int row_block() const { return kRowBlock; }
+  // Pass 1: g[i] for i in [i0, i1) (at most row_block() rows), expert e of `layer` on token tok.
   // w_in scales the gate and up dots: the router weight when it applies on the input, else 1.
   virtual void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* x, float w_in,
                        bf16_t* g) const = 0;
-  // Pass 2: out[j * kRowBlock + h - h0] for h in [h0, h1) (at most kRowBlock rows) and each of the n routes, before the router weight.
+  // Pass 2: out[j * row_block() + h - h0] for h in [h0, h1) (at most row_block() rows) and each of the n routes, before the router weight.
   // Visiting the routes' rows h together keeps n weight streams in flight, which the down GEMV needs to reach DRAM bandwidth.
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
   // Round each router-weighted down output to bf16 before the sum over routes.
