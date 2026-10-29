@@ -118,6 +118,7 @@ class ExpertPrefetch:
             self.evict[t], self.src[t], self.num[t], self.issued[t:],
             t * cache.num_experts, num_slots, self.topn, self.budget, cache.num_experts,
             BLOCK_E=triton.next_power_of_2(cache.num_experts),
+            BLOCK_B=triton.next_power_of_2(max(self.budget, 2)),
             CHUNK=triton.next_power_of_2(num_slots),
             num_warps=8 if num_slots >= 4096 else 4,
         )
@@ -164,6 +165,7 @@ def _prefetch_select_kernel(
     budget,
     num_experts: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    BLOCK_B: tl.constexpr,
     CHUNK: tl.constexpr,
 ):
     """Take the best-scored of the top ``topn`` experts that are not resident, at most ``budget``, give each the
@@ -175,14 +177,22 @@ def _prefetch_select_kernel(
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=0)
     cold = e_mask & (slot == -1)
     step = tl.load(step_ptr)
-    off_k = tl.arange(0, CHUNK)
-    u = tl.load(usage_ptr + off_k, mask=off_k < cache_size, other=9223372036854775807).to(tl.int64)
-    n = tl.zeros((), dtype=tl.int32)
+    off_b = tl.arange(0, BLOCK_B)
+    cand = tl.full((BLOCK_B,), 0, dtype=tl.int32)
+    found = tl.zeros((), dtype=tl.int32)
     for i in tl.range(topn):
         e = tl.argmax(s, axis=0).to(tl.int32)
         s = tl.where(off_e == e, float("-inf"), s)
         is_cold = tl.sum(tl.where(off_e == e, cold.to(tl.int32), 0)) > 0
-        take = is_cold & (n < budget)
+        keep = is_cold & (found < budget)
+        cand = tl.where((off_b == found) & keep, e, cand)
+        found = found + keep.to(tl.int32)
+    off_k = tl.arange(0, CHUNK)
+    u = tl.load(usage_ptr + off_k, mask=off_k < cache_size, other=9223372036854775807).to(tl.int64)
+    n = tl.zeros((), dtype=tl.int32)
+    for j in tl.range(budget):
+        take = j < found
+        e = tl.sum(tl.where(off_b == j, cand, 0))
         victim = tl.argmin(u, axis=0).to(tl.int32)
         u = tl.where((off_k == victim) & take, 9223372036854775807, u)
         old_id = tl.load(id_of_slot_ptr + victim)
