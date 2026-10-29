@@ -1084,6 +1084,33 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp-verify",
+        dest="speculative_algorithm",
+        action="store_const",
+        const="mtp",
+        help="Speculative decoding with the checkpoint's own MTP head drafting one token per step: --speculative-algorithm mtp.",
+    )
+
+    parser.add_argument(
+        "--mtp-window",
+        type=int,
+        default=ServerArgs.mtp_window,
+        help="Attention history the MTP draft head keeps per request, in tokens; a bounded ring replaces a KV-cache layer for the head.",
+    )
+
+    parser.add_argument(
+        "--mtp-routed-experts",
+        type=int,
+        dest="mtp_top_k",
+        default=ServerArgs.mtp_top_k,
+        help=(
+            "Routed experts the MTP draft head takes per draft: 0 leaves it with its shared expert alone and claims no "
+            "cache slots, -1 (default) follows the model's router width. The head's experts are quantized to NVFP4 at "
+            "load and ride the offload cache as one more bank layer."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

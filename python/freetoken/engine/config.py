@@ -220,7 +220,7 @@ class EngineConfig:
         return replace(
             model_config,
             quant=quant,
-            mtp_draft=self.mtp_draft and model_config.mtp_num_layers > 0,
+            mtp_draft=(self.mtp_draft or self.speculative_algorithm == "mtp") and model_config.mtp_num_layers > 0,
             mtp_window=self.mtp_window,
             mtp_top_k=_resolve_mtp_top_k(self.mtp_top_k, model_config),
             ablate_direction=self.ablate_direction,
