@@ -266,6 +266,9 @@ class OffloadMoeCache:
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
+        # per-slot scales of the routed slots only, refreshed by alphas_for_slots(slot_ids=...); sized to the largest pool
+        self._slot_gate_up_alpha: torch.Tensor | None = None
+        self._slot_down_alpha: torch.Tensor | None = None
         # Opt-in decode miss-rate instrumentation. Accumulated on-device (no per-step host
         # sync); read via ``decode_miss_stats``. Graph-safe: the ``+=`` is captured into the
         # decode graph and re-executes with each replay's REAL routing (record_decode_stats
@@ -722,6 +725,7 @@ class OffloadMoeCache:
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
         self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
         self._slice_pools()
+        self._alloc_slot_alphas()
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
@@ -773,6 +777,14 @@ class OffloadMoeCache:
         assert gate_up_alpha.shape == down_alpha.shape == (total,)
         self.gate_up_alpha = gate_up_alpha.to(self.device)
         self.down_alpha = down_alpha.to(self.device)
+        self._alloc_slot_alphas()
+
+    def _alloc_slot_alphas(self) -> None:
+        if self.gate_up_alpha is None:
+            return
+        n = max(self.pool_sizes)
+        self._slot_gate_up_alpha = torch.zeros(n, dtype=self.gate_up_alpha.dtype, device=self.device)
+        self._slot_down_alpha = torch.zeros(n, dtype=self.down_alpha.dtype, device=self.device)
 
     def set_cpu_executor(self, executor) -> None:
         """Attach the CPU MoE executor (``decode_target`` in {"cpu", "hybrid"}).
@@ -795,13 +807,25 @@ class OffloadMoeCache:
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id; a locked_hybrid layer's decode fetches go through ``locked_fetch`` instead."""
         return layer_id in self._unpinned_layers
 
-    def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    def alphas_for_slots(
+        self, layer_id: int, slot_ids: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
         keeps no GPU-resident alphas (bf16 / triton-nvfp4). Slots of other layers
         yield garbage values, but only slots routed to -- and those belong to
-        ``layer_id`` -- are ever read by the grouped GEMM."""
+        ``layer_id`` -- are ever read by the grouped GEMM.
+
+        With ``slot_ids`` (the call's routed local slots after ``ensure_experts``, -1 = not on
+        the GPU) only those entries of two persistent per-slot buffers are refreshed, in
+        one launch; without it every slot of the pool is gathered (six launches)."""
         if self.gate_up_alpha is None:
             return None
+        if slot_ids is not None:
+            from freetoken.moe.offload_kernels import routed_slot_alphas
+
+            routed_slot_alphas(self, layer_id, slot_ids)
+            n = self.pool_slots(layer_id)
+            return self._slot_gate_up_alpha[:n], self._slot_down_alpha[:n]
         id_of_slot, _ = self.pool_state(layer_id)
         idx = layer_id * self.num_experts + (
             id_of_slot.clamp(min=0).long() % self.num_experts
