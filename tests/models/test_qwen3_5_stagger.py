@@ -1,9 +1,10 @@
 """A staggered MTP verify (row 1 half a layer behind row 0 on its own stream) equals the lockstep layers.
 
 The mixer of row 1 reads what row 0's wrote, as attention reads row 0's KV and GDN its stash; a row's ensure writes
-a staging buffer shared by every call, which its GEMM reads, as the expert cache's slots and staging are; and the CPU
-pool has one IO block, which a submit fills and its sync reads. Row 0's mixer, the GEMM and the CPU task sleep on the
-GPU first, so a step that does not wait for them reads stale or clobbered values.
+a staging buffer shared by every call, which its miss copy reads, as the expert cache's staging is; the GEMMs share one
+workspace, as b12x does; and the CPU pool has one IO block, which a submit fills and its sync reads. Row 0's mixer, the
+copy, the GEMM and the CPU task sleep on the GPU first, so a step that does not wait for them reads stale or clobbered
+values.
 """
 
 from __future__ import annotations
@@ -73,16 +74,18 @@ class _Executor:
         self.w[:n].copy_(weights[:, 1:2].sigmoid())
         return layer, n
 
-    def decode_sync(self, pending, add_to: torch.Tensor) -> torch.Tensor:
+    def decode_sync(self, pending, add_to: torch.Tensor | None = None) -> torch.Tensor:
         layer, n = pending
         torch.cuda._sleep(SLEEP)
-        return add_to.add_(((self.x[:n] @ self.cpu_w[layer].T) * self.w[:n]).to(add_to.dtype))
+        out = ((self.x[:n] @ self.cpu_w[layer].T) * self.w[:n]).to(torch.bfloat16)
+        return out if add_to is None else add_to.add_(out)
 
 
 class _Experts:
-    """GPU share through a staging buffer every call shares; ``forward`` is both shares at once."""
+    """GPU share through a staging buffer and a GEMM workspace every call shares; ``forward`` is both shares at once."""
 
     staging = None
+    workspace = None
     stages_hybrid = True
 
     def __init__(self, layer: int, gpu_w: torch.Tensor, cache):
@@ -98,10 +101,18 @@ class _Experts:
         weights = router_logits.float()
         return weights, None, None, weights
 
-    def hybrid_gpu(self, hidden_states: torch.Tensor, routes) -> torch.Tensor:
+    def hybrid_gpu(self, hidden_states: torch.Tensor, routes, staged=None, gemm_after=None) -> torch.Tensor:
         n = hidden_states.shape[0]
         torch.cuda._sleep(SLEEP)
-        return ((_Experts.staging[:n] @ self.w.T) * routes[0][:, :1].sigmoid()).to(hidden_states.dtype)
+        x = _Experts.staging[:n].clone()
+        if staged is not None:
+            staged.record()
+        if gemm_after is not None:
+            torch.cuda.current_stream().wait_event(gemm_after)
+        ws = _Experts.workspace[:n]
+        ws.copy_((x @ self.w.T) * routes[0][:, :1].sigmoid())
+        torch.cuda._sleep(3 * SLEEP)
+        return ws.to(hidden_states.dtype)
 
     def hybrid_done(self) -> None:
         pass
@@ -140,6 +151,7 @@ def _model(g: torch.Generator) -> Qwen3_5Model:
 def test_staggered_rows_match_lockstep(monkeypatch):
     g = torch.Generator().manual_seed(7)
     _Experts.staging = torch.zeros(2, H, device="cuda")
+    _Experts.workspace = torch.zeros(2, H, device="cuda")
     model = _model(g)
     ctx = Context(page_size=1)
     ctx.attn_backend = SimpleNamespace(supports_verify_rows=True, prepare_verify_row=lambda batch, rb: None)

@@ -3,14 +3,17 @@ layer behind row 0, so the CPU pool, which bounds a hybrid MoE layer, works on o
 the other row's dense part (norms, mixer, router, shared expert) and its own routing, miss copy and GEMMs.
 
 Per layer k and row r: ``D`` the dense part, ``R`` the routing and capped-fetch ensure, ``G`` the miss copy and the
-GPU experts' GEMMs, ``C`` the CPU pool's task (submit, wait, combine), ``A`` the merge with the shared expert::
+GPU experts' GEMMs, ``C`` the CPU pool's task (submit, wait, read back), ``A`` the sum with ``G`` and the merge with the
+shared expert::
 
     row r stream:  D_r,k  R_r,k  G_r,k ............ A_r,k  D_r,k+1 ...
     CPU stream:                 C_0,k  C_1,k  C_0,k+1  C_1,k+1 ...
 
 The CPU tasks run back to back in that order, one in flight (the pool has one IO block): C_1,k is submitted once
-C_0,k has combined. A row's ensure waits for the other row's last GEMM, which may read slots it evicts, and so the
-cache's staging serves one call at a time. Row 1's dense part waits for row 0's, which wrote the KV row and the GDN
+C_0,k has read its result back, whatever the GEMMs are doing. A row's ensure waits until the other row's last call no
+longer reads the cache's copy staging (its miss copy, or the copy engine's snapshot of the victims); the slots that
+call routes to are its most recent, so the ensure never evicts them. The expert GEMMs still run one at a time: a
+row's wait for the other row's last ones. Row 1's dense part waits for row 0's, which wrote the KV row and the GDN
 stash it reads. Each row is a one-row verify against the same KV and GDN state. Whatever moves the misses
 (``copy_missing``) runs inside G unchanged.
 """
@@ -82,7 +85,7 @@ def staggered_forward(model: Qwen3_5Model, x: torch.Tensor) -> torch.Tensor:
     hidden = [x[r : r + 1] for r in range(ROWS)]
     residual: list[torch.Tensor | None] = [None] * ROWS
     dense0 = torch.cuda.Event()
-    routed, gemm, done = ([torch.cuda.Event() for _ in range(ROWS)] for _ in range(3))
+    routed, staged, gemm, done = ([torch.cuda.Event() for _ in range(ROWS)] for _ in range(4))
     # tensors one stream allocates and another reads stay referenced until the join
     keep = []
     for s in (streams[1], host):
@@ -99,22 +102,21 @@ def staggered_forward(model: Qwen3_5Model, x: torch.Tensor) -> torch.Tensor:
                     if r == 0:
                         dense0.record(s)
                     if k or r:
-                        s.wait_event(gemm[1 - r])
+                        s.wait_event(staged[1 - r])
                     routes = experts.hybrid_route(h, dense[0])
                     routed[r].record(s)
-                    gpu = experts.hybrid_gpu(h, routes)
+                    gpu = experts.hybrid_gpu(h, routes, staged[r], gemm[1 - r] if k or r else None)
                     gemm[r].record(s)
                 with torch.cuda.stream(host):
                     host.wait_event(routed[r])
                     pending = executor.decode_submit(experts.layer_id, h, routes[0], routes[3])
-                    host.wait_event(gemm[r])
-                    out = executor.decode_sync(pending, add_to=gpu)
+                    cpu = executor.decode_sync(pending)
                     done[r].record(host)
                 with torch.cuda.stream(s):
                     s.wait_event(done[r])
-                    hidden[r] = layer.merge(out, dense)
+                    hidden[r] = layer.merge(gpu.add_(cpu), dense)
                     experts.hybrid_done()
-                keep += [h, *dense, *routes, gpu, out, pending]
+                keep += [h, *dense, *routes, gpu, cpu, pending]
     finally:
         ctx._batch = batch
     joined = torch.cuda.Event()
