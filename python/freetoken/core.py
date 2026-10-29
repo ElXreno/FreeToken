@@ -176,6 +176,8 @@ class Batch:
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
     # per-row hidden states a draft model reads from this forward; None when nothing reads them
     features: "FeatureSink | None" = field(default=None, init=False)
+    # a staggered verify's row batch: row verify_row of every request, one row each; None = all rows
+    verify_row: int | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.rows_per_req is None and self.phase == "decode":

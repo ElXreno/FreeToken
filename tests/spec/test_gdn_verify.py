@@ -65,3 +65,42 @@ def test_kernel_verify_stash_replay_matches_decode_bitwise(layers, bs, h, hv, di
         gdn_state_replay(st, stash, meta)
         assert torch.equal(st[:, slots], per_step[n - 1][:, slots]), f"n={n}"
         assert torch.equal(st[:, bs], state0[:, bs])  # the slot no row commits to
+
+
+@cuda
+def test_kernel_verify_one_row_per_call_matches_all_rows_bitwise():
+    """A staggered verify runs row t of every request in its own call, replaying the t rows earlier calls stashed;
+    each call's output and stash must equal the all-rows verify's bitwise, and the live slab stays untouched."""
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update as fused
+
+    torch.manual_seed(1)
+    dev = torch.device("cuda")
+    bs, steps, h, hv, kd = 3, 4, NK, NV, HD
+
+    def r(*s, dt=torch.bfloat16, sc=0.5):
+        return (torch.randn(*s, device=dev) * sc).to(dt)
+
+    q, k, v = r(1, bs * steps, h, kd), r(1, bs * steps, h, kd), r(1, bs * steps, hv, kd)
+    a, b = r(bs * steps, hv), r(bs * steps, hv)
+    a_log, dt_bias = r(hv, dt=torch.float32, sc=0.1), r(hv, dt=torch.float32, sc=0.1)
+    state0 = torch.randn(bs + 1, hv, kd, kd, device=dev) * 0.1
+    common = {
+        "A_log": a_log, "dt_bias": dt_bias, "softplus_beta": 1.0, "softplus_threshold": 20.0, "scale": kd ** -0.5,
+        "use_qk_l2norm_in_kernel": True, "disable_state_update": True,
+        "initial_state_indices": torch.tensor([2, 0, 3], dtype=torch.int32, device=dev),
+    }
+
+    def stash():
+        return tuple(torch.zeros(bs, steps, *shape, device=dev) for shape in ((h, kd), (hv, kd), (hv,), (hv,)))
+
+    want_stash, st = stash(), state0.clone()
+    want = fused(a=a, q=q, k=k, v=v, b=b, initial_state_source=st, input_stash=want_stash,
+                 cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=dev) * steps, **common)
+    got_stash = stash()
+    for t in range(steps):
+        rows = torch.arange(bs, device=dev) * steps + t
+        got = fused(a=a[rows], q=q[:, rows], k=k[:, rows], v=v[:, rows], b=b[rows], initial_state_source=st,
+                    input_stash=got_stash, prior_steps=t, cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=dev), **common)
+        assert torch.equal(got, want[:, rows]), f"row {t}"
+    assert all(torch.equal(g, w) for g, w in zip(got_stash, want_stash))
+    assert torch.equal(st, state0)

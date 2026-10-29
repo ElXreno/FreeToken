@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -37,6 +37,8 @@ class FLAMetadata:
     fresh_state_indices: torch.Tensor | None = None
     # verify only: the state pool's scratch the verify writes (row = batch row) and the commit replays
     verify_scratch: "LinearVerifyScratch | None" = None
+    # verify only: rows per request that earlier calls verified (staggered verify)
+    verify_offset: int = 0
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -71,6 +73,12 @@ def _decode_cu_seqlens(bs: int, rows: int, device: torch.device) -> torch.Tensor
     return buf
 
 
+def verify_row_fla_metadata(fla: FLAMetadata, row: int) -> FLAMetadata:
+    """A verify's metadata narrowed to row ``row`` of every request (a staggered verify's row batch)."""
+    bs = fla.cache_indices.numel()
+    return replace(fla, cu_seqlens=_decode_cu_seqlens(bs, 1, fla.cu_seqlens.device), verify_offset=row)
+
+
 def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePool) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
@@ -93,6 +101,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
         )
         if batch.phase == "verify":
             metadata.verify_scratch = pool.verify_scratch
+            metadata.verify_offset = batch.verify_row or 0
         return metadata
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
