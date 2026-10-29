@@ -30,6 +30,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+from freetoken.moe.routing_trace import RoutingTrace, trace_path
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -661,6 +662,8 @@ class Engine:
             return
         started = perf_counter_ns()
         seeded = cache.seed_resident()
+        if cache.routing_trace is not None:
+            cache.routing_trace.start(list(zip(cache.pool_sizes, cache._pool_stable_from, strict=True)), cache.seeds)
         if seeded:
             logger.info_rank0(
                 f"MoE cache seeded with {seeded} experts in {(perf_counter_ns() - started) / 1e9:.2f} s"
@@ -989,6 +992,12 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        if path := trace_path():
+            cache.routing_trace = RoutingTrace(
+                path, num_layers=config.model_config.num_moe_layers, num_experts=config.model_config.num_experts,
+                top_k=config.model_config.num_experts_per_tok,
+                max_rows=config.max_running_req * max(config.decode_rows_per_req, 4), device=self.device,
+            )
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):

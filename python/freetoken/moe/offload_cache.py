@@ -298,6 +298,8 @@ class OffloadMoeCache:
         # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
         # captured graph would not re-run this host-side scatter on replay).
         self.collect_decode_freq = False
+        # opt-in decode routing trace (moe.routing_trace), attached by the engine before graph capture
+        self.routing_trace = None
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
@@ -881,6 +883,10 @@ class OffloadMoeCache:
             tail.zero_()
 
     def begin_prefill(self) -> None:
+        if self.routing_trace is not None:
+            from freetoken.moe.routing_trace import PREFILL
+
+            self.routing_trace.marker(PREFILL)
         if not self.prefill_overlap:
             return
         self._prefill_buffer_layer = [None, None]
@@ -1147,6 +1153,7 @@ class OffloadMoeCache:
         serves it; the seeds keep usage 0, so decode evicts them before anything it loaded.
         Slots below a pool's stable index overlap the prefill staging and are left alone.
         """
+        self.seeds: list[tuple[int, int, int]] = []
         if self.device.type != "cuda" or not self.banks:
             return 0
         seeded = 0
@@ -1172,6 +1179,7 @@ class OffloadMoeCache:
                 for (per_layer, _), view in zip(self.banks, views, strict=True):
                     view[slot : slot + share].copy_(per_layer[layer_id][:share], non_blocking=True)
                 self.slot_for_id[layer_id, :share] = experts + slot
+                self.seeds.append((layer_id, share, slot))
                 id_of_slot[slot : slot + share] = experts + layer_id * self.num_experts
                 slot += share
             seeded += slot - first
@@ -1181,6 +1189,10 @@ class OffloadMoeCache:
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 
+        if self.routing_trace is not None:
+            from freetoken.moe.routing_trace import RESET
+
+            self.routing_trace.marker(RESET)
         reset_cache(self)
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
