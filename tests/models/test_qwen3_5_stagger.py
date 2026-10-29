@@ -2,9 +2,9 @@
 
 The mixer of row 1 reads what row 0's wrote, as attention reads row 0's KV and GDN its stash; a row's ensure writes
 a staging buffer shared by every call, which its miss copy reads, as the expert cache's staging is; the GEMMs share one
-workspace, as b12x does; and the CPU pool has one IO block, which a submit fills and its sync reads. Row 0's mixer, the
-copy, the GEMM and the CPU task sleep on the GPU first, so a step that does not wait for them reads stale or clobbered
-values.
+workspace, as b12x does; and the CPU pool has an IO block per handshake slot, which a submit fills and its sync reads.
+Row 0's mixer, the copy, the GEMM and the CPU task sleep on the GPU first, so a step that does not wait for them reads
+stale or clobbered values.
 """
 
 from __future__ import annotations
@@ -56,28 +56,30 @@ class _Mixer(_Linear):
 
 
 class _Executor:
-    """The CPU pool: a submit fills the one IO block, the sync reads it after the task."""
+    """The CPU pool: a submit fills its slot's IO rows, the sync reads them after the task."""
+
+    slots = 2
 
     def __init__(self):
-        self.x = torch.zeros(2, H, device="cuda")
-        self.w = torch.zeros(2, 1, device="cuda")
+        self.x = torch.zeros(self.slots, 2, H, device="cuda")
+        self.w = torch.zeros(self.slots, 2, 1, device="cuda")
         self.cpu_w: dict[int, torch.Tensor] = {}
         self.tasks: list[int] = []
 
     def share(self, layer: int, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         return (x.float() @ self.cpu_w[layer].T) * weights[:, 1:2].sigmoid()
 
-    def decode_submit(self, layer: int, x: torch.Tensor, weights: torch.Tensor, cpu_ids: torch.Tensor):
+    def decode_submit(self, layer: int, x: torch.Tensor, weights: torch.Tensor, cpu_ids: torch.Tensor, slot: int = 0):
         n = x.shape[0]
         self.tasks.append(layer)
-        self.x[:n].copy_(x)
-        self.w[:n].copy_(weights[:, 1:2].sigmoid())
-        return layer, n
+        self.x[slot, :n].copy_(x)
+        self.w[slot, :n].copy_(weights[:, 1:2].sigmoid())
+        return layer, n, slot
 
     def decode_sync(self, pending, add_to: torch.Tensor | None = None) -> torch.Tensor:
-        layer, n = pending
+        layer, n, slot = pending
         torch.cuda._sleep(SLEEP)
-        out = ((self.x[:n] @ self.cpu_w[layer].T) * self.w[:n]).to(torch.bfloat16)
+        out = ((self.x[slot, :n] @ self.cpu_w[layer].T) * self.w[slot, :n]).to(torch.bfloat16)
         return out if add_to is None else add_to.add_(out)
 
 
