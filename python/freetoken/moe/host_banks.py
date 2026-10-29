@@ -94,10 +94,49 @@ def _env_born_pinned() -> bool | None:
     return v in ("1", "true", "yes", "on")
 
 
-def _hugepages_wanted() -> bool:
-    """``FREETOKEN_BANK_HUGEPAGES`` (default on): ask for transparent huge pages on the private anonymous bank mmaps."""
-    v = os.environ.get("FREETOKEN_BANK_HUGEPAGES", "1").strip().lower()
-    return v not in ("0", "false", "no", "off") and hasattr(mmap, "MADV_HUGEPAGE")
+def _free_huge_bytes() -> int:
+    """Bytes in free blocks of 2 MiB or more (``/proc/buddyinfo``, order >= 9): what MADV_HUGEPAGE gets without compaction."""
+    total = 0
+    try:
+        with open("/proc/buddyinfo") as f:
+            for line in f:
+                _, _, rest = line.partition("zone")
+                counts = rest.split()[1:]
+                total += sum(int(c) * (4096 << order) for order, c in enumerate(counts) if order >= 9)
+    except (OSError, ValueError):
+        return 0
+    return total
+
+
+_HUGE_MARGIN = 1.25
+_huge_lock = threading.Lock()
+_huge_budget: int | None = None
+_huge_denied = False
+
+
+def _hugepages_wanted(nbytes: int) -> bool:
+    """``FREETOKEN_BANK_HUGEPAGES``: ask for transparent huge pages on a private anonymous bank mmap.
+
+    ``auto`` (default) grants banks while the free 2 MiB blocks seen at the first bank cover the granted total ``_HUGE_MARGIN`` times over; past that, a THP fault would compact page cache for every 2 MiB and stall the load. ``1`` always asks, ``0`` never."""
+    global _huge_budget, _huge_denied
+    if not hasattr(mmap, "MADV_HUGEPAGE"):
+        return False
+    v = os.environ.get("FREETOKEN_BANK_HUGEPAGES", "auto").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v != "auto":
+        return True
+    with _huge_lock:
+        if _huge_budget is None:
+            _huge_budget = int(_free_huge_bytes() / _HUGE_MARGIN)
+        if nbytes <= _huge_budget:
+            _huge_budget -= nbytes
+            return True
+        if not _huge_denied:
+            _huge_denied = True
+            logger.info("host banks: free 2 MiB blocks exhausted, further banks use 4 KiB pages "
+                        "(FREETOKEN_BANK_HUGEPAGES=1 asks for huge pages anyway)")
+        return False
 
 
 def born_pinned_default() -> bool:
@@ -113,7 +152,7 @@ def born_pinned_default() -> bool:
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
-    * ``"mmap"`` (default) -- lazy private anonymous mmap (huge pages unless ``FREETOKEN_BANK_HUGEPAGES=0``); pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
+    * ``"mmap"`` (default) -- lazy private anonymous mmap (huge pages while free 2 MiB blocks cover them, see :func:`_hugepages_wanted`); pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
@@ -145,7 +184,7 @@ class HostBank:
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
             self._buf = mmap.mmap(-1, asize, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)  # lazy: address space only, no resident pages yet
-            if _hugepages_wanted():
+            if _hugepages_wanted(asize):
                 with contextlib.suppress(OSError):
                     self._buf.madvise(mmap.MADV_HUGEPAGE)
             _LIVE_BUFFERS.append(self._buf)
