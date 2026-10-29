@@ -59,6 +59,8 @@ class GpuSync {
   // 1. submit. gpu_submit() is enqueued on `stream`, which may be capturing; cpu_poll() returns 0 when nothing is submitted.
   void gpu_submit(uintptr_t stream, uint64_t task);
   uint64_t cpu_poll();
+  // Host address of the word cpu_poll reads, for umonitor.
+  const void* poll_address() const;
 
   // 2. wait. cpu_done() also unblocks the stream on teardown and from the watchdog.
   void gpu_wait(uintptr_t stream);
