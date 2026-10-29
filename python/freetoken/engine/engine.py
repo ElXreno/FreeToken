@@ -7,6 +7,7 @@ import gc
 import math
 import os
 from datetime import timedelta
+from time import perf_counter_ns
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
@@ -651,6 +652,19 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self._seed_moe_cache()
+
+    def _seed_moe_cache(self) -> None:
+        """After every capture/warmup that resets the MoE cache, so the seeds survive into serving."""
+        cache = self.moe_offload_cache
+        if cache is None:
+            return
+        started = perf_counter_ns()
+        seeded = cache.seed_resident()
+        if seeded:
+            logger.info_rank0(
+                f"MoE cache seeded with {seeded} experts in {(perf_counter_ns() - started) / 1e9:.2f} s"
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1349,6 +1363,7 @@ class Engine:
             self.spec.attach(self)
         # reuse the startup-resolved bs set (see above)
         self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+        self._seed_moe_cache()
 
     def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
         """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
