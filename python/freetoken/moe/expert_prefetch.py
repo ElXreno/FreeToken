@@ -90,6 +90,8 @@ class ExpertPrefetch:
             return
         logits = torch.nn.functional.linear(hidden, self.predictors[layer_id]).float()
         self.scores[layer_id] = torch.softmax(logits, dim=-1).sum(0)
+        if self.budget == 0:
+            self._hint(t, self.scores[layer_id])
 
     def launch(self, layer_id: int) -> None:
         """Once this layer's experts are done: fetch the next layer's best cold experts and hint the CPU pool at the
@@ -97,9 +99,11 @@ class ExpertPrefetch:
         score = self.scores[layer_id]
         if score is None:
             return
-        t = layer_id + 1
         if self.budget > 0:
-            self._fetch(t, score)
+            self._fetch(layer_id + 1, score)
+            self._hint(layer_id + 1, score)
+
+    def _hint(self, t: int, score: torch.Tensor) -> None:
         if getattr(self.cache.cpu_executor, "prefetch_hint", None) is not None:
             from freetoken.moe.cpu_prefetch_hint import write_cpu_prefetch_hint
 
