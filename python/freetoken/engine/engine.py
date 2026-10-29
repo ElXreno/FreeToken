@@ -31,6 +31,7 @@ from freetoken.moe.kv_lend import attach_kv_lend, gdn_lend_enabled, kv_lend_enab
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+from freetoken.moe.demand_copy import DemandCopy, demand_copy_mode
 from freetoken.moe.expert_prefetch import ExpertPrefetch, next_layer_routers, prefetch_budget
 from freetoken.moe.prefill_dump import PrefillDump, dump_dir, dump_every
 from freetoken.moe.routing_trace import RoutingTrace, trace_hidden, trace_path
@@ -1025,8 +1026,23 @@ class Engine:
         budget = prefetch_budget()
         if budget or getattr(cache.cpu_executor, "prefetch_hint", None) is not None:
             self._attach_expert_prefetch(config, cache, budget)
+        if demand_copy_mode() == "ce":
+            self._attach_demand_copy(cache, budget)
         self.moe_offload_cache = cache
         return cache
+
+    def _attach_demand_copy(self, cache, budget: int) -> None:
+        if cache.decode_target != "hybrid" or os.environ.get("FREETOKEN_HYBRID_SPLIT_GEMM") != "copy":
+            logger.warning_rank0("copy-engine demand copy: needs hybrid decode with FREETOKEN_HYBRID_SPLIT_GEMM=copy, off")
+            return
+        if budget:
+            # the SM prefetch picks victims without the pending check
+            logger.warning_rank0("copy-engine demand copy: FREETOKEN_EXPERT_PREFETCH copies into slots on its own, off")
+            return
+        cache.demand_copy = DemandCopy(cache)
+        logger.info_rank0(
+            f"copy-engine demand copy: up to {DemandCopy.max_fetch} experts per layer, SM fallback after {cache.demand_copy.timeout_ns // 1000} us"
+        )
 
     def _attach_expert_prefetch(self, config: EngineConfig, cache, budget: int) -> None:
         if cache.decode_target not in ("gpu", "hybrid"):
