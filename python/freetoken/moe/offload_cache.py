@@ -310,6 +310,8 @@ class OffloadMoeCache:
         self.prefill_dump = None
         # opt-in next-layer expert prefetch (moe.expert_prefetch)
         self.expert_prefetch = None
+        # opt-in copy-engine demand copy (moe.demand_copy)
+        self.demand_copy = None
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
@@ -767,6 +769,8 @@ class OffloadMoeCache:
         sizes = [cache_size] if pool_sizes is None else list(pool_sizes)
         assert len(sizes) == len(self.pool_sizes) and sum(sizes) == cache_size and min(sizes) > 0, (sizes, cache_size)
         self.validate_rebuild(cache_size, sizes)
+        if self.demand_copy is not None:
+            self.demand_copy.detach()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_copy_stream = None
         self.prefill_begin_event = None
@@ -826,6 +830,8 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        if self.demand_copy is not None:
+            self.demand_copy.on_rebuild()
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
@@ -965,6 +971,7 @@ class OffloadMoeCache:
             tail.zero_()
 
     def begin_prefill(self) -> None:
+        self._drain_copies()
         if self.routing_trace is not None:
             from freetoken.moe.routing_trace import PREFILL
 
@@ -1217,11 +1224,18 @@ class OffloadMoeCache:
             # a locked layer fetches through the staging, so at most its rows per step
             (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
         self._pending_fetch_cap = cap
+        if self.demand_copy is not None and self.demand_copy.serves(layer_id):
+            cap = min(self.num_experts if cap is None else cap, self.demand_copy.max_fetch)
         return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
+
+    def _drain_copies(self) -> None:
+        if self.demand_copy is not None:
+            self.demand_copy.drain()
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
+        self._drain_copies()
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
@@ -1277,6 +1291,7 @@ class OffloadMoeCache:
             from freetoken.moe.routing_trace import RESET
 
             self.routing_trace.marker(RESET)
+        self._drain_copies()
         reset_cache(self)
         if self.lend_segments:
             self.usage[self.lend_base :] = UNAVAILABLE
@@ -1352,6 +1367,8 @@ class OffloadMoeCache:
             parts.append(f"cpu-only {_layers(len(cpu_only))}")
         if parts and self.lend_segments:
             parts.append("borrowed slots live " + ", ".join(f"{live} of {slots}" for _, slots, live in self.lend_segments))
+        if self.demand_copy is not None and (line := self.demand_copy.stats_line()):
+            parts.append(line)
         return "MoE decode, " + "; ".join(parts) if parts else None
 
     def decode_miss_stats_per_layer(self) -> dict:

@@ -28,6 +28,10 @@
 #include <freetoken/hip_compat.h>
 #include <torch/extension.h>
 
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
+
 #include "format.h"
 #include "gpu_sync.h"
 #include "gpu_sync_io.h"
@@ -85,6 +89,23 @@ std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams&
 
 // One format instance as cpu_executor.py passes it: name, bank tables by role, integer options.
 using FormatSpec = std::tuple<std::string, std::map<std::string, uint64_t>, std::map<std::string, int64_t>>;
+
+// cuStreamWriteValue32, resolved at run time like the memops of gpu_sync_cuda.cpp.
+using cuWrite32_fn = int (*)(void* stream, unsigned long long addr, unsigned int value, unsigned int flags);
+cuWrite32_fn resolve_write32() {
+#if defined(_WIN32) || defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+  return nullptr;
+#else
+  static cuWrite32_fn fn = [] {
+    void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (h == nullptr) return static_cast<cuWrite32_fn>(nullptr);
+    auto f = reinterpret_cast<cuWrite32_fn>(dlsym(h, "cuStreamWriteValue32_v2"));
+    if (f == nullptr) f = reinterpret_cast<cuWrite32_fn>(dlsym(h, "cuStreamWriteValue32"));
+    return f;
+  }();
+  return fn;
+#endif
+}
 
 struct CpuMoeExecutor {
   // A host-function callback gets one pointer, so it carries the executor with the task.
@@ -165,6 +186,24 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> pf_tasks{0}, pf_bytes{0}, pf_aborted{0};
   std::atomic<uint64_t> pf_sink{0};
 
+  // copy-engine demand copy into GPU slots, see moe/demand_copy.py
+  std::atomic<const int32_t*> ce_rows{nullptr};  // [rows][width]: seq, layer, n, 0, slots, experts, gens
+  int ce_nrows = 0;
+  int ce_width = 0, ce_maxb = 0;
+  uint64_t ce_ready = 0, ce_ack = 0;  // device uint32 ready[cache_size], ack[rows]
+  std::vector<std::vector<uint64_t>> ce_src, ce_dst, ce_feat;  // [layer][bank], [pool][bank], [layout][bank]
+  std::vector<int> ce_pool, ce_layout;
+  std::vector<int64_t> ce_pool_base;
+  std::vector<int32_t> ce_seen;
+  cudaStream_t ce_stream = nullptr;
+  int ce_device = 0;
+  cuWrite32_fn ce_write32 = nullptr;
+  std::mutex ce_mtx;
+  // the coordinator must never enter the driver: a launch blocked on the stalled GPU holds its lock
+  std::thread ce_thread;
+  std::atomic<bool> ce_stop{false};
+  std::atomic<int64_t> ce_rows_served{0}, ce_experts{0}, ce_bytes{0}, ce_issue_ns{0};
+
   CpuMoeExecutor(int num_threads_, int num_layers_, int num_experts_, int top_k_,
                  int hidden_size, int inter_size, int max_tokens_, int activation_id,
                  int apply_router_weight_on_input, std::vector<FormatSpec> formats,
@@ -212,6 +251,12 @@ struct CpuMoeExecutor {
   ~CpuMoeExecutor() {
     coord_stop.store(true);
     if (coord_thread.joinable()) coord_thread.join();
+    ce_stop.store(true);
+    if (ce_thread.joinable()) ce_thread.join();
+    if (ce_stream != nullptr) {
+      cudaStreamSynchronize(ce_stream);
+      cudaStreamDestroy(ce_stream);
+    }
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       stop = true;
@@ -400,6 +445,132 @@ struct CpuMoeExecutor {
 
   void prefetch_now(int layer) {
     if (submit_prefetch(layer)) sync();
+  }
+
+  void ce_setup(uintptr_t rows, int width, int maxb, uintptr_t ready, uintptr_t ack, std::vector<std::vector<uint64_t>> src,
+                std::vector<std::vector<uint64_t>> dst, std::vector<std::vector<uint64_t>> feat, std::vector<int> pool_of_layer,
+                std::vector<int> layer_layout, std::vector<int64_t> pool_base, int device) {
+    std::lock_guard<std::mutex> lk(ce_mtx);
+    ce_write32 = resolve_write32();
+    if (ce_write32 == nullptr) throw std::runtime_error("copy-engine copies need cuStreamWriteValue32");
+    if (src.empty() || pool_of_layer.size() != src.size() || layer_layout.size() != src.size())
+      throw std::invalid_argument("copy-engine rows need a source, a pool and a layout each");
+    ce_device = device;
+    if (ce_stream == nullptr) {
+      cudaSetDevice(device);
+      if (cudaStreamCreateWithFlags(&ce_stream, cudaStreamNonBlocking) != cudaSuccess)
+        throw std::runtime_error("copy-engine copy stream");
+    }
+    ce_width = width;
+    ce_maxb = maxb;
+    ce_ready = ready;
+    ce_ack = ack;
+    ce_src = std::move(src);
+    ce_dst = std::move(dst);
+    ce_feat = std::move(feat);
+    ce_pool = std::move(pool_of_layer);
+    ce_layout = std::move(layer_layout);
+    ce_pool_base = std::move(pool_base);
+    ce_nrows = static_cast<int>(ce_src.size());
+    ce_seen.assign(ce_nrows, 0);
+    ce_rows.store(reinterpret_cast<const int32_t*>(rows), std::memory_order_release);
+    if (!ce_thread.joinable()) ce_thread = std::thread([this] { ce_loop(); });
+  }
+
+  // spins while rows keep coming, dozes like the coordinator once decode stops
+  void ce_loop() {
+    using clock = std::chrono::steady_clock;
+    constexpr auto kHotWindow = std::chrono::milliseconds(50);
+    auto last_active = clock::now();
+    unsigned empty_polls = 0;
+    int64_t sleep_us = 50;
+    bool dozing = false;
+    while (!ce_stop.load(std::memory_order_relaxed)) {
+      if (ce_poll()) {
+        last_active = clock::now();
+        empty_polls = 0;
+        sleep_us = 50;
+        dozing = false;
+        continue;
+      }
+      if (!dozing) {
+        if ((++empty_polls & 1023u) != 0 || clock::now() - last_active < kHotWindow) {
+          cpu_relax();
+          continue;
+        }
+        dozing = true;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+      sleep_us = std::min<int64_t>(sleep_us * 2, 500);
+    }
+  }
+
+  // stop serving rows; the caller drains first
+  void ce_detach() {
+    std::lock_guard<std::mutex> lk(ce_mtx);
+    ce_rows.store(nullptr, std::memory_order_release);
+  }
+
+  // issue the copies of every row with a new seq; whether any was found
+  bool ce_poll() {
+    if (ce_rows.load(std::memory_order_relaxed) == nullptr) return false;
+    std::unique_lock<std::mutex> lk(ce_mtx, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    const int32_t* rows = ce_rows.load(std::memory_order_acquire);
+    if (rows == nullptr) return false;
+    static thread_local int bound_device = -1;
+    bool served = false;
+    for (int t = 0; t < ce_nrows; ++t) {
+      const int32_t* row = rows + static_cast<size_t>(t) * ce_width;
+      const int32_t seq = __atomic_load_n(row, __ATOMIC_ACQUIRE);
+      if (seq == ce_seen[t]) continue;
+      const auto t0 = std::chrono::steady_clock::now();
+      if (bound_device != ce_device) {
+        cudaSetDevice(ce_device);
+        bound_device = ce_device;
+      }
+      const int n = std::min<int>(__atomic_load_n(row + 2, __ATOMIC_RELAXED), ce_maxb);
+      const int pool = ce_pool[t];
+      const auto& feat = ce_feat[ce_layout[t]];
+      for (int i = 0; i < n; ++i) {
+        const int64_t slot = __atomic_load_n(row + 4 + i, __ATOMIC_RELAXED);
+        const int64_t e = __atomic_load_n(row + 4 + ce_maxb + i, __ATOMIC_RELAXED);
+        const auto gen = static_cast<unsigned int>(__atomic_load_n(row + 4 + 2 * ce_maxb + i, __ATOMIC_RELAXED));
+        for (size_t b = 0; b < feat.size(); ++b) {
+          if (feat[b] == 0 || ce_src[t][b] == 0) continue;
+          cudaMemcpyAsync(reinterpret_cast<void*>(ce_dst[pool][b] + slot * feat[b]),
+                          reinterpret_cast<const void*>(ce_src[t][b] + e * feat[b]), feat[b], cudaMemcpyDefault, ce_stream);
+          ce_bytes.fetch_add(static_cast<int64_t>(feat[b]), std::memory_order_relaxed);
+        }
+        ce_write32(ce_stream, ce_ready + 4ull * static_cast<unsigned long long>(ce_pool_base[pool] + slot), gen, 0);
+        ce_experts.fetch_add(1, std::memory_order_relaxed);
+      }
+      ce_seen[t] = seq;
+      ce_write32(ce_stream, ce_ack + 4ull * static_cast<unsigned long long>(t), static_cast<unsigned int>(seq), 0);
+      served = true;
+      ce_rows_served.fetch_add(1, std::memory_order_relaxed);
+      ce_issue_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                            std::memory_order_relaxed);
+    }
+    return served;
+  }
+
+  // callers synchronize the compute stream first
+  void ce_drain() {
+    for (;;) {
+      bool fresh = false;
+      {
+        std::lock_guard<std::mutex> lk(ce_mtx);
+        const int32_t* rows = ce_rows.load(std::memory_order_acquire);
+        if (rows == nullptr) break;
+        for (int t = 0; t < ce_nrows && !fresh; ++t)
+          fresh = __atomic_load_n(rows + static_cast<size_t>(t) * ce_width, __ATOMIC_ACQUIRE) != ce_seen[t];
+      }
+      if (!fresh) break;
+      ce_poll();
+    }
+    std::lock_guard<std::mutex> lk(ce_mtx);
+    if (ce_stream != nullptr) cudaStreamSynchronize(ce_stream);
   }
 
   void run_task_body(const MoeTask& t) {
@@ -683,6 +854,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              return py::make_tuple(e.pf_tasks.load(), e.pf_bytes.load(), e.pf_aborted.load());
            })
       .def_property_readonly_static("prefetch_hint_width", [](py::object) { return 2 + CpuMoeExecutor::kMaxHint; })
+      .def("ce_setup", &CpuMoeExecutor::ce_setup, py::arg("rows"), py::arg("width"), py::arg("maxb"), py::arg("ready"),
+           py::arg("ack"), py::arg("src"), py::arg("dst"), py::arg("feat"), py::arg("pool_of_layer"), py::arg("layer_layout"),
+           py::arg("pool_base"), py::arg("device"))
+      .def("ce_poll", &CpuMoeExecutor::ce_poll, py::call_guard<py::gil_scoped_release>())
+      .def("ce_drain", &CpuMoeExecutor::ce_drain, py::call_guard<py::gil_scoped_release>())
+      .def("ce_detach", &CpuMoeExecutor::ce_detach)
+      .def("ce_stats",
+           [](const CpuMoeExecutor& e) {
+             return py::make_tuple(e.ce_rows_served.load(), e.ce_experts.load(), e.ce_bytes.load(), e.ce_issue_ns.load());
+           })
       .def("isa_name", &CpuMoeExecutor::isa_name)
       .def("set_spin_wait",
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
