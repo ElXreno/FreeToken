@@ -110,13 +110,15 @@ class GatedDeltaNet(BaseOP):
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
     def _conv_verify(self, conv_in: torch.Tensor, fla, pool) -> torch.Tensor:
-        """Causal conv over a verify batch's rows: rolls the live conv state as if every row were accepted and parks each row's window in ``fla.verify_scratch``."""
+        """Causal conv over a verify batch's rows: rolls the live conv state as if every row were accepted and parks each row's window in ``fla.verify_scratch``.
+        A staggered row continues from the state its earlier rows rolled and parks after their windows."""
         li = pool.local_index(self.layer_id)
         total = conv_in.shape[0]
         bs = fla.cu_seqlens.numel() - 1
         # free views both ways: the conv reads any strides and writes token-major output
         x = conv_in.reshape(bs, total // bs, -1).transpose(1, 2)
-        out = causal_conv1d_verify(x, pool.conv_states[li], self._conv_weight(), fla.cache_indices, fla.verify_scratch.conv_window[li])
+        window = fla.verify_scratch.conv_window[li][:, fla.verify_offset :]
+        out = causal_conv1d_verify(x, pool.conv_states[li], self._conv_weight(), fla.cache_indices, window)
         return out.transpose(1, 2).reshape(total, -1)
 
     def _write_track_snapshot(self, pool, li: int, conv_rows: torch.Tensor,
@@ -185,6 +187,7 @@ class GatedDeltaNet(BaseOP):
                 initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
                 disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
+                prior_steps=fla.verify_offset if verify else 0,
             )[0]  # [total, num_v, V]
         else:
             from .gdn_prefill import chunk_gated_delta_rule_owned

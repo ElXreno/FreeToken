@@ -65,6 +65,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     STASH_INPUTS: tl.constexpr = False,
+    PRIOR_STEPS: tl.constexpr = 0,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -147,6 +148,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         mask_sk = mask_k & (i_v == 0) & (i_hv % (HV // H) == 0)
         mask_sv = mask_v
         mask_sg = i_v == 0
+        # replay the tokens earlier calls stashed, op for op as the loop below
+        for _ in tl.static_range(PRIOR_STEPS):
+            r_k = tl.load(ps_k, mask=mask_k, other=0)
+            r_v = tl.load(ps_v, mask=mask_v, other=0)
+            r_g = tl.load(ps_g)
+            r_beta = tl.load(ps_beta)
+            b_h *= tl.exp(r_g)
+            r_v -= tl.sum(b_h * r_k[:, None], 0)
+            r_v *= r_beta
+            b_h += r_k[:, None] * r_v[None, :]
+            ps_k += H * K
+            ps_v += HV * V
+            ps_g += HV
+            ps_beta += HV
 
     step_idx = 0
     for _ in range(0, T):
@@ -301,6 +316,7 @@ def fused_sigmoid_gating_delta_rule_update(
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
     input_stash: Optional[tuple] = None,
+    prior_steps: int = 0,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -314,7 +330,9 @@ def fused_sigmoid_gating_delta_rule_update(
 
     ``input_stash`` = (k, v, g, beta) fp32 buffers of shape [rows, steps, H, K] / [rows, steps, HV, V] /
     [rows, steps, HV] / [rows, steps, HV], indexed by batch row: each token's l2-normed k,
-    raw v and gates, for ``gdn_state_replay``.
+    raw v and gates, for ``gdn_state_replay``. With ``prior_steps`` each row's first ``prior_steps``
+    stashed tokens (an earlier call's) are applied to the initial state first and this call's tokens
+    stash after them: a verify split into one call per row gives the all-rows call's outputs and stash.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
@@ -366,6 +384,7 @@ def fused_sigmoid_gating_delta_rule_update(
         assert all(t.dtype == torch.float32 and t.is_contiguous() for t in input_stash)
         assert stash_k.shape[2:] == (H, K) and stash_v.shape[2:] == (HV, V)
         cache_stride_steps = stash_k.shape[1]
+    assert prior_steps == 0 or input_stash is not None, "prior_steps replays the stash"
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -414,6 +433,7 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         STASH_INPUTS=input_stash is not None,
+        PRIOR_STEPS=prior_steps,
         num_warps=num_warps,
         num_stages=num_stages,
     )

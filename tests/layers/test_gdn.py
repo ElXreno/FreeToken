@@ -101,11 +101,19 @@ def _prefill(op, ctx: Context, lengths: list[int], seed: int):
     return hidden, reqs, out
 
 
-def _step(op, ctx: Context, reqs, hidden: torch.Tensor, phase: str = "decode", rows: int = 1) -> torch.Tensor:
+def _step(op, ctx: Context, reqs, hidden: torch.Tensor, phase: str = "decode", rows: int = 1, verify_row: int | None = None) -> torch.Tensor:
     batch = Batch(reqs=reqs, phase=phase, rows_per_req=rows)
     batch.padded_reqs = reqs
+    batch.verify_row = verify_row
     with ctx.forward_batch(batch):
         return op.forward(hidden)
+
+
+def _verify(op, ctx: Context, reqs, rows: torch.Tensor, staggered: bool) -> torch.Tensor:
+    """[bs, K + 1, hidden] verify rows -> outputs, all rows in one call or one row of every request per call."""
+    if not staggered:
+        return _step(op, ctx, reqs, rows.flatten(0, 1), "verify", K + 1).view(rows.shape[0], K + 1, -1)
+    return torch.stack([_step(op, ctx, reqs, rows[:, t].contiguous(), "verify", 1, verify_row=t) for t in range(K + 1)], 1)
 
 
 @torch.no_grad()
@@ -114,10 +122,12 @@ def _ref_out(ref, hidden: torch.Tensor) -> torch.Tensor:
 
 
 # 3:1 with sigmoid is Qwen3.8-Flash-Next; the sigmoid case also catches a layer that ignores output_gate (the default is silu)
+@pytest.mark.parametrize("staggered", [False, True], ids=["rows-together", "row-per-call"])
 @pytest.mark.parametrize("ratio,output_gate", [(2, "silu"), (3, "sigmoid")])
-def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_gate):
+def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_gate, staggered):
     """bs=3 ragged prefill, a decode step, a verify of K+1 rows committed at a different accept count per request, then another decode step.
-    Each step is checked against the reference over the request's whole sequence so far, so a state that did not survive a step, or a verify that wrote the live state, shows up in the next one."""
+    Each step is checked against the reference over the request's whole sequence so far, so a state that did not survive a step, or a verify that wrote the live state, shows up in the next one.
+    A staggered verify runs row t of every request in its own call and commits through the same scratch."""
     op, ref = _make_layer(ratio, output_gate, seed=ratio)
     ctx = _ctx(monkeypatch, ratio)
     lengths = [128, 1000, 37]
@@ -137,7 +147,7 @@ def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_ga
         torch.testing.assert_close(dec[i].float(), _ref_out(ref, h)[-1], rtol=RTOL, atol=ATOL)
 
     rows = torch.randn(len(lengths), K + 1, HIDDEN, device=DEV, dtype=torch.bfloat16)
-    ver = _step(op, ctx, reqs, rows.flatten(0, 1), "verify", K + 1).view(len(lengths), K + 1, -1)
+    ver = _verify(op, ctx, reqs, rows, staggered)
     for i, h in enumerate(seqs):
         want = _ref_out(ref, torch.cat([h, rows[i]]))[-(K + 1):]
         torch.testing.assert_close(ver[i].float(), want, rtol=RTOL, atol=ATOL)
