@@ -443,6 +443,19 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool
         raise err[0]
 
 
+def _has_mtp_weights(reader: FTWReader) -> bool:
+    return any(e["name"].startswith("mtp.") for e in reader.entries("weight"))
+
+
+def _leading_layers(entry: dict, keep: int, stored: int) -> dict:
+    """A flat ``[stored * num_experts, ...]`` bank entry cut to its first ``keep`` layers; per-layer entries pass through."""
+    if _LAYER_ENTRY_RE.match(entry["name"]) is not None:
+        return entry
+    total, *rest = entry["shape"]
+    assert total % stored == 0 and entry["nbytes"] % stored == 0, (entry["name"], total, stored)
+    return {**entry, "shape": [total // stored * keep, *rest], "nbytes": entry["nbytes"] // stored * keep}
+
+
 def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
     """``(all, alphas, flat regions, {base: {layer: entry}})`` of the ``experts_bank`` entries; None when there are none."""
     bank_entries = reader.entries("experts_bank")
@@ -454,11 +467,20 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
 
     meta_layers = reader.meta("expert_bank_num_layers")
     if meta_layers is not None and meta_layers != num_layers:
-        raise RuntimeError(
-            f"{path!r} was converted with {meta_layers} expert-bank layers but the "
-            f"model config says num_moe_layers={num_layers}; the checkpoint does not "
-            "match its config"
-        )
+        if meta_layers == num_layers + 1 and _has_mtp_weights(reader):
+            logger.info(f"{path!r}: the draft head's expert bank (layer {num_layers}) is not loaded, MTP is off")
+            alpha_entries = [_leading_layers(e, num_layers, meta_layers) for e in alpha_entries]
+            row_entries = [
+                _leading_layers(e, num_layers, meta_layers) for e in row_entries
+                if (m := _LAYER_ENTRY_RE.match(e["name"])) is None or int(m.group("layer")) < num_layers
+            ]
+            bank_entries = alpha_entries + row_entries
+        else:
+            raise RuntimeError(
+                f"{path!r} was converted with {meta_layers} expert-bank layers but the "
+                f"model config says num_moe_layers={num_layers}; the checkpoint does not "
+                "match its config"
+            )
 
     # Split row entries into the two layouts by name.
     flat_entries: list[dict] = []
