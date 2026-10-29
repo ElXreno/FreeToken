@@ -288,8 +288,8 @@ class OffloadMoELayer(MoELayer):
         cache.copy_missing()
         if prefetch is not None:
             prefetch.wait(self.layer_id)
-            prefetch.issue(self.layer_id, hidden_states)
-        return self._expert_gemm(
+            prefetch.score(self.layer_id, hidden_states)
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -299,6 +299,9 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id, topk_ids),
             is_prefill=False,
         )
+        if prefetch is not None:
+            prefetch.launch(self.layer_id)
+        return out
 
     def _decode_hybrid(
         self,
@@ -337,7 +340,7 @@ class OffloadMoELayer(MoELayer):
         cache.copy_missing()
         if prefetch is not None:
             prefetch.wait(self.layer_id)
-            prefetch.issue(self.layer_id, hidden_states)
+            prefetch.score(self.layer_id, hidden_states)
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -348,9 +351,10 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id, gpu_slots),
             is_prefill=False,
         )
-        if not _HYBRID_OVERLAP:
-            return gpu_routed + cpu_routed_early
-        return executor.decode_sync(pending, add_to=gpu_routed)
+        out = gpu_routed + cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending, add_to=gpu_routed)
+        if prefetch is not None:
+            prefetch.launch(self.layer_id)
+        return out
 
     def _prefill_routed(
         self,
