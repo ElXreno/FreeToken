@@ -28,6 +28,7 @@ namespace freetoken::cpu_moe {
 constexpr int kRowBlock = 32;
 // Largest row_block() a format may ask for: a tiled layout whose tile spans more output rows reads each tile once.
 constexpr int kMaxRowBlock = 64;
+constexpr int kMaxRanges = 8;
 
 struct MoeParams {
   int top_k = 0, max_tokens = 0;
@@ -127,6 +128,8 @@ class MoeFormat {
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
   // Round each router-weighted down output to bf16 before the sum over routes.
   virtual bool rounds_routes() const { return false; }
+  // Byte ranges of expert e for the cache prefetch (<= kMaxRanges); 0 = none.
+  virtual int expert_ranges(int /*layer*/, int /*e*/, const void** /*ptrs*/, size_t* /*lens*/) const { return 0; }
 
  protected:
   const MoeParams& p;
