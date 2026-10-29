@@ -17,6 +17,7 @@ experts into a GPU slot cache. Rules every kernel here follows:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -546,6 +547,8 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
     name = "b12x"
     cpu_format = "nvfp4_b12x"
+    # the small-M decode launch skips routes with a negative slot
+    supports_inactive_slots = os.environ.get("FREETOKEN_B12X_INACTIVE_SLOTS", "0") == "1"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if backend.is_rocm():
