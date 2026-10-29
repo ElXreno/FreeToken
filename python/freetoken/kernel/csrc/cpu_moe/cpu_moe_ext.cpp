@@ -173,7 +173,7 @@ struct CpuMoeExecutor {
   std::array<std::unique_ptr<GpuSync>, kSlots> gpu_sync;
   std::array<std::unique_ptr<KernelIo>, kSlots> kernel_io;  // replaces the copies around the doorbell once enable_kernel_io() runs
   int last_slot = kSlots - 1;
-  bool slots_used = false;  // a task came on a slot other than 0: umwait watches slot 0 only
+  int due_slot = 0;  // the next while the slots alternate, else the same one again
   std::thread coord_thread;
   std::atomic<bool> coord_stop{false};
   std::atomic<int64_t> flag_served{0};  // completed doorbells (tests, watchdog)
@@ -785,9 +785,9 @@ struct CpuMoeExecutor {
         word = gpu_sync[slot]->cpu_poll();
       }
       if (word != 0) {
+        due_slot = slot != last_slot ? (slot + 1) % kSlots : slot;
         last_slot = slot;
         use_slot(slot);
-        if (slot != 0) slots_used = true;
         const MoeTask t = from_word(word);
         const bool spin = coord_pinned && spin_wait.load(std::memory_order_relaxed);
         retire_prefetch(spin);
@@ -817,10 +817,13 @@ struct CpuMoeExecutor {
         if ((++empty_polls & 1023u) != 0 ||
             coord_clock::now() - last_active < kHotWindow) {
 #if CPU_MOE_X86
-          if (umwait_enabled() && !slots_used) {
-            const auto* ready = static_cast<const int64_t*>(gpu_sync[0]->poll_address());
-            umonitor_line(ready);
-            if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0) umwait_c01();
+          if (umwait_enabled()) {
+            // watch the slot due next; another one is seen at the latest when umwait times out
+            umonitor_line(gpu_sync[due_slot]->poll_address());
+            bool rung = false;
+            for (const auto& g : gpu_sync)
+              rung = rung || __atomic_load_n(static_cast<const int64_t*>(g->poll_address()), __ATOMIC_ACQUIRE) != 0;
+            if (!rung) umwait_c01();
             continue;
           }
 #endif
