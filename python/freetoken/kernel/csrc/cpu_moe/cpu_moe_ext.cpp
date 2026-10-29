@@ -178,6 +178,7 @@ struct CpuMoeExecutor {
   alignas(64) std::atomic<int64_t> in_next{0};
 
   // flow: one queue, no barriers, see run_flow()
+  static constexpr int kFlowMaxTokens = 4;
   int flow_p1 = 0, flow_p2 = 2;
   bool task_flow = false;
   int flow_p1_per = 0, flow_p2_per = 0;
@@ -282,13 +283,14 @@ struct CpuMoeExecutor {
     set_row_block(kRowBlock);
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
     p1_route.assign(static_cast<size_t>(params.max_tokens) * params.top_k, 0);
-    if (const char* s = getenv("FREETOKEN_CPU_MOE_FLOW"); s && s[0] && s[0] != '0') {
-      flow_p1 = std::clamp(atoi(s), 1, 4);
+    const char* fs = getenv("FREETOKEN_CPU_MOE_FLOW");
+    flow_p1 = (fs && fs[0]) ? std::clamp(atoi(fs), 0, 4) : 1;
+    if (flow_p1 > 0) {
       if (const char* s2 = getenv("FREETOKEN_CPU_MOE_FLOW_P2")) flow_p2 = std::clamp(atoi(s2), 1, 8);
-      const size_t routes = static_cast<size_t>(params.max_tokens) * params.top_k;
+      const size_t tokens = std::min(params.max_tokens, kFlowMaxTokens), routes = tokens * params.top_k;
       route_left = std::make_unique<std::atomic<int>[]>(routes);
       route_ready = std::make_unique<std::atomic<int>[]>(routes);
-      blk_left = std::make_unique<std::atomic<int>[]>(static_cast<size_t>(params.max_tokens) * params.H);
+      blk_left = std::make_unique<std::atomic<int>[]>(tokens * params.H);
       partial.assign(routes * params.H, 0.0f);
     }
     for (int t = 0; t < num_threads; ++t)
@@ -914,7 +916,7 @@ struct CpuMoeExecutor {
     p1_total = static_cast<int64_t>(routed) * n_iblk;
     p2_total = static_cast<int64_t>(num_tokens) * n_hblk;
     prt_total = fmt.preps_inter() ? routed : 0;
-    task_flow = flow_p1 > 0 && fmt.has_tiles();
+    task_flow = flow_p1 > 0 && fmt.has_tiles() && num_tokens <= kFlowMaxTokens;
     if (task_flow) {
       flow_p1_per = (n_iblk + flow_p1 - 1) / flow_p1;
       flow_p2_per = (n_hblk + flow_p2 - 1) / flow_p2;
