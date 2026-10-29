@@ -10,12 +10,19 @@ GPU prefetch has claimed its experts: those are resident by then and stay out of
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
+_HINT_N = int(os.environ.get("FREETOKEN_CPU_PREFETCH_HINT_N", "4") or 4)
+_HINT_TOPN = int(os.environ.get("FREETOKEN_CPU_PREFETCH_HINT_TOPN", "16") or 16)
 
-def write_cpu_prefetch_hint(cache, layer: int, score: torch.Tensor, *, max_n: int = 4, topn: int = 16) -> None:
+
+def write_cpu_prefetch_hint(cache, layer: int, score: torch.Tensor, *, max_n: int | None = None, topn: int | None = None) -> None:
+    max_n = _HINT_N if max_n is None else max_n
+    topn = _HINT_TOPN if topn is None else topn
     executor = cache.cpu_executor
     hint = getattr(executor, "prefetch_hint", None)
     if hint is None or layer >= cache.num_layers:

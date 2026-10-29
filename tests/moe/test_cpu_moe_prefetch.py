@@ -155,3 +155,22 @@ def test_the_hint_takes_the_best_cold_experts_of_the_top_n_walk_with_ties():
         write_cpu_prefetch_hint(cache, 0, score.cuda(), max_n=max_n, topn=topn)
         torch.cuda.synchronize()
         assert hint[0, 1].item() == len(want) and hint[0, 2:2 + len(want)].tolist() == want, (case, topn, max_n)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_hint_size_and_walk_default_to_their_env_knobs(monkeypatch):
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.moe import cpu_prefetch_hint as mod
+
+    monkeypatch.setattr(mod, "_HINT_N", 2)
+    monkeypatch.setattr(mod, "_HINT_TOPN", 3)
+    hint = alloc_pinned_tensor(L, 34, dtype=torch.int32)
+    hint.fill_(-1)
+    slot_for_id = torch.full((L, E), -1, dtype=torch.int32, device="cuda")
+    slot_for_id[1, 4] = 0
+    cache = SimpleNamespace(num_layers=L, num_experts=E, slot_for_id=slot_for_id,
+                            step=torch.tensor([7], dtype=torch.int64, device="cuda"),
+                            cpu_executor=SimpleNamespace(prefetch_hint=hint))
+    mod.write_cpu_prefetch_hint(cache, 1, torch.arange(E, dtype=torch.float32, device="cuda"))
+    torch.cuda.synchronize()
+    assert hint[1, :4].tolist() == [7, 2, 5, 3]
