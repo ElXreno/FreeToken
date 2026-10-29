@@ -295,11 +295,14 @@ class CpuMoeExecutor:
             if device.type == "cpu"
             else alloc_pinned_tensor
         )
+        # handshake slots: a task can wait on one slot's IO rows while the next is published on another
+        self.slots = int(getattr(_cpu_moe.CpuMoeExecutor, "slots", 1))
+        rows = self.max_tokens * self.slots
         self._io = {
-            "x": alloc_io(self.max_tokens, self.H, dtype=torch.bfloat16),
-            "ids": alloc_io(self.max_tokens, self.top_k, dtype=torch.int32),
-            "w": alloc_io(self.max_tokens, self.top_k, dtype=torch.float32),
-            "y": alloc_io(self.max_tokens, self.H, dtype=torch.bfloat16),
+            "x": alloc_io(rows, self.H, dtype=torch.bfloat16),
+            "ids": alloc_io(rows, self.top_k, dtype=torch.int32),
+            "w": alloc_io(rows, self.top_k, dtype=torch.float32),
+            "y": alloc_io(rows, self.H, dtype=torch.bfloat16),
         }
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
@@ -587,6 +590,7 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        slot: int = 0,
     ) -> tuple:
         """Issue the D2H copies + the CPU-pool submit host node (or the publish kernel), then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
@@ -595,7 +599,8 @@ class CpuMoeExecutor:
         ``topk_ids`` may carry ``-1`` entries (the C++ kernel skips them), so the CPU
         computes only the routes assigned to it. Returns an opaque handle to pass to
         :meth:`decode_sync`. The output tensor is allocated here so it stays live (and
-        distinct from the interleaved GPU work) across the overlap window."""
+        distinct from the interleaved GPU work) across the overlap window. ``slot`` picks the handshake and IO rows: a
+        task on one slot may be submitted while the other slot's is still running (the flag handshake only)."""
         bs = hidden_states.shape[0]
         if bs > self.max_tokens:
             raise ValueError(f"CPU MoE decode batch {bs} exceeds the executor's max_tokens {self.max_tokens}")
@@ -620,44 +625,46 @@ class CpuMoeExecutor:
             ids = topk_ids.to(torch.int32).contiguous()
             w = topk_weights.to(torch.float32).contiguous()
             assert x.shape == (bs, self.H) and ids.shape == w.shape == (bs, self.top_k), (x.shape, ids.shape, w.shape)
-            self._ext.flag_publish(stream, x.data_ptr(), ids.data_ptr(), w.data_ptr(), layer_id, bs)
-            return (bs, torch.empty_like(x), True)
+            self._ext.flag_publish(stream, x.data_ptr(), ids.data_ptr(), w.data_ptr(), layer_id, bs, slot)
+            return (bs, torch.empty_like(x), True, slot)
+        assert slot == 0 or self._flag_sync, "handshake slots need the flag handshake"
 
         # D2H: ship this step's activations + routing to pinned host memory.
+        rows = slice(slot * self.max_tokens, slot * self.max_tokens + bs)
         io = self._io
-        io["x"][:bs].copy_(hidden_states, non_blocking=True)
-        io["ids"][:bs].copy_(topk_ids.to(torch.int32), non_blocking=True)
-        io["w"][:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        io["x"][rows].copy_(hidden_states, non_blocking=True)
+        io["ids"][rows].copy_(topk_ids.to(torch.int32), non_blocking=True)
+        io["w"][rows].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         out = torch.empty_like(hidden_states)
         if self._flag_sync:
             # Front-end memops: reset done, then ring the doorbell with (layer, bs).
             # No kernel launched; no host-func round trip.
-            self._ext.flag_signal(stream, layer_id, bs)
+            self._ext.flag_signal(stream, layer_id, bs, slot)
         else:
             self._ext.submit_with_cuda_stream(stream, layer_id, bs)
-        return (bs, out, False)
+        return (bs, out, False, slot)
 
     def decode_sync(self, pending: tuple, add_to: torch.Tensor | None = None) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
         memop on done (set by the CPU coordinator); otherwise a cudaLaunchHostFunc.
         With ``add_to``, return ``add_to`` + the CPU output; the kernel path adds in place into ``add_to``."""
-        bs, out, kernel_io = pending
+        bs, out, kernel_io, slot = pending
         stream = torch.cuda.current_stream().cuda_stream
         if self._flag_sync:
             # Front-end WAIT(done >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
-            self._ext.flag_wait(stream)
+            self._ext.flag_wait(stream, slot)
         else:
             self._ext.sync_with_cuda_stream(stream)
         if kernel_io:
             if add_to is not None and add_to.dtype == torch.bfloat16 and add_to.is_contiguous() and add_to.shape == out.shape:
-                self._ext.flag_combine(stream, add_to.data_ptr(), bs, True)
+                self._ext.flag_combine(stream, add_to.data_ptr(), bs, True, slot)
                 return add_to
-            self._ext.flag_combine(stream, out.data_ptr(), bs, False)
+            self._ext.flag_combine(stream, out.data_ptr(), bs, False, slot)
             return out if add_to is None else add_to + out
-        out.copy_(self._io["y"][:bs], non_blocking=True)
+        out.copy_(self._io["y"][slot * self.max_tokens : slot * self.max_tokens + bs], non_blocking=True)
         return out if add_to is None else add_to + out
 
     def _watchdog_tick(self, suspect: dict) -> None:

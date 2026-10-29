@@ -11,6 +11,7 @@
 // Compute is FP32-accumulate; the intermediate is stored bf16 to match the GPU decode path.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -122,7 +123,14 @@ struct CpuMoeExecutor {
   int rb = kRowBlock;           // row_block() of the current task's format
   int n_iblk = 0, n_hblk = 0;  // rb blocks per intermediate row and per output row
 
-  // Pinned IO shared by every layer and batch size (one task in flight): [max_tokens, H] x and y, [max_tokens, top_k] ids and w.
+  // Pinned IO shared by every layer and batch size: [kSlots * max_tokens, H] x and y, [kSlots * max_tokens, top_k] ids and w.
+  // Slot s holds rows [s * max_tokens, (s + 1) * max_tokens): a task on slot 1 can be published while one on slot 0 runs.
+  static constexpr int kSlots = 2;
+  const bf16_t* const io_x0;
+  const int32_t* const io_ids0;
+  const float* const io_w0;
+  bf16_t* const io_y0;
+  // the rows of the slot whose task the pool runs, set by the coordinator before it submits
   const bf16_t* io_x;
   const int32_t* io_ids;
   const float* io_w;
@@ -162,8 +170,10 @@ struct CpuMoeExecutor {
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
   // The GPU rings the doorbell with a task word at submit; this coordinator thread busy-polls it, runs the task on the worker pool, and completes it, which the GPU waits on at sync.
   // This removes the ~2x30-50us host-func dispatch round trips per MoE layer per decode step that otherwise idle the GPU (~6 ms/step on a 75-layer model).
-  std::unique_ptr<GpuSync> gpu_sync;
-  std::unique_ptr<KernelIo> kernel_io;  // replaces the copies around the doorbell once enable_kernel_io() runs
+  std::array<std::unique_ptr<GpuSync>, kSlots> gpu_sync;
+  std::array<std::unique_ptr<KernelIo>, kSlots> kernel_io;  // replaces the copies around the doorbell once enable_kernel_io() runs
+  int last_slot = kSlots - 1;
+  bool slots_used = false;  // a task came on a slot other than 0: umwait watches slot 0 only
   std::thread coord_thread;
   std::atomic<bool> coord_stop{false};
   std::atomic<int64_t> flag_served{0};  // completed doorbells (tests, watchdog)
@@ -215,10 +225,14 @@ struct CpuMoeExecutor {
         apply_on_input(apply_router_weight_on_input != 0),
         params{top_k_, max_tokens_, hidden_size, inter_size, activation_id, static_cast<float>(swiglu_alpha_),
                static_cast<float>(swiglu_limit_)},
-        io_x(reinterpret_cast<const bf16_t*>(x_ptr)),
-        io_ids(reinterpret_cast<const int32_t*>(ids_ptr)),
-        io_w(reinterpret_cast<const float*>(w_ptr)),
-        io_y(reinterpret_cast<bf16_t*>(y_ptr)),
+        io_x0(reinterpret_cast<const bf16_t*>(x_ptr)),
+        io_ids0(reinterpret_cast<const int32_t*>(ids_ptr)),
+        io_w0(reinterpret_cast<const float*>(w_ptr)),
+        io_y0(reinterpret_cast<bf16_t*>(y_ptr)),
+        io_x(io_x0),
+        io_ids(io_ids0),
+        io_w(io_w0),
+        io_y(io_y0),
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
     if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
@@ -696,8 +710,16 @@ struct CpuMoeExecutor {
   // Start the busy-poll coordinator over the doorbell. ``pin_core`` >= 0
   // pins the coordinator to that logical CPU (the worker auto-sizing reserves it), so its
   // polling never migrates onto / contends with a GEMV worker's core.
+  void use_slot(int slot) {
+    const size_t rows = static_cast<size_t>(slot) * params.max_tokens;
+    io_x = io_x0 + rows * params.H;
+    io_ids = io_ids0 + rows * params.top_k;
+    io_w = io_w0 + rows * params.top_k;
+    io_y = io_y0 + rows * params.H;
+  }
+
   void start_flag_coordinator(int pin_core) {
-    gpu_sync = std::make_unique<GpuSync>();
+    for (auto& g : gpu_sync) g = std::make_unique<GpuSync>();
     coord_stop.store(false);
     coord_pinned = CPU_MOE_HAS_AFFINITY && pin_core >= 0;
     coord_thread = std::thread([this, pin_core] {
@@ -706,25 +728,34 @@ struct CpuMoeExecutor {
     });
   }
 
-  void flag_signal(uintptr_t stream, int layer_id, int num_tokens) {
-    gpu_sync->gpu_submit(stream, to_word(task(layer_id, num_tokens)));
+  void flag_signal(uintptr_t stream, int layer_id, int num_tokens, int slot) {
+    gpu_sync.at(slot)->gpu_submit(stream, to_word(task(layer_id, num_tokens)));
   }
-  void flag_wait(uintptr_t stream) { gpu_sync->gpu_wait(stream); }
+  void flag_wait(uintptr_t stream, int slot) { gpu_sync.at(slot)->gpu_wait(stream); }
   void enable_kernel_io() {
-    kernel_io = std::make_unique<KernelIo>(gpu_sync->ready_word(), gpu_sync->done_word(), io_x, io_ids, io_w, io_y, params.H,
-                                           params.top_k);
+    for (int s = 0; s < kSlots; ++s) {
+      const size_t rows = static_cast<size_t>(s) * params.max_tokens;
+      kernel_io[s] = std::make_unique<KernelIo>(gpu_sync[s]->ready_word(), gpu_sync[s]->done_word(), io_x0 + rows * params.H,
+                                                io_ids0 + rows * params.top_k, io_w0 + rows * params.top_k, io_y0 + rows * params.H,
+                                                params.H, params.top_k);
+    }
   }
-  void flag_publish(uintptr_t stream, uintptr_t x, uintptr_t ids, uintptr_t w, int layer_id, int num_tokens) {
-    kernel_io->publish(stream, reinterpret_cast<const void*>(x), reinterpret_cast<const int32_t*>(ids),
-                       reinterpret_cast<const float*>(w), num_tokens, to_word(task(layer_id, num_tokens)));
+  void flag_publish(uintptr_t stream, uintptr_t x, uintptr_t ids, uintptr_t w, int layer_id, int num_tokens, int slot) {
+    kernel_io.at(slot)->publish(stream, reinterpret_cast<const void*>(x), reinterpret_cast<const int32_t*>(ids),
+                                reinterpret_cast<const float*>(w), num_tokens, to_word(task(layer_id, num_tokens)));
   }
-  void flag_combine(uintptr_t stream, uintptr_t out, int num_tokens, bool accumulate) {
-    kernel_io->combine(stream, reinterpret_cast<void*>(out), num_tokens, accumulate);
+  void flag_combine(uintptr_t stream, uintptr_t out, int num_tokens, bool accumulate, int slot) {
+    kernel_io.at(slot)->combine(stream, reinterpret_cast<void*>(out), num_tokens, accumulate);
   }
-  bool flag_pending() const { return gpu_sync && gpu_sync->pending(); }
+  bool flag_pending() const {
+    for (const auto& g : gpu_sync)
+      if (g && g->pending()) return true;
+    return false;
+  }
   // Complete a doorbell the coordinator never answered so the stream can make progress.
   void poison_flag() {
-    if (gpu_sync) gpu_sync->cpu_done();
+    for (auto& g : gpu_sync)
+      if (g) g->cpu_done();
   }
 
   void coordinator_loop() {
@@ -746,8 +777,17 @@ struct CpuMoeExecutor {
     int64_t sleep_us = 100;
     bool dozing = false;
     while (!coord_stop.load(std::memory_order_relaxed)) {
-      const uint64_t word = gpu_sync->cpu_poll();
+      // the slots in turn, starting after the one served last: a slot is rung again only after its task was waited on
+      uint64_t word = 0;
+      int slot = 0;
+      for (int i = 1; i <= kSlots && word == 0; ++i) {
+        slot = (last_slot + i) % kSlots;
+        word = gpu_sync[slot]->cpu_poll();
+      }
       if (word != 0) {
+        last_slot = slot;
+        use_slot(slot);
+        if (slot != 0) slots_used = true;
         const MoeTask t = from_word(word);
         const bool spin = coord_pinned && spin_wait.load(std::memory_order_relaxed);
         retire_prefetch(spin);
@@ -759,7 +799,7 @@ struct CpuMoeExecutor {
           std::memset(io_y, 0, sizeof(bf16_t) * t.num_tokens * params.H);
         }
         // Release: the workers' y stores are visible before the GPU sees done.
-        gpu_sync->cpu_done();
+        gpu_sync[slot]->cpu_done();
         flag_served.fetch_add(1, std::memory_order_relaxed);
         if (hint) pf_inflight = submit_prefetch(static_cast<int>(t.layer) + 1);
         last_active = coord_clock::now();
@@ -777,8 +817,8 @@ struct CpuMoeExecutor {
         if ((++empty_polls & 1023u) != 0 ||
             coord_clock::now() - last_active < kHotWindow) {
 #if CPU_MOE_X86
-          if (umwait_enabled()) {
-            const auto* ready = static_cast<const int64_t*>(gpu_sync->poll_address());
+          if (umwait_enabled() && !slots_used) {
+            const auto* ready = static_cast<const int64_t*>(gpu_sync[0]->poll_address());
             umonitor_line(ready);
             if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0) umwait_c01();
             continue;
@@ -794,17 +834,19 @@ struct CpuMoeExecutor {
     }
     // Teardown: complete any in-flight wait so a replay caught mid-shutdown does not stall
     // until the watchdog fires. Runs before the destructor's join() returns, while the doorbell is still alive.
-    gpu_sync->cpu_done();
+    for (auto& g : gpu_sync) g->cpu_done();
   }
 
   // Eager (non-graph) path: run one task to completion on the pool.
   void run(int layer_id, int num_tokens) {
+    use_slot(0);
     submit(task(layer_id, num_tokens));
     sync();
   }
 
   static void CUDART_CB submit_cb(void* ud) {
     HostTask* h = reinterpret_cast<HostTask*>(ud);
+    h->exec->use_slot(0);
     h->exec->submit(h->task);
   }
   static void CUDART_CB sync_cb(void* ud) { reinterpret_cast<CpuMoeExecutor*>(ud)->sync(); }
@@ -838,14 +880,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flag_served", [](const CpuMoeExecutor& e) { return e.flag_served.load(); })
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator, py::arg("pin_core"))
       .def("flag_signal", &CpuMoeExecutor::flag_signal, py::arg("stream"), py::arg("layer_id"),
-           py::arg("num_tokens"))
-      .def("flag_wait", &CpuMoeExecutor::flag_wait, py::arg("stream"))
+           py::arg("num_tokens"), py::arg("slot") = 0)
+      .def("flag_wait", &CpuMoeExecutor::flag_wait, py::arg("stream"), py::arg("slot") = 0)
       .def("flag_pending", &CpuMoeExecutor::flag_pending)
       .def("enable_kernel_io", &CpuMoeExecutor::enable_kernel_io)
       .def("flag_publish", &CpuMoeExecutor::flag_publish, py::arg("stream"), py::arg("x"), py::arg("ids"), py::arg("w"),
-           py::arg("layer_id"), py::arg("num_tokens"))
+           py::arg("layer_id"), py::arg("num_tokens"), py::arg("slot") = 0)
       .def("flag_combine", &CpuMoeExecutor::flag_combine, py::arg("stream"), py::arg("out"), py::arg("num_tokens"),
-           py::arg("accumulate"))
+           py::arg("accumulate"), py::arg("slot") = 0)
+      .def_property_readonly_static("slots", [](py::object) { return CpuMoeExecutor::kSlots; })
       .def("poison_flag", &CpuMoeExecutor::poison_flag)
       .def("set_prefetch_hint", &CpuMoeExecutor::set_prefetch_hint, py::arg("ptr"), py::arg("mode"))
       .def("prefetch_now", &CpuMoeExecutor::prefetch_now, py::arg("layer_id"), py::call_guard<py::gil_scoped_release>())

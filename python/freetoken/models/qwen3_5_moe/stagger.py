@@ -7,15 +7,17 @@ GPU experts' GEMMs, ``C`` the CPU pool's task (submit, wait, read back), ``A`` t
 shared expert::
 
     row r stream:  D_r,k  R_r,k  G_r,k ............ A_r,k  D_r,k+1 ...
-    CPU stream:                 C_0,k  C_1,k  C_0,k+1  C_1,k+1 ...
+    CPU pool:                   C_0,k  C_1,k  C_0,k+1  C_1,k+1 ...
 
-The CPU tasks run back to back in that order, one in flight (the pool has one IO block): C_1,k is submitted once
-C_0,k has read its result back, whatever the GEMMs are doing. A row's ensure waits until the other row's last call no
-longer reads the cache's copy staging (its miss copy, or the copy engine's snapshot of the victims); the slots that
-call routes to are its most recent, so the ensure never evicts them. The expert GEMMs still run one at a time: a
-row's wait for the other row's last ones. Row 1's dense part waits for row 0's, which wrote the KV row and the GDN
-stash it reads. Each row is a one-row verify against the same KV and GDN state. Whatever moves the misses
-(``copy_missing``) runs inside G unchanged.
+The pool runs one task at a time. With a handshake slot per row (each with its own IO rows and its own stream for the
+submit, wait and read back) C_1,k is submitted as soon as R_1,k is done and the pool starts it when C_0,k finishes;
+with one slot, one stream carries both rows' handshakes and C_1,k is submitted once C_0,k has read its result back.
+Neither waits for the GEMMs. A row's ensure waits until the other row's last call no longer reads the cache's copy
+staging (its miss copy, or the copy engine's snapshot of the victims); the slots that call routes to are its most
+recent, so the ensure never evicts them. The expert GEMMs still run one at a time: a row's wait for the other row's
+last ones. Row 1's dense part waits for row 0's, which wrote the KV row and the GDN stash it reads. Each row is a
+one-row verify against the same KV and GDN state. Whatever moves the misses (``copy_missing``) runs inside G
+unchanged.
 """
 
 from __future__ import annotations
@@ -81,14 +83,16 @@ def staggered_forward(model: Qwen3_5Model, x: torch.Tensor) -> torch.Tensor:
     executor = layers[0].mlp.experts.offload_cache.cpu_executor
     rows = [row_batch(batch, r) for r in range(ROWS)]
     streams = (torch.cuda.current_stream(), _stream(x.device, "row"))
-    host = _stream(x.device, "cpu", priority=-2)
+    # one handshake slot per row lets row 1's task be submitted while row 0's runs; with one, the tasks share a stream
+    slotted = getattr(executor, "slots", 1) >= ROWS
+    hosts = tuple(_stream(x.device, f"cpu{r if slotted else 0}", priority=-2) for r in range(ROWS))
     hidden = [x[r : r + 1] for r in range(ROWS)]
     residual: list[torch.Tensor | None] = [None] * ROWS
     dense0 = torch.cuda.Event()
     routed, staged, gemm, done = ([torch.cuda.Event() for _ in range(ROWS)] for _ in range(4))
     # tensors one stream allocates and another reads stay referenced until the join
     keep = []
-    for s in (streams[1], host):
+    for s in (streams[1], *hosts):
         s.wait_stream(streams[0])
     try:
         for k, layer in enumerate(layers):
@@ -107,11 +111,11 @@ def staggered_forward(model: Qwen3_5Model, x: torch.Tensor) -> torch.Tensor:
                     routed[r].record(s)
                     gpu = experts.hybrid_gpu(h, routes, staged[r], gemm[1 - r] if k or r else None)
                     gemm[r].record(s)
-                with torch.cuda.stream(host):
-                    host.wait_event(routed[r])
-                    pending = executor.decode_submit(experts.layer_id, h, routes[0], routes[3])
+                with torch.cuda.stream(hosts[r]):
+                    hosts[r].wait_event(routed[r])
+                    pending = executor.decode_submit(experts.layer_id, h, routes[0], routes[3], slot=r if slotted else 0)
                     cpu = executor.decode_sync(pending)
-                    done[r].record(host)
+                    done[r].record(hosts[r])
                 with torch.cuda.stream(s):
                     s.wait_event(done[r])
                     hidden[r] = layer.merge(gpu.add_(cpu), dense)
