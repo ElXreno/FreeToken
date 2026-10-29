@@ -290,7 +290,7 @@ class OffloadMoELayer(MoELayer):
             topk_ids,
             views=cache.pool_bank_views(self.layer_id),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=cache.alphas_for_slots(self.layer_id, topk_ids),
             is_prefill=False,
         )
 
@@ -335,7 +335,7 @@ class OffloadMoELayer(MoELayer):
             gpu_slots,
             views=cache.pool_bank_views(self.layer_id),
             n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
+            alphas=cache.alphas_for_slots(self.layer_id, gpu_slots),
             is_prefill=False,
         )
         if not _HYBRID_OVERLAP:
