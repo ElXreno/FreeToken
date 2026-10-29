@@ -178,6 +178,7 @@ class Scheduler(SchedulerIOMixin):
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         moe_cache = getattr(self.engine, "moe_offload_cache", None)
+        self._routing_trace = getattr(moe_cache, "routing_trace", None)
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -199,6 +200,8 @@ class Scheduler(SchedulerIOMixin):
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        if self._routing_trace is not None:
+            self._routing_trace.flush(self.engine.stream)
         self.cache_manager.check_integrity()
         self.run_idle_tick()
 
@@ -396,6 +399,8 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        if self._routing_trace is not None:
+            self._routing_trace.close()
         if self.cache_manager.is_tiered:
             try:
                 stats = self.cache_manager.flush_host_meta()
@@ -413,6 +418,8 @@ class Scheduler(SchedulerIOMixin):
         batch, output = last_data[0].batch, last_data[1]
         _, next_tokens_cpu, copy_done = output[:3]
         copy_done.synchronize()
+        if self._routing_trace is not None and not batch.is_prefill:
+            self._routing_trace.tick(self.engine.stream)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         generated = None
