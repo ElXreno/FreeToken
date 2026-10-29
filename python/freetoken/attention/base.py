@@ -55,6 +55,9 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    # prepare_metadata honours Batch.verify_row (a staggered verify's row batch)
+    supports_verify_rows = False
+
     @abstractmethod
     def forward(
         self,
@@ -68,6 +71,10 @@ class BaseAttnBackend(ABC):
 
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
+
+    def prepare_verify_row(self, batch: Batch, row_batch: Batch) -> None:
+        """Metadata of ``row_batch``, one row of the verify ``batch`` (``supports_verify_rows`` backends)."""
+        raise NotImplementedError(f"{type(self).__name__} has no staggered verify rows")
 
     @abstractmethod
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
@@ -100,6 +107,7 @@ class HybridBackend(BaseAttnBackend):
     ) -> None:
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.supports_verify_rows = decode_backend.supports_verify_rows
 
     def forward(
         self,
@@ -116,6 +124,9 @@ class HybridBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.prepare_metadata(batch)
+
+    def prepare_verify_row(self, batch: Batch, row_batch: Batch) -> None:
+        self.decode_backend.prepare_verify_row(batch, row_batch)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         self.decode_backend.init_capture_graph(max_seq_len, bs_list, rows_per_req)
