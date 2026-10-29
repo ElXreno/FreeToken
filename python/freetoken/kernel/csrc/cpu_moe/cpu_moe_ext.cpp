@@ -484,6 +484,14 @@ struct CpuMoeExecutor {
       if (!dozing) {
         if ((++empty_polls & 1023u) != 0 ||
             coord_clock::now() - last_active < kHotWindow) {
+#if CPU_MOE_X86
+          if (umwait_enabled()) {
+            const auto* ready = static_cast<const int64_t*>(gpu_sync->poll_address());
+            umonitor_line(ready);
+            if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0) umwait_c01();
+            continue;
+          }
+#endif
           cpu_relax();
           continue;
         }

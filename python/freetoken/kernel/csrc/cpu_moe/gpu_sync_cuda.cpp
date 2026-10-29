@@ -155,6 +155,8 @@ uint64_t GpuSync::cpu_poll() {
   return static_cast<uint64_t>(task);
 }
 
+const void* GpuSync::poll_address() const { return const_cast<const int64_t*>(impl_->ready); }
+
 void GpuSync::cpu_done() { flag_store_release(impl_->done, 1); }
 
 bool GpuSync::pending() const { return flag_load_acquire(impl_->ready) != 0 && flag_load_acquire(impl_->done) == 0; }
