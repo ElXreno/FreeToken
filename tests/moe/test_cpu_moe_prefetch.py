@@ -130,3 +130,28 @@ def test_the_gpu_hint_names_the_best_cold_experts_and_follows_the_graph():
     graph.replay()
     torch.cuda.synchronize()
     assert hint[1, :5].tolist() == [42, 3, 0, 1, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_hint_takes_the_best_cold_experts_of_the_top_n_walk_with_ties():
+    """Against the walk it replaces: visit the top ``topn`` experts by score (ties to the lower id), keep the cold ones."""
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    from freetoken.moe.cpu_prefetch_hint import write_cpu_prefetch_hint
+
+    g = torch.Generator().manual_seed(7)
+    experts = 64
+    for case in range(200):
+        score = (torch.randint(0, 12, (experts,), generator=g).float() / 4).to(torch.bfloat16 if case % 2 else torch.float32)
+        slot_for_id = torch.where(torch.rand(1, experts, generator=g) < 0.5, 0, -1).to(torch.int32)
+        topn = int(torch.randint(1, 20, (), generator=g))
+        max_n = int(torch.randint(1, 7, (), generator=g))
+        order = sorted(range(experts), key=lambda e: (-float(score[e]), e))[:topn]
+        want = [e for e in order if slot_for_id[0, e] == -1][:max_n]
+        hint = alloc_pinned_tensor(1, 34, dtype=torch.int32)
+        hint.fill_(-1)
+        cache = SimpleNamespace(num_layers=1, num_experts=experts, slot_for_id=slot_for_id.cuda(),
+                                step=torch.tensor([5], dtype=torch.int64, device="cuda"),
+                                cpu_executor=SimpleNamespace(prefetch_hint=hint))
+        write_cpu_prefetch_hint(cache, 0, score.cuda(), max_n=max_n, topn=topn)
+        torch.cuda.synchronize()
+        assert hint[0, 1].item() == len(want) and hint[0, 2:2 + len(want)].tolist() == want, (case, topn, max_n)

@@ -140,3 +140,15 @@ def test_early_mode_installs_low_priority_slots_and_waits_before_the_demand_copy
         s = _resident(cache, 1, e)
         assert _rows_match(cache, 1, e), e
         assert int(usage[s]) == 0, (e, int(usage[s]))
+
+
+@cuda
+def test_a_single_row_scores_by_its_logits_and_rows_by_their_summed_softmax():
+    cache, pf = _setup()
+    one = torch.randn(1, D, dtype=torch.bfloat16, device="cuda")
+    pf.score(0, one)
+    torch.testing.assert_close(pf.scores[0], torch.nn.functional.linear(one, pf.predictors[0])[0], rtol=0, atol=0)
+    two = torch.randn(2, D, dtype=torch.bfloat16, device="cuda")
+    pf.score(0, two)
+    want = torch.softmax(torch.nn.functional.linear(two, pf.predictors[0]).float(), dim=-1).sum(0)
+    torch.testing.assert_close(pf.scores[0], want)
