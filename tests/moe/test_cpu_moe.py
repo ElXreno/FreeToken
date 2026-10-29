@@ -11,6 +11,7 @@ routing, i.e. the dependency flows through the pinned buffers, not baked-in).
 
 from __future__ import annotations
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -803,3 +804,50 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+def test_cpu_moe_profile_records_each_task_and_leaves_its_output():
+    """With the profile on, each task gets a record of its routes, its ids and every worker's phase times and items;
+    the output stays bitwise the unprofiled one."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(5)
+    L, E, H, I, top_k, bs, threads = 2, 6, 256, 128, 3, 2, 3
+    cache = _make_cache(L, E, H, I)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=threads,
+                        max_tokens=bs, device=torch.device("cpu"))
+    ids = torch.tensor([[0, -1, 4], [4, 2, -1]], dtype=torch.int32)
+    ex._io["x"][:bs].copy_(torch.randn(bs, H))
+    ex._io["ids"][:bs].copy_(ids)
+    ex._io["w"][:bs].copy_(torch.rand(bs, top_k))
+    ex._ext.run(1, bs)
+    want = ex._io["y"][:bs].clone()
+    ex._io["y"].zero_()
+    ex._ext.profile_start(4)
+    ex._ext.run(1, bs)
+    ex._ext.run(0, 1)
+    got = ex._ext.profile_take()
+    assert ex._ext.profile_take().shape[0] == 0
+    task, nids, thread, nthreads = ex._ext.profile_layout()
+    assert nids == bs * top_k and nthreads == threads
+    assert got.shape == (2, len(task) + nids + len(thread) * threads)
+    rec = {name: got[:, i] for i, name in enumerate(task)}
+    assert rec["layer"].tolist() == [1, 0] and rec["tokens"].tolist() == [2, 1]
+    assert rec["routes"].tolist() == [4, 2] and rec["distinct"].tolist() == [3, 2]
+    assert got[0, len(task):len(task) + nids].tolist() == ids.flatten().tolist()
+    assert got[1, len(task):len(task) + nids].tolist() == [0, -1, 4, -1, -1, -1]
+    assert (rec["ring"] <= rec["retired"]).all() and (rec["retired"] <= rec["submitted"]).all()
+    assert (rec["submitted"] <= rec["synced"]).all() and (rec["synced"] <= rec["answered"]).all()
+    per = got[:, len(task) + nids:].view(2, threads, len(thread))
+    th = {name: per[..., i] for i, name in enumerate(thread)}
+    order = ["wake", "pass1_end", "barrier1", "prep_end", "barrier2", "pass2_end"]
+    for a, b in itertools.pairwise(order):
+        assert (th[a] <= th[b]).all(), (a, b)
+    assert (th["wake"] >= rec["retired"][:, None]).all() and (th["pass2_end"] <= rec["synced"][:, None]).all()
+    n_iblk, n_hblk = I // 32, H // 32
+    assert th["pass1_items"].sum(1).tolist() == [4 * n_iblk, 2 * n_iblk]
+    assert th["pass2_items"].sum(1).tolist() == [2 * n_hblk, n_hblk]
+    assert (th["pass1_busy"] > 0).any() and (th["pass2_busy"] > 0).any()
+    ex._io["ids"][:bs].copy_(ids)
+    ex._ext.run(1, bs)
+    assert torch.equal(ex._io["y"][:bs], want)

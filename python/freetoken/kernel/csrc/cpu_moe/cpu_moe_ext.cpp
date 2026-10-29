@@ -196,6 +196,14 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> pf_tasks{0}, pf_bytes{0}, pf_aborted{0};
   std::atomic<uint64_t> pf_sink{0};
 
+  // per-task phase profile, field layout in profile_layout()
+  static constexpr int kProfTask = 10, kProfThread = 10;
+  std::vector<int64_t> prof;
+  int64_t prof_cap = 0;
+  std::atomic<int64_t> prof_n{0};
+  int64_t prof_cur = -1;
+  std::atomic<bool> prof_on{false};
+
   // copy-engine demand copy into GPU slots, see moe/demand_copy.py
   std::atomic<const int32_t*> ce_rows{nullptr};  // [rows][width]: seq, layer, n, 0, slots, experts, gens
   int ce_nrows = 0;
@@ -317,19 +325,20 @@ struct CpuMoeExecutor {
   }
 
   // Pass 1 item p = one rb-row block of one (token, route)'s intermediate row.
-  void do_pass1(const MoeTask& t, int64_t p) {
+  bool do_pass1(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t ib = p % n_iblk;
     const int64_t tk = p / n_iblk;
     const int k = static_cast<int>(tk % top_k);
     const int tok = static_cast<int>(tk / top_k);
     const int e = io_ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    if (e < 0 || e >= num_experts) return false;
     const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     const int i0 = static_cast<int>(ib) * rb;
     const int i1 = std::min(I, i0 + rb);
     format_of(t).gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
                          g_scratch.data() + ((size_t)tok * top_k + k) * I);
+    return true;
   }
 
   // Pass 2 item p = one rb-row block of one token's output row, summed over its routes.
@@ -587,18 +596,80 @@ struct CpuMoeExecutor {
     if (ce_stream != nullptr) cudaStreamSynchronize(ce_stream);
   }
 
-  void run_task_body(const MoeTask& t) {
+  static int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  int prof_task_fields() const { return kProfTask + params.max_tokens * params.top_k; }
+  int prof_stride() const { return prof_task_fields() + kProfThread * num_threads; }
+
+  // -1 when the profile is off or full
+  int64_t prof_begin(const MoeTask& t, int slot, int64_t ring, int64_t retired) {
+    const int64_t i = prof_n.load(std::memory_order_relaxed);
+    if (!prof_on.load(std::memory_order_relaxed) || i >= prof_cap) return -1;
+    int64_t* r = prof.data() + i * prof_stride();
+    std::fill(r, r + prof_stride(), 0);
+    const int n = static_cast<int>(t.num_tokens) * params.top_k;
+    int routes = 0, distinct = 0;
+    for (int j = 0; j < params.max_tokens * params.top_k; ++j) {
+      const int e = j < n ? io_ids[j] : -1;
+      r[kProfTask + j] = e;
+      if (e < 0 || e >= num_experts) continue;
+      ++routes;
+      distinct += std::find(io_ids, io_ids + j, e) == io_ids + j;
+    }
+    r[0] = ring;
+    r[1] = retired;
+    r[5] = t.layer;
+    r[6] = t.num_tokens;
+    r[7] = slot;
+    r[8] = routes;
+    r[9] = distinct;
+    return i;
+  }
+
+  void prof_mark(int field) {
+    if (prof_cur >= 0) prof[prof_cur * prof_stride() + field] = now_ns();
+  }
+
+  void prof_end() {
+    if (prof_cur < 0) return;
+    prof_mark(4);
+    prof_n.store(prof_cur + 1, std::memory_order_release);
+    prof_cur = -1;
+  }
+
+  void run_routed(const MoeTask& t, int slot, int64_t ring, bool spin) {
+    prof_cur = prof_begin(t, slot, ring, ring != 0 ? now_ns() : 0);
+    submit(t);
+    prof_mark(2);
+    sync(spin);
+    prof_mark(3);
+  }
+
+  void run_task_body(const MoeTask& t, int tid) {
     if (cur_prefetch) {
       do_prefetch();
       return;
     }
+    int64_t* tp = prof_cur >= 0 ? prof.data() + prof_cur * prof_stride() + prof_task_fields() + kProfThread * tid : nullptr;
+    if (tp) tp[0] = now_ns();
     int local_sense = 0;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
-      do_pass1(t, p);
+      if (tp) {
+        const int64_t a = now_ns();
+        if (do_pass1(t, p)) {
+          tp[6] += now_ns() - a;
+          ++tp[8];
+        }
+      } else {
+        do_pass1(t, p);
+      }
     }
+    if (tp) tp[1] = now_ns();
     barrier(local_sense);
+    if (tp) tp[2] = now_ns();
     // Prepare the intermediate rows (per token,route) for the down GEMV, see prep_inter.
     // Needs all of pass1 done (a full row spans every iblk).
     if (prt_total > 0) {
@@ -608,13 +679,25 @@ struct CpuMoeExecutor {
         if (r >= prt_total) break;
         f.prep_inter(r, g_scratch.data() + (size_t)r * params.I);
       }
+      if (tp) tp[3] = now_ns();
       barrier(local_sense);
+    } else if (tp) {
+      tp[3] = tp[2];
     }
+    if (tp) tp[4] = now_ns();
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p2_total) break;
-      do_pass2(t, p);
+      if (tp) {
+        const int64_t a = now_ns();
+        do_pass2(t, p);
+        tp[7] += now_ns() - a;
+        ++tp[9];
+      } else {
+        do_pass2(t, p);
+      }
     }
+    if (tp) tp[5] = now_ns();
   }
 
   // Tasks arrive once per MoE layer, sub-ms apart. Spinning skips a futex wakeup per worker per layer; parking after kSpinWindow keeps an idle server off the CPU.
@@ -642,7 +725,7 @@ struct CpuMoeExecutor {
       }
       // submit() writes cur_task before the release store to `submitted`.
       my_gen = gen;
-      run_task_body(cur_task);
+      run_task_body(cur_task, tid);
       last_active = wclk::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
@@ -785,6 +868,7 @@ struct CpuMoeExecutor {
         word = gpu_sync[slot]->cpu_poll();
       }
       if (word != 0) {
+        const int64_t ring = prof_on.load(std::memory_order_relaxed) ? now_ns() : 0;
         due_slot = slot != last_slot ? (slot + 1) % kSlots : slot;
         last_slot = slot;
         use_slot(slot);
@@ -792,14 +876,14 @@ struct CpuMoeExecutor {
         const bool spin = coord_pinned && spin_wait.load(std::memory_order_relaxed);
         retire_prefetch(spin);
         if (has_routes(t)) {
-          submit(t);
-          sync(coord_pinned && spin_wait.load(std::memory_order_relaxed));
+          run_routed(t, slot, ring, spin);
         } else {
           // What the pool would write for a task without routes, minus its fork and join.
           std::memset(io_y, 0, sizeof(bf16_t) * t.num_tokens * params.H);
         }
         // Release: the workers' y stores are visible before the GPU sees done.
         gpu_sync[slot]->cpu_done();
+        prof_end();
         flag_served.fetch_add(1, std::memory_order_relaxed);
         if (hint) pf_inflight = submit_prefetch(static_cast<int>(t.layer) + 1);
         last_active = coord_clock::now();
@@ -843,8 +927,31 @@ struct CpuMoeExecutor {
   // Eager (non-graph) path: run one task to completion on the pool.
   void run(int layer_id, int num_tokens) {
     use_slot(0);
-    submit(task(layer_id, num_tokens));
-    sync();
+    const MoeTask t = task(layer_id, num_tokens);
+    if (!prof_on.load(std::memory_order_relaxed)) {
+      submit(t);
+      sync();
+      return;
+    }
+    run_routed(t, 0, now_ns(), false);
+    prof_end();
+  }
+
+  // records for up to `cap` tasks from now on; call while no task runs
+  void profile_start(int64_t cap) {
+    prof.assign(static_cast<size_t>(cap) * prof_stride(), 0);
+    prof_cap = cap;
+    prof_n.store(0);
+    prof_on.store(cap > 0);
+  }
+
+  // the records so far as [n, stride] int64, then empties the profile; call while no task runs
+  torch::Tensor profile_take() {
+    const int64_t n = prof_n.load(std::memory_order_acquire);
+    torch::Tensor out = torch::empty({n, prof_stride()}, torch::kInt64);
+    std::memcpy(out.data_ptr<int64_t>(), prof.data(), sizeof(int64_t) * n * prof_stride());
+    prof_n.store(0);
+    return out;
   }
 
   static void CUDART_CB submit_cb(void* ud) {
@@ -900,6 +1007,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              return py::make_tuple(e.pf_tasks.load(), e.pf_bytes.load(), e.pf_aborted.load());
            })
       .def_property_readonly_static("prefetch_hint_width", [](py::object) { return 2 + CpuMoeExecutor::kMaxHint; })
+      .def("profile_start", &CpuMoeExecutor::profile_start, py::arg("cap"))
+      .def("profile_take", &CpuMoeExecutor::profile_take)
+      .def("profile_layout",
+           [](const CpuMoeExecutor& e) {
+             return py::make_tuple(
+                 py::make_tuple("ring", "retired", "submitted", "synced", "answered", "layer", "tokens", "slot", "routes", "distinct"),
+                 e.params.max_tokens * e.params.top_k,
+                 py::make_tuple("wake", "pass1_end", "barrier1", "prep_end", "barrier2", "pass2_end", "pass1_busy", "pass2_busy",
+                                "pass1_items", "pass2_items"),
+                 e.num_threads);
+           })
       .def("ce_setup", &CpuMoeExecutor::ce_setup, py::arg("rows"), py::arg("width"), py::arg("maxb"), py::arg("ready"),
            py::arg("ack"), py::arg("src"), py::arg("dst"), py::arg("feat"), py::arg("pool_of_layer"), py::arg("layer_layout"),
            py::arg("pool_base"), py::arg("device"))
