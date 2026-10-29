@@ -263,6 +263,8 @@ uint64_t GpuSync::cpu_poll() {
   return static_cast<uint64_t>(task);
 }
 
+const void* GpuSync::poll_address() const { return impl_->ready; }
+
 void GpuSync::cpu_done() { flag_store_release(as_flag(impl_->done), 1); }
 
 bool GpuSync::pending() const {
