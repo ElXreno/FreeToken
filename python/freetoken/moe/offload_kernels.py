@@ -61,6 +61,11 @@ class HybridRoutes(NamedTuple):
     cpu_ids: torch.Tensor  # expert ids, -1 for a GPU route
 
 
+def _frac_q16(fetch_fraction: float) -> int:
+    """Q16 fixed point of the fetch share; a share above 0 keeps at least one unit, so it never reads as the fixed cap."""
+    return min(1 << 16, max(int(fetch_fraction > 0), round(fetch_fraction * (1 << 16))))
+
+
 def ensure_experts_hybrid(
     cache,
     layer_id: int,
@@ -87,7 +92,7 @@ def ensure_experts_hybrid(
     ``fetch_cap`` bounds the fetch count after ``max_fetch`` / ``fetch_fraction`` (a fixed-size staging buffer)."""
     assert expert_ids.is_cuda, "the hybrid ensure kernel runs on the GPU"
     # Q16 fixed point: the kernel caps in integers.
-    frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
+    frac_q16 = _frac_q16(fetch_fraction)
     weights = weights.contiguous()
     routes = HybridRoutes(expert_ids, torch.empty_like(weights), torch.empty_like(expert_ids))
     cap = cache.num_experts if fetch_cap is None else fetch_cap
