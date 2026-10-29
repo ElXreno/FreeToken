@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 import math
 from dataclasses import dataclass
 from functools import cached_property
@@ -82,6 +84,8 @@ class FIMetadata(BaseAttnMetadata):
 
 
 class FlashInferBackend(BaseAttnBackend):
+    supports_verify_rows = True
+
     def __init__(self, config: ModelConfig) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
@@ -178,6 +182,9 @@ class FlashInferBackend(BaseAttnBackend):
         ] = {}
         self.capture: FICaptureData | None = None
         self.capture_rows_per_req = 1
+        # (graph bs or None, verify row) -> a staggered verify row's wrapper, with its own plan event
+        self.row_wrappers: Dict[tuple[int | None, int], BatchPrefillWithPagedKVCacheWrapper] = {}
+        self._plan_events: Dict[int, torch.cuda.Event] = {}
         self.last_event = torch.cuda.Event()
         self.last_event.record()
         self._plan_wait_ns = 0
@@ -192,8 +199,9 @@ class FlashInferBackend(BaseAttnBackend):
         metadata.initialized = True
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
+        event = self._plan_events.get(id(metadata.wrapper), self.last_event)
         _t0 = perf_counter_ns()
-        self.last_event.synchronize()
+        event.synchronize()
         self._plan_wait_ns += perf_counter_ns() - _t0
         self._plan_waits += 1
         if self._plan_waits % 2000 == 0:
@@ -236,7 +244,7 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
                 causal=True,
             )
-        self.last_event.record()
+        event.record()
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
@@ -281,13 +289,59 @@ class FlashInferBackend(BaseAttnBackend):
         k_scale, v_scale = scales
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache, k_scale=k_scale, v_scale=v_scale)
 
-    def prepare_metadata(self, batch: Batch) -> None:
+    def _row_wrapper(self, row: int, graph_bs: int | None) -> BatchPrefillWithPagedKVCacheWrapper:
+        """A staggered verify row's own wrapper, eager or for the graph of ``graph_bs``: both rows' plans live in one
+        forward, so each keeps its own int workspace (and, under a graph, its own indptr and indices)."""
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        key = (graph_bs, row)
+        wrapper = self.row_wrappers.get(key)
+        if wrapper is not None:
+            return wrapper
+        if graph_bs is None:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(self.float_workspace_buffer, kv_layout="NHD", backend="fa2")
+        else:
+            assert self.capture is not None
+            i32 = {"dtype": torch.int32, "device": self.device}
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                backend="fa2",
+                use_cuda_graph=True,
+                qo_indptr_buf=torch.arange(graph_bs + 1, **i32),
+                paged_kv_indptr_buf=torch.zeros(graph_bs + 1, **i32),
+                paged_kv_indices_buf=torch.zeros_like(self.capture.indices),
+                paged_kv_last_page_len_buf=torch.ones(graph_bs, **i32),
+            )
+        self.row_wrappers[key] = wrapper
+        self._plan_events[id(wrapper)] = torch.cuda.Event()
+        return wrapper
+
+    def prepare_verify_row(self, batch: Batch, row_batch: Batch) -> None:
+        """Metadata of ``row_batch``, row ``row_batch.verify_row`` of the verify ``batch``; under ``batch``'s graph,
+        planned for the capture and re-planned by ``prepare_for_replay``."""
+        bs = batch.padded_size
+        parent = getattr(batch, "attn_metadata", None)
+        graph = isinstance(parent, FIMetadata) and parent.wrapper is self.graph_wrappers.get(bs)
+        wrapper = self._row_wrapper(row_batch.verify_row, bs if graph else None)
+        if graph and torch.cuda.is_current_stream_capturing():
+            # the warmup forward before the capture planned it, each replay plans it again
+            row_batch.attn_metadata = dataclasses.replace(parent, wrapper=wrapper, initialized=True)
+            return
+        self.prepare_metadata(row_batch, wrapper)
+
+    def prepare_metadata(self, batch: Batch, wrapper=None) -> None:
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
+        row = batch.verify_row
+        if row is not None:
+            # row ``row`` of each request sees its prefix and the rows up to its own
+            seqlens_q = [1] * padded_size
+            seqlens_k = [c + row + 1 for c in cached_lens]
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
@@ -319,11 +373,13 @@ class FlashInferBackend(BaseAttnBackend):
                 ]
 
         page_table = get_global_ctx().page_table
+        if wrapper is None:
+            wrapper = self._row_wrapper(row, None) if row is not None else self.decode_wrappers if batch.is_decode else self.prefill_wrapper
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
+            indices=torch.cat([page_table[req.table_idx, :n] for req, n in zip(reqs, seqlens_k, strict=True)]),
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
@@ -333,7 +389,7 @@ class FlashInferBackend(BaseAttnBackend):
             seq_lens_cpu=seq_len_cpu,
             dtype=self.q_dtype,
             kv_dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            wrapper=wrapper,
             blocked=blocked,
         )
 
@@ -343,6 +399,8 @@ class FlashInferBackend(BaseAttnBackend):
         # long-lived workspace buffers. Lets init_capture_graph re-run after a cache rebuild.
         super().reset_capture()
         self.graph_wrappers = {}
+        for key in [key for key in self.row_wrappers if key[0] is not None]:
+            self._plan_events.pop(id(self.row_wrappers.pop(key)), None)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -407,5 +465,15 @@ class FlashInferBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs
+        if (bs, 0) in self.row_wrappers:
+            # a staggered graph reads its rows' wrappers only
+            row = 0
+            while (wrapper := self.row_wrappers.get((bs, row))) is not None:
+                rb = copy.copy(batch)
+                rb.verify_row, rb.rows_per_req = row, 1
+                self.prepare_metadata(rb, wrapper)
+                self._initialize_metadata_once(rb.attn_metadata)
+                row += 1
+            return
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)
