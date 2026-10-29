@@ -808,7 +808,8 @@ class OffloadMoeCache:
         """Side stream of the hybrid split GEMM, one per cache."""
         stream = getattr(self, "_split_gemm_stream", None)
         if stream is None:
-            stream = self._split_gemm_stream = torch.cuda.Stream(device=self.device)
+            priority = int(os.environ.get("FREETOKEN_HYBRID_SPLIT_PRIORITY", "0"))
+            stream = self._split_gemm_stream = torch.cuda.Stream(device=self.device, priority=priority)
         return stream
 
     def is_cpu_layer(self, layer_id: int) -> bool:
