@@ -12,7 +12,9 @@ so it captures into the decode CUDA graph like the rest of the offload path.
 ``FREETOKEN_EXPERT_PREFETCH=<budget>`` enables it (0 or unset: off), ``FREETOKEN_EXPERT_PREFETCH_TOPN`` sets how
 many predicted experts are considered (default 16), ``FREETOKEN_EXPERT_PREFETCH_WEIGHTS=<file>`` loads trained
 predictor weights (``torch.save`` of ``{"W": [num_layers - 1, hidden, experts]}``) instead of the routers,
-``FREETOKEN_EXPERT_PREFETCH_BLOCKS`` sets the copy kernel's blocks per bank (default: the demand copy's).
+``FREETOKEN_EXPERT_PREFETCH_BLOCKS`` sets the copy kernel's blocks per bank (default: the demand copy's),
+``FREETOKEN_EXPERT_PREFETCH_PRIORITY`` the copy stream's priority (default -3, the highest: equal-priority grids
+dispatch in launch order, so a default-priority copy would queue behind the mixer it is meant to overlap).
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ class ExpertPrefetch:
         self.predictors = predictors
         self.blocks = int(os.environ.get("FREETOKEN_EXPERT_PREFETCH_BLOCKS", "0") or 0)
         L, device = cache.num_layers, cache.device
-        self.stream = torch.cuda.Stream(device=device)
+        self.stream = torch.cuda.Stream(device=device, priority=int(os.environ.get("FREETOKEN_EXPERT_PREFETCH_PRIORITY", "-3")))
         self.done = [torch.cuda.Event() for _ in range(L)]
         self.pending = [False] * L
         self.scores: list[torch.Tensor | None] = [None] * L
