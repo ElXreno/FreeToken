@@ -93,7 +93,7 @@ class TieredHybridRadixCache(HybridRadixCache):
                 break
         if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn, tic)
-            new_node.set_key_value(ids[prefix_len:], kv[prefix_len:].clone())
+            new_node.set_key_value(ids[prefix_len:].clone(), kv[prefix_len:].clone())
             new_node.set_parent(node)
             self.full_evictable += new_node.length
             node = new_node
