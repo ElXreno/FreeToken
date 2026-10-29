@@ -14,6 +14,7 @@ def test_kv_usage_pages_excludes_evictable_prefix_cache():
         num_pages=100,
         page_size=4,
         free_slots=[0] * 20,
+        lent_pages=0,
         is_hybrid=False,
         is_swa=False,
         prefix_cache=SimpleNamespace(
