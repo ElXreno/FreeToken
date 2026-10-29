@@ -111,5 +111,18 @@ class Qwen3_5MoE(BaseOP):
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
+    def dense(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The block's part before the routed experts, in order on the current stream: (router logits, shared expert, its gate)."""
+        router_logits = self.gate.forward(hidden_states)
+        shared = self.shared_expert.forward(hidden_states)
+        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+        return router_logits, shared, gate
+
+    def routed(self, hidden_states: torch.Tensor, dense: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """The routed experts over ``dense``'s router logits, merged with its shared expert: ``forward`` = ``routed(x, dense(x))``."""
+        router_logits, shared, gate = dense
+        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        return shared_gate_mul_add(routed, shared, gate)
+
 
 __all__ = ["Qwen3_5MoE", "Qwen3_5DenseMLP"]
