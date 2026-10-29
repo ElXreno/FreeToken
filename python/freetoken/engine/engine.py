@@ -724,6 +724,7 @@ class Engine:
                 self.device,
                 include_moe_experts=not getattr(config.model_config, "is_moe", False),
                 include_vision=bool(config.active_encoders),
+                include_mtp=config.model_config.mtp_draft,
             ),
             device=self.device,
             host_keys=host_keys,

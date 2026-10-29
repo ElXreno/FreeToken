@@ -22,13 +22,6 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
-class _SkipProjection:
-    """Stands in for the vocabulary projection when pricing it (``--mtp-skip-projection``)."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x[:, :8]
-
-
 class _HeadExpertQuant:
     """Quant config view binding the head's experts to the model's routed-expert scheme.
 
@@ -186,64 +179,18 @@ class Qwen3_5MTPHead(BaseOP):
         self._fill = torch.zeros(num_slots, device=device, dtype=torch.int32)
         self._written = torch.zeros(num_slots, device=device, dtype=torch.int32)
         self._pred = torch.zeros(num_slots, device=device, dtype=torch.int32)
-        self._has_pred = torch.zeros(num_slots, device=device, dtype=torch.bool)
-        self._hits = torch.zeros((), device=device, dtype=torch.int64)
-        self._scored = torch.zeros((), device=device, dtype=torch.int64)
 
     def reset_slots(self, slots: torch.Tensor) -> None:
         self._fill.index_fill_(0, slots, 0)
         self._written.index_fill_(0, slots, 0)
-        self._has_pred.index_fill_(0, slots, False)
-
-    def score(self, slots: torch.Tensor, actual: torch.Tensor) -> None:
-        """Charge last step's drafts against the tokens the model actually sampled."""
-        live = self._has_pred.index_select(0, slots)
-        self._hits += ((self._pred.index_select(0, slots) == actual) & live).sum()
-        self._scored += live.sum()
 
     def remember(self, slots: torch.Tensor, pred: torch.Tensor) -> None:
-        # index_copy_/index_fill_ keep this capturable: `self._has_pred[slots] = True` would
-        # stage the python bool through an unpinned CPU tensor, which capture refuses.
+        # index_copy_ keeps this capturable
         self._pred.index_copy_(0, slots, pred.to(self._pred.dtype))
-        self._has_pred.index_fill_(0, slots, True)
 
-    def acceptance(self) -> tuple[int, int]:
-        return int(self._hits.item()), int(self._scored.item())
-
-    def clear_counters(self) -> None:
-        self._hits.zero_()
-        self._scored.zero_()
-
-    def draft_and_score(
-        self,
-        hidden: torch.Tensor,
-        next_ids: torch.Tensor,
-        positions: torch.Tensor,
-        slots: torch.Tensor,
-        embed_tokens,
-        lm_head,
-    ) -> None:
-        """One step of bookkeeping and drafting, reading and writing only the head's own state.
-
-        Every tensor it touches is persistent, so the whole thing captures into a CUDA graph and
-        replays as a single launch off the engine's critical path.
-        """
-        self.score(slots, next_ids)
-        logits = self.forward(hidden, next_ids, positions, slots, embed_tokens, lm_head)
-        self.remember(slots, logits.argmax(dim=-1))
-
-    def draft_probe(
-        self,
-        hidden: torch.Tensor,
-        next_ids: torch.Tensor,
-        positions: torch.Tensor,
-        slots: torch.Tensor,
-        embed_tokens,
-    ) -> None:
-        """Everything but the vocabulary projection, to price that projection under contention."""
-        self.score(slots, next_ids)
-        x = self.forward(hidden, next_ids, positions, slots, embed_tokens, _SkipProjection())
-        self.remember(slots, x.argmax(dim=-1))
+    def drafts(self, slots: torch.Tensor) -> torch.Tensor:
+        """The last draft remembered for each of ``slots``."""
+        return self._pred.index_select(0, slots)
 
     @property
     def num_slots(self) -> int:
@@ -302,7 +249,7 @@ class Qwen3_5MTPHead(BaseOP):
         x = layer.mlp.forward(layer.post_attention_layernorm.forward(x)) + residual
         if self._ablate is not None:
             x = self._ablate.cut_(x)
-        return lm_head.forward(self.norm.forward(x))
+        return lm_head.logits(self.norm.forward(x))
 
 
 __all__ = ["Qwen3_5MTPHead", "Qwen3_5MTPLayer"]
