@@ -20,6 +20,7 @@ from freetoken.utils import nvtx_annotate
 from .ablate import DirectionAblation
 from .attention import Qwen3_5Attention
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
+from .stagger import can_stagger, staggered_forward
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -119,6 +120,27 @@ class Qwen3_5DecoderLayer(BaseOP):
         hidden = self.mlp.forward(hidden)
         return self._writer_cut.cut_(hidden), residual
 
+    @property
+    def splits_at_experts(self) -> bool:
+        """Whether ``dense`` + ``routed`` compute ``forward``: the routed MoE block without the unrolled ablation."""
+        return self._ablate is None and isinstance(self.mlp, Qwen3_5MoE)
+
+    @nvtx_annotate("Dense_{}", layer_id_field="_layer_id")
+    def dense(self, hidden: torch.Tensor, residual: torch.Tensor | None):
+        """``forward`` up to the routed experts: (MLP input, residual, the MLP's dense part for ``routed``)."""
+        hidden, residual = self.input_layernorm.forward(hidden, residual)
+        hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        if self._writer_cut is not None:
+            self._writer_cut.cut_(hidden)
+        hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
+        return hidden, residual, self.mlp.dense(hidden)
+
+    @nvtx_annotate("Routed_{}", layer_id_field="_layer_id")
+    def routed(self, hidden: torch.Tensor, dense) -> torch.Tensor:
+        """The rest of ``forward``: the routed experts on ``dense``'s output; with the residual it returned, the layer output."""
+        hidden = self.mlp.routed(hidden, dense)
+        return self._writer_cut.cut_(hidden) if self._writer_cut is not None else hidden
+
 
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
@@ -147,6 +169,8 @@ class Qwen3_5Model(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         batch = get_global_ctx().batch
         x = embed_input_ids(self.embed_tokens, input_ids, batch)
+        if can_stagger(batch, self.layers.op_list):
+            return staggered_forward(self, x)
         residual: torch.Tensor | None = None
         features = batch.features
         wanted = features.wanted_layers if features is not None else ()

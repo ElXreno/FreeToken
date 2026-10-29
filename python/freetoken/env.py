@@ -82,6 +82,7 @@ class EnvClassSingleton:
     KPROF_SKIP = EnvInt(20)
     KPROF_OUT = EnvStr(".")
     B12X_CACHE = EnvStr("")  # b12x compile objects: "" = $XDG_CACHE_HOME/freetoken/b12x, "off" = memory only
+    STAGGER = EnvBool(False)  # bs=1 MTP verify: row 1 half a layer behind row 0 on its own stream
 
     def __new__(cls):
         # single instance
