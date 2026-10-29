@@ -109,6 +109,8 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # with moe_hybrid_max_fetch -1: one PCIe fetch share for every MoE layer instead of the benched ratio (-1)
+    moe_hybrid_fetch_fraction: float = -1.0
     # Hybrid with locked layers (banks the pin quota could not take, OS-locked instead): a locked layer keeps GPU
     # slots of its own pools and fetches this share of each decode step's misses through pinned staging; the rest
     # are computed on the CPU. -1 (default) = auto: per layer from its `ft bench bw` row (bench_profile.locked_fetch_fraction),

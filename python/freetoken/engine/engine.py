@@ -1043,6 +1043,18 @@ class Engine:
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
+        if config.moe_hybrid_fetch_fraction >= 0:
+            share = min(1.0, config.moe_hybrid_fetch_fraction)
+            if share == 0:
+                cache.hybrid_max_fetch = 0  # a zero share would read as "no share, fixed cap"
+                return
+            cache.hybrid_max_fetch = 1
+            cache.hybrid_fetch_fraction = [share] * config.model_config.num_moe_layers
+            logger.info_rank0(
+                f"--moe-hybrid-fetch-fraction: each decode step fetches {share:.1%} of a layer's expert misses "
+                "over PCIe and computes the rest on the CPU"
+            )
+            return
         from freetoken.moe.bench_profile import fetch_fraction
 
         cache.hybrid_max_fetch = 1
@@ -1825,6 +1837,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_hybrid_fetch_fraction": -1.0,
     "moe_locked_fetch": -1.0,
     "moe_locked_max_fetch": 8,
     "moe_prefill_overlap": True,

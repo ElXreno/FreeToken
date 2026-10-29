@@ -61,3 +61,37 @@ def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
     # this card's own file wins over the legacy one
     write(default_profile_path(uuid), "FAKE GPU", "card")
     assert load_layer_kinds(gpu_name="FAKE GPU", gpu_uuid=uuid) == {"k": "card"}
+
+
+def _resolve(flag, layers=4):
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import Engine
+
+    config = SimpleNamespace(
+        moe_hybrid_max_fetch=-1,
+        moe_hybrid_fetch_fraction=flag,
+        model_config=SimpleNamespace(num_moe_layers=layers),
+    )
+    cache = SimpleNamespace(hybrid_max_fetch=1, hybrid_fetch_fraction=None)
+    Engine._resolve_hybrid_fetch(SimpleNamespace(), config, cache)
+    return cache.hybrid_max_fetch, cache.hybrid_fetch_fraction
+
+
+def test_fetch_fraction_flag_sets_every_layer():
+    assert _resolve(0.1) == (1, [0.1] * 4)
+    assert _resolve(1.5, layers=2) == (1, [1.0, 1.0])
+
+
+def test_zero_fetch_fraction_fetches_nothing():
+    # zero means no fetches at all, not the fraction-off fixed cap
+    assert _resolve(0.0) == (0, None)
+
+
+def test_tiny_fraction_does_not_turn_into_the_fixed_cap():
+    from freetoken.moe.offload_kernels import _frac_q16
+
+    assert _frac_q16(0.0) == 0
+    assert _frac_q16(1e-9) == 1
+    assert _frac_q16(0.5) == 1 << 15
+    assert _frac_q16(2.0) == 1 << 16
