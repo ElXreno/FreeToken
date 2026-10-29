@@ -103,6 +103,9 @@ _BANK_BYTES_PER_EXPERT = {
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
 
+# usage of a borrowed slot KV holds: never an LRU victim, fits flashlib's (usage << slot_bits) keys
+UNAVAILABLE = 1 << 48
+
 
 def placeholder_bank(num_experts: int) -> torch.Tensor:
     """The source of a bank whose role a layer's expert kernel does not read (experts of several formats): zero bytes per row."""
@@ -204,6 +207,9 @@ class OffloadMoeCache:
         # _pad_bytes[g][k]: zeroed bytes after the last row of every pool and staging buffer of layout g in bank k, for kernels that read past it (16-aligned)
         self._pad_bytes: list[list[int]] = []
         self._raw_banks = False
+        # borrowed slots (moe/kv_lend.py): per segment [first slot, slots, live]
+        self._lend = None
+        self.lend_segments: list[list[int]] = []
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size, self.pool_sizes)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -569,6 +575,9 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _alloc_banks(self) -> None:
+        if self._lend is not None:
+            self._alloc_lent_banks()
+            return
         for k, name in enumerate(self.bank_schema):
             if self._raw_banks:
                 self.bank_caches[name] = torch.zeros(self._bank_bytes(k, self.pool_sizes), dtype=torch.uint8, device=self.device)
@@ -576,6 +585,59 @@ class OffloadMoeCache:
                 dtype, shape = self.layouts[0][k]
                 self.bank_caches[name] = torch.zeros((self.cache_size, *shape), dtype=dtype, device=self.device)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+
+    def _alloc_lent_banks(self) -> None:
+        """Each bank on its own chunks up to the last base slot, then on the chunks each borrowed segment names."""
+        from freetoken.kernel.vmm import Chunk, Region
+
+        first = self._lend[0][0]
+        g = first.granule
+        for k, name in enumerate(self.bank_schema):
+            dtype, shape = self.layouts[0][k]
+            nbytes = self.cache_size * self._row_bytes[0][k]
+            if nbytes == 0:
+                self.bank_caches[name] = torch.zeros((self.cache_size, *shape), dtype=dtype, device=self.device)
+                continue
+            region = Region(self.device, nbytes)
+            if first.own_chunks[k]:
+                region.map(0, Chunk(self.device, first.own_chunks[k] * g))
+            for plan, chunks in self._lend:
+                for i, c in enumerate(plan.ext_chunks[k]):
+                    region.map((plan.own_chunks[k] + i) * g, chunks[c])
+            bank = region.tensor(nbytes).view(dtype).view(self.cache_size, *shape)
+            bank[: first.base_slots].zero_()
+            self.bank_caches[name] = bank
+        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+
+    @property
+    def lend_base(self) -> int:
+        """The first borrowed slot."""
+        return self.lend_segments[0][0] if self.lend_segments else self.cache_size
+
+    def borrow_slots(self, segments: list) -> None:
+        """Grow the single pool by each ``(plan, chunks)`` segment's slots (moe/kv_lend.py), all unusable; before graph capture."""
+        assert len(self.pool_sizes) == 1 and not self._raw_banks and segments[0][0].base_slots == self.cache_size
+        self._lend = segments
+        self.lend_segments = [[plan.base_slots, plan.slots, 0] for plan, _ in segments]
+        size = segments[-1][0].base_slots + segments[-1][0].slots
+        self.rebuild(size, [size])
+        self.usage[self.lend_base :] = UNAVAILABLE
+
+    def set_live_slots(self, live: int, segment: int = 0) -> None:
+        """Make the first ``live`` slots of a borrowed segment usable and drop the experts of the rest, whose bytes go back.
+
+        Between steps only, with no kernel in flight that reads or writes those bytes either way."""
+        lo, slots, cur = self.lend_segments[segment]
+        assert 0 <= live <= slots, (live, slots)
+        if live < cur:
+            span = slice(lo + live, lo + cur)
+            ids = self.id_of_slot[span]
+            self.slot_for_id.view(-1)[ids[ids >= 0].long()] = -1
+            self.id_of_slot[span] = -1
+            self.usage[span] = UNAVAILABLE
+        elif live > cur:
+            self.usage[lo + cur : lo + live] = 0
+        self.lend_segments[segment][2] = live
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -1177,7 +1239,9 @@ class OffloadMoeCache:
         if self.device.type != "cuda" or not self.banks:
             return 0
         seeded = 0
-        for pool, size in enumerate(self.pool_sizes):
+        # borrowed slots stay empty until KV lets go of them
+        sizes = [self.lend_base] if self.lend_segments else self.pool_sizes
+        for pool, size in enumerate(sizes):
             first = self._pool_stable_from[pool]
             layers = [
                 layer_id
@@ -1214,6 +1278,10 @@ class OffloadMoeCache:
 
             self.routing_trace.marker(RESET)
         reset_cache(self)
+        if self.lend_segments:
+            self.usage[self.lend_base :] = UNAVAILABLE
+            for lo, _, live in self.lend_segments:
+                self.usage[lo : lo + live] = 0
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
@@ -1282,6 +1350,8 @@ class OffloadMoeCache:
         cpu_only = self.cpu_layer_ids - self.locked_hybrid
         if cpu_only:
             parts.append(f"cpu-only {_layers(len(cpu_only))}")
+        if parts and self.lend_segments:
+            parts.append("borrowed slots live " + ", ".join(f"{live} of {slots}" for _, slots, live in self.lend_segments))
         return "MoE decode, " + "; ".join(parts) if parts else None
 
     def decode_miss_stats_per_layer(self) -> dict:

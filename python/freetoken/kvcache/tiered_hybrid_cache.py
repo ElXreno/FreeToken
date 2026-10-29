@@ -174,6 +174,51 @@ class TieredHybridRadixCache(HybridRadixCache):
     def evict_mamba(self, num: int) -> EvictResult:
         return EvictResult(self.empty, [])
 
+    def _split_stale(self) -> tuple[list[RadixTreeNode], list[RadixTreeNode]]:
+        """Unlocked resident nodes off the path to the most recently used one (the deepest of the newest), and those on it."""
+        resident = [n for n in self._all_nodes() if n.resident]
+        if not resident:
+            return [], []
+        newest = max(resident, key=lambda n: (n.timestamp, len(self._path(n))))
+        keep = set(map(id, self._path(newest)))
+        unlocked = [n for n in resident if n.ref_count == 0]
+        return [n for n in unlocked if id(n) not in keep], [n for n in unlocked if id(n) in keep]
+
+    def stale_evictable_tokens(self) -> int:
+        return sum(n.length for n in self._split_stale()[0])
+
+    def _release(self, node: RadixTreeNode, kv: list[torch.Tensor]) -> int:
+        if not node.resident or node._parent is None:
+            return 0
+        if node.host_kv is None:
+            return self._drop_subtree(node, kv)
+        kv.append(node.value)
+        self.full_evictable -= node.length
+        node._value = node._key[:0].clone()
+        node.resident = False
+        return node.length
+
+    def evict_stale(self) -> EvictResult:
+        """Release the VRAM pages of every stale node: one with a host copy just loses residency, one without drops with its subtree."""
+        kv: list[torch.Tensor] = []
+        for node in self._split_stale()[0]:
+            self._release(node, kv)
+        return EvictResult(torch.cat(kv) if kv else self.empty, [])
+
+    def evict_low(self, num_tokens: int) -> EvictResult:
+        """Release at least ``num_tokens`` VRAM tokens, lowest pages first: stale nodes, then the most recent path."""
+        kv: list[torch.Tensor] = []
+        freed = 0
+        for nodes in self._split_stale():
+            if nodes:
+                lows = torch.stack([n.value.min() for n in nodes]).tolist()
+                nodes = [n for _, n in sorted(zip(lows, nodes), key=lambda p: p[0])]
+            for node in nodes:
+                if freed >= num_tokens:
+                    return EvictResult(torch.cat(kv) if kv else self.empty, [])
+                freed += self._release(node, kv)
+        return EvictResult(torch.cat(kv) if kv else self.empty, [])
+
     def evict_host(self, nbytes: int) -> bool:
         """Arena pressure: drop the LRU unlocked leaf that owns host data (a leaf that cannot
         resume its GDN state is worthless), cascading up over snapshot-less leaves."""
