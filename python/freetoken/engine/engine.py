@@ -30,6 +30,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+from freetoken.moe.expert_prefetch import ExpertPrefetch, next_layer_routers, prefetch_budget
 from freetoken.moe.prefill_dump import PrefillDump, dump_dir, dump_every
 from freetoken.moe.routing_trace import RoutingTrace, trace_hidden, trace_path
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -1013,8 +1014,33 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
+        if budget := prefetch_budget():
+            self._attach_expert_prefetch(config, cache, budget)
         self.moe_offload_cache = cache
         return cache
+
+    def _attach_expert_prefetch(self, config: EngineConfig, cache, budget: int) -> None:
+        if cache.decode_target not in ("gpu", "hybrid"):
+            logger.warning_rank0(f"expert prefetch: decode target {cache.decode_target!r} has no GPU slot cache, off")
+            return
+        num_model = config.model_config.num_moe_layers - config.model_config.num_mtp_moe_layers
+        routers = next_layer_routers(self.model)
+        if weights := os.environ.get("FREETOKEN_EXPERT_PREFETCH_WEIGHTS"):
+            W = torch.load(weights, map_location="cpu")["W"]
+            predictors = {l: W[l].T.contiguous().to(device=self.device, dtype=torch.bfloat16) for l in range(min(len(W), num_model - 1))}
+            source = weights
+        else:
+            predictors = {l: routers[l + 1] for l in range(num_model - 1) if l + 1 in routers}
+            source = "next layer's router"
+        if not predictors:
+            logger.warning_rank0("expert prefetch: no next-layer routers found, off")
+            return
+        topn = int(os.environ.get("FREETOKEN_EXPERT_PREFETCH_TOPN", "16"))
+        cache.expert_prefetch = ExpertPrefetch(cache, predictors, budget=budget, topn=topn)
+        logger.info_rank0(
+            f"expert prefetch: up to {budget} of the top {max(topn, budget)} predicted cold experts per layer, "
+            f"predictor {source}, {len(predictors)} layers"
+        )
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
