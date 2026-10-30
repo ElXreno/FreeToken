@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 from types import SimpleNamespace
 
 import torch
@@ -18,6 +19,7 @@ class _Head:
     def __init__(self):
         self.calls = []
         self._pred = torch.zeros(ROWS + 1, dtype=torch.int32)
+        self._conf = torch.ones(ROWS + 1)
         self.reset = []
         self.ring_bytes = 0
 
@@ -37,6 +39,12 @@ class _Head:
 
     def drafts(self, slots):
         return self._pred.index_select(0, slots)
+
+    def remember_confidence(self, slots, conf):
+        self._conf.index_copy_(0, slots, conf)
+
+    def confidence(self, slots):
+        return self._conf.index_select(0, slots)
 
 
 def _proposer(monkeypatch):
@@ -103,3 +111,14 @@ def test_a_prefill_of_intermediate_chunks_drafts_nothing(monkeypatch):
     batch = SimpleNamespace(size=1, reqs=[_req(1, chunked=True)], is_prefill=True)
     p.on_prefill(batch, torch.tensor([3], dtype=torch.int32))
     assert head.calls == [] and head.reset == []
+
+
+def test_a_tracked_draft_keeps_its_top_probability_per_slot(monkeypatch):
+    p, head = _proposer(monkeypatch)
+    assert p.track_confidence()
+    batch = SimpleNamespace(size=1, reqs=[_req(2)], positions=torch.tensor([10, 11], dtype=torch.int32))
+    p.feature_sink(SimpleNamespace(is_prefill=False)).final_hidden(torch.zeros(2, H))
+    p.post_verify(batch, torch.tensor([[5, 6]]), torch.tensor([0]))
+    # the stub's logits are one-hot, so the top probability is e / (e + V - 1)
+    top = math.e / (math.e + V - 1)
+    assert torch.allclose(p.confidence(torch.tensor([2, 0])), torch.tensor([top, 1.0]))
