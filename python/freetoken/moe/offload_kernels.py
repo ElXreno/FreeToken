@@ -93,7 +93,8 @@ def ensure_experts_hybrid(
     The same launch splits the routes: ``expert_ids`` becomes the GPU slots in place, and
     ``clamp`` gives CPU routes slot 0 instead of -1 for GEMM kernels that read every slot.
     ``fetch_cap`` bounds the fetch count after ``max_fetch`` / ``fetch_fraction`` (a fixed-size staging buffer).
-    ``route_src`` (int32 per row of ``expert_ids``) first gives each row the experts of its source row."""
+    ``route_src`` (int32 per row of ``expert_ids``) first gives each row the experts of its source row; a row redirected
+    to another one computes none of its routes (slot -1 or 0 with ``clamp``, weight 0, CPU id -1)."""
     assert expert_ids.is_cuda, "the hybrid ensure kernel runs on the GPU"
     # Q16 fixed point: the kernel caps in integers.
     frac_q16 = _frac_q16(fetch_fraction)
@@ -540,8 +541,15 @@ def _ensure_experts_hybrid_kernel(
         if PENDING:
             on_gpu = on_gpu & (tl.sum(tl.where(off_e == e, pend.to(tl.int32), 0)) == 0)
             s = tl.where(on_gpu, s, -1)
-        tl.store(cpu_ids_ptr + i, tl.where(on_gpu, -1, e))
-        tl.store(gpu_w_ptr + i, tl.where(on_gpu, tl.load(weights_ptr + i), 0.0))
+        if ROUTE_SRC:
+            # a redirected row only shapes the step's expert set: none of its routes is computed
+            live = tl.load(route_src_ptr + i // top_k) * top_k + i % top_k == i
+            s = tl.where(live, s, -1)
+            tl.store(cpu_ids_ptr + i, tl.where(on_gpu | ~live, -1, e))
+            tl.store(gpu_w_ptr + i, tl.where(on_gpu & live, tl.load(weights_ptr + i), 0.0))
+        else:
+            tl.store(cpu_ids_ptr + i, tl.where(on_gpu, -1, e))
+            tl.store(gpu_w_ptr + i, tl.where(on_gpu, tl.load(weights_ptr + i), 0.0))
         if CLAMP:
             s = tl.maximum(s, 0)
         tl.store(expert_ids_ptr + i, s)
