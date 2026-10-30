@@ -61,6 +61,7 @@ def _setup():
         eos_token_ids=set(),
         toolcall_anchor_id=None,
         spec=None,
+        _routing_trace=None,
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         send_result=sent.extend,
