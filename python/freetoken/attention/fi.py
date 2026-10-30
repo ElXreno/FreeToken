@@ -337,7 +337,7 @@ class FlashInferBackend(BaseAttnBackend):
         seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
-        row = batch.verify_row
+        row = getattr(batch, "verify_row", None)
         if row is not None:
             # row ``row`` of each request sees its prefix and the rows up to its own
             seqlens_q = [1] * padded_size
