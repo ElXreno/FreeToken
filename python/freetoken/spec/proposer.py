@@ -60,6 +60,14 @@ class Proposer:
         """[bs, k] target-vocab drafts after each request's pending token; ``rows`` holds the requests' table_idx on the device."""
         raise NotImplementedError
 
+    def track_confidence(self) -> bool:
+        """Keep each draft's confidence for ``confidence``, from the next draft on (before graph capture); False if unsupported."""
+        return False
+
+    def confidence(self, rows: torch.Tensor) -> torch.Tensor:
+        """[bs] float32: the draft model's top probability for each request's pending draft."""
+        raise NotImplementedError
+
     def feature_sink(self, batch: Batch) -> FeatureSink | None:
         """What the target forward of a prefill or verify batch hands the draft."""
         return None
