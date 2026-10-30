@@ -1,17 +1,52 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import os
 import pathlib
 import re
+import shutil
+import tempfile
 from functools import cache
 from typing import TYPE_CHECKING, Iterator, List, NamedTuple, Tuple, TypeAlias, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
-KERNEL_PATH = pathlib.Path(__file__).parent / "csrc"
+
+def content_addressed(src: pathlib.Path, cache_root: pathlib.Path | None = None) -> pathlib.Path:
+    """A copy of ``src`` in a directory named by its content, else ``src`` itself.
+
+    A JIT build is keyed by the paths it includes, so the same kernel sources installed under another prefix (a new
+    package path) would otherwise rebuild every kernel."""
+    try:
+        files = sorted(p for p in src.rglob("*") if p.is_file())
+        digest = hashlib.sha256()
+        for p in files:
+            digest.update(p.relative_to(src).as_posix().encode() + b"\0")
+            digest.update(p.read_bytes() + b"\0")
+        if cache_root is None:
+            cache_root = pathlib.Path(os.getenv("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "freetoken" / "csrc"
+        dst = cache_root / digest.hexdigest()[:16]
+        if not dst.is_dir():
+            cache_root.mkdir(parents=True, exist_ok=True)
+            tmp = pathlib.Path(tempfile.mkdtemp(dir=cache_root))
+            try:
+                for p in files:
+                    out = tmp / p.relative_to(src)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(p, out)
+                with contextlib.suppress(OSError):
+                    tmp.rename(dst)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        return dst if dst.is_dir() else src
+    except OSError:
+        return src
+
+
+KERNEL_PATH = content_addressed(pathlib.Path(__file__).parent / "csrc")
 KERNEL_CACHE_PACKAGE = "freetoken_kernel_cache"
 KERNEL_CACHE_DIR_ENV = "FREETOKEN_KERNEL_CACHE_DIR"
 DISABLE_KERNEL_CACHE_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE"

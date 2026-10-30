@@ -7,17 +7,16 @@ Activations are fp32, bf16 or fp16 and are quantized to q8_1 first; results come
 from __future__ import annotations
 
 import functools
-import pathlib
 from typing import TYPE_CHECKING
 
 import torch
 
-from .utils import _is_rocm, load_aot
+from .utils import KERNEL_PATH, _is_rocm, load_aot
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
-_ROOT = pathlib.Path(__file__).parent / "csrc" / "ggml"
+_ROOT = KERNEL_PATH / "ggml"
 
 
 def load_module(build_directory: str | None = None) -> Module:
