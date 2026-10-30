@@ -1,5 +1,6 @@
 """Hybrid ensure with route sources: a row whose source is another row routes to that row's experts, so its own
-experts are never fetched, counted as misses or sent to the CPU; identity sources route every row as given."""
+experts are never fetched or counted as misses, and none of its routes is computed on the GPU or the CPU; identity
+sources route every row as given."""
 
 from __future__ import annotations
 
@@ -36,14 +37,15 @@ def test_a_row_routed_to_another_rows_source_fetches_only_the_source_experts():
     assert int(cache.num_missing_full) == 2
     assert all(int(cache.slot_for_id[0, e]) >= 0 for e in (0, 1))
     assert all(int(cache.slot_for_id[0, e]) == -1 for e in (2, 3))
-    assert torch.equal(routes.gpu_slots[1], routes.gpu_slots[0])
+    assert (routes.gpu_slots[0] >= 0).all() and routes.gpu_w[0].tolist() == [1.0, 1.0]
+    assert routes.gpu_slots[1].tolist() == [-1, -1] and routes.gpu_w[1].tolist() == [0.0, 0.0]
 
 
 @cuda
-def test_a_row_routed_to_another_row_sends_the_source_experts_to_the_cpu():
+def test_a_row_routed_to_another_row_leaves_the_cpu_only_the_source_rows_routes():
     cache = _cache(0.0)
     routes = _ensure(cache, [0, 0])
-    assert routes.cpu_ids.tolist() == [[0, 1], [0, 1]]
+    assert routes.cpu_ids.tolist() == [[0, 1], [-1, -1]]
 
 
 @cuda
