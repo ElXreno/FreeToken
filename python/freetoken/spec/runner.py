@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
 
 from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecForwardOutput
+from freetoken.layers.base import iter_ops
 
 from .proposer import DraftContext, Proposer
 from .rejection import reject
@@ -16,6 +18,9 @@ if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.sample import BatchSamplingArgs
     from freetoken.models.blocks import FeatureSink
+
+# below this draft top probability a request verifies its pending token alone; 0 = never
+_GATE = float(os.environ.get("FREETOKEN_SPEC_GATE", "0") or 0)
 
 
 def proposer_class(config) -> type[Proposer]:
@@ -36,6 +41,7 @@ class SpecRunner:
         self.proposer = proposer_class(config)(config, engine.model)
         self.radix_lookahead = self.proposer.radix_lookahead
         self.engine = None
+        self._route_src: torch.Tensor | None = None
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
@@ -57,10 +63,33 @@ class SpecRunner:
         """Second construction phase, after the pools and before graph capture."""
         self.engine = engine
         self._host = torch.zeros(self.config.max_running_req + 1, self.k + 2, dtype=torch.int64, pin_memory=True)
+        self._attach_gate(engine)
         self.proposer.attach(DraftContext(
             page_table=engine.page_table, num_pages=engine.num_pages, device=engine.device,
             stream=engine.stream, dummy_req=engine.dummy_req,
         ))
+
+    def _attach_gate(self, engine) -> None:
+        caches = {id(c): c for op in iter_ops(engine.model) if (c := getattr(op, "offload_cache", None)) is not None}
+        if _GATE <= 0 or not caches or not self.proposer.track_confidence():
+            return
+        rows = (self.config.max_running_req + 1) * (self.k + 1)
+        self._route_iota = torch.arange(rows, dtype=torch.int32, device=self.device)
+        self._route_lane = self._route_iota % (self.k + 1)
+        self._route_src = self._route_iota.clone()
+        for cache in caches.values():
+            cache.route_src = self._route_src
+
+    def _gate(self, batch: Batch) -> torch.Tensor | None:
+        """[bs] bool: the requests that verify their pending token alone this step; sets the MoE route sources."""
+        if self._route_src is None:
+            return None
+        bs, width = batch.size, self.k + 1
+        tables = make_device_tensor([r.table_idx for r in batch.reqs[:bs]], torch.int64, self.device)
+        gate = self.proposer.confidence(tables) < _GATE
+        self._route_src.copy_(self._route_iota)
+        self._route_src[: bs * width] -= gate.repeat_interleave(width).to(torch.int32) * self._route_lane[: bs * width]
+        return gate
 
     def detach(self, *, keep_kv: bool) -> None:
         self.proposer.detach(keep_kv=keep_kv)
@@ -87,8 +116,11 @@ class SpecRunner:
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
         batch.features = self.feature_sink(batch)
+        gate = self._gate(batch)
         logits = engine.forward_logits(batch)[: bs * width]
         out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+        if gate is not None:
+            emitted = emitted.masked_fill(gate, 0)
         host = self._host[:bs]
         host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
         copy_done = torch.cuda.Event()

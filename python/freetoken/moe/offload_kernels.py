@@ -77,6 +77,7 @@ def ensure_experts_hybrid(
     fetch_fraction: float = 0.0,
     clamp: bool = False,
     fetch_cap: int | None = None,
+    route_src: torch.Tensor | None = None,
 ) -> HybridRoutes:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -91,14 +92,15 @@ def ensure_experts_hybrid(
 
     The same launch splits the routes: ``expert_ids`` becomes the GPU slots in place, and
     ``clamp`` gives CPU routes slot 0 instead of -1 for GEMM kernels that read every slot.
-    ``fetch_cap`` bounds the fetch count after ``max_fetch`` / ``fetch_fraction`` (a fixed-size staging buffer)."""
+    ``fetch_cap`` bounds the fetch count after ``max_fetch`` / ``fetch_fraction`` (a fixed-size staging buffer).
+    ``route_src`` (int32 per row of ``expert_ids``) first gives each row the experts of its source row."""
     assert expert_ids.is_cuda, "the hybrid ensure kernel runs on the GPU"
     # Q16 fixed point: the kernel caps in integers.
     frac_q16 = _frac_q16(fetch_fraction)
     weights = weights.contiguous()
     routes = HybridRoutes(expert_ids, torch.empty_like(weights), torch.empty_like(expert_ids))
     cap = cache.num_experts if fetch_cap is None else fetch_cap
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, weights, routes, clamp, max_fetch, frac_q16, cap)
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, weights, routes, clamp, max_fetch, frac_q16, cap, route_src)
     return routes
 
 
@@ -154,6 +156,7 @@ def _ensure_experts_hybrid_gpu(
     max_fetch: int,
     frac_q16: int,
     fetch_cap: int,
+    route_src: torch.Tensor | None = None,
 ) -> None:
     id_of_slot, usage = cache.pool_state(layer_id)
     num_slots = id_of_slot.numel()
@@ -194,6 +197,8 @@ def _ensure_experts_hybrid_gpu(
         freq,
         last,
         _HYBRID_LFU_TAU if lfu else 1.0,
+        route_src if route_src is not None else id_of_slot,
+        expert_ids.shape[-1] if expert_ids.dim() > 1 else 1,
         BLOCK_E=block_e,
         CHUNK=chunk,
         SMALL=num_slots <= chunk,
@@ -203,6 +208,7 @@ def _ensure_experts_hybrid_gpu(
         STATS=cache.collect_stats,
         PENDING=ready is not None,
         LFU=lfu,
+        ROUTE_SRC=route_src is not None,
         num_warps=num_warps,
     )
 
@@ -306,7 +312,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "fetch_cap", "cache_size", "id_of_slot_ptr", "usage_ptr", "ready_ptr", "gen_ptr"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "fetch_cap", "cache_size", "id_of_slot_ptr", "usage_ptr", "ready_ptr", "gen_ptr", "top_k"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -337,6 +343,8 @@ def _ensure_experts_hybrid_kernel(
     freq_ptr,
     last_ptr,
     lfu_tau,
+    route_src_ptr,
+    top_k,
     BLOCK_E: tl.constexpr,
     CHUNK: tl.constexpr,
     SMALL: tl.constexpr,
@@ -346,6 +354,7 @@ def _ensure_experts_hybrid_kernel(
     STATS: tl.constexpr,
     PENDING: tl.constexpr,
     LFU: tl.constexpr,
+    ROUTE_SRC: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -376,6 +385,14 @@ def _ensure_experts_hybrid_kernel(
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
+
+    if ROUTE_SRC:
+        # a row whose source is another row routes to that row's experts; sources map to themselves
+        for i in tl.range(num_active):
+            src = tl.load(route_src_ptr + i // top_k) * top_k + i % top_k
+            e = tl.load(expert_ids_ptr + src)
+            tl.store(expert_ids_ptr + i, e, mask=src != i)
+        tl.debug_barrier()
 
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)

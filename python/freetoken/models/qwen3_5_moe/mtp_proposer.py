@@ -73,6 +73,7 @@ class Qwen3_5MTPProposer(Proposer):
         self.max_rows = config.max_running_req
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._rings = False
+        self._keep_conf = False
 
     def attach(self, ctx: DraftContext) -> None:
         super().attach(ctx)
@@ -103,7 +104,8 @@ class Qwen3_5MTPProposer(Proposer):
         logits = self.head.forward(
             self._hidden[:n], self._tokens[:n], self._positions[:n], self._slots[:n], self.embed_tokens, self.lm_head
         )
-        self.head.remember(self._slots[:n], logits.argmax(dim=-1))
+        conf = torch.softmax(logits.float(), dim=-1).amax(dim=-1) if self._keep_conf else None
+        self.head.remember(self._slots[:n], logits.argmax(dim=-1), conf)
 
     def _run(self, n: int) -> None:
         graph = self.graphs.get(n)
@@ -151,6 +153,13 @@ class Qwen3_5MTPProposer(Proposer):
 
     def propose(self, reqs: list[Req], rows: torch.Tensor) -> torch.Tensor:
         return self.head.drafts(rows).unsqueeze(1).to(torch.int64)
+
+    def track_confidence(self) -> bool:
+        self._keep_conf = True
+        return True
+
+    def confidence(self, rows: torch.Tensor) -> torch.Tensor:
+        return self.head.confidence(rows)
 
     @torch.inference_mode()
     def capture_graphs(self, bs_list: list[int], pool) -> None:
