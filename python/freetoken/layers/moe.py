@@ -330,7 +330,9 @@ class OffloadMoELayer(MoELayer):
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
         # with several quants this holds only because the cache zeroes its staging area after prefill
         clamp = not self.skips_inactive_slots
-        gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
+        gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(
+            self.layer_id, topk_ids, topk_weights, clamp=clamp, route_src=self._route_src(cache)
+        )
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -400,7 +402,8 @@ class OffloadMoELayer(MoELayer):
             hidden_states=hidden_states, gating_output=router_logits, topk=self.top_k, renormalize=self.renormalize,
         )
         gpu_slots, gpu_w, cpu_ids = self.offload_cache.ensure_experts_hybrid(
-            self.layer_id, topk_ids, topk_weights, clamp=not self.skips_inactive_slots
+            self.layer_id, topk_ids, topk_weights, clamp=not self.skips_inactive_slots,
+            route_src=self._route_src(self.offload_cache),
         )
         return topk_weights, gpu_slots, gpu_w, cpu_ids
 
@@ -420,6 +423,14 @@ class OffloadMoELayer(MoELayer):
         prefetch = self._prefetch(self.offload_cache)
         if prefetch is not None:
             prefetch.after_layer(self.layer_id)
+
+    @staticmethod
+    def _route_src(cache: OffloadMoeCache) -> torch.Tensor | None:
+        """The rows' source rows of a gated verify (all its rows in one call), else None."""
+        batch = getattr(maybe_global_ctx(), "batch", None)
+        if cache.route_src is None or getattr(batch, "phase", None) != "verify" or getattr(batch, "verify_row", None) is not None:
+            return None
+        return cache.route_src
 
     @staticmethod
     def _prefetch(cache: OffloadMoeCache):

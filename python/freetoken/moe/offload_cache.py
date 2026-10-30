@@ -317,6 +317,8 @@ class OffloadMoeCache:
         self.expert_prefetch = None
         # opt-in copy-engine demand copy (moe.demand_copy)
         self.demand_copy = None
+        # a verify row's source row (int32 per row), set by a gated speculative verify (spec.runner)
+        self.route_src: torch.Tensor | None = None
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
@@ -1214,7 +1216,8 @@ class OffloadMoeCache:
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(
-        self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False
+        self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False,
+        route_src: torch.Tensor | None = None,
     ) -> HybridRoutes:
         """Capped-fetch LRU for the hybrid backend.
 
@@ -1241,7 +1244,7 @@ class OffloadMoeCache:
         self._pending_fetch_cap = cap
         if self.demand_copy is not None and self.demand_copy.serves(layer_id):
             cap = min(self.num_experts if cap is None else cap, self.demand_copy.max_fetch)
-        return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
+        return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap, route_src)
 
     def _drain_copies(self) -> None:
         if self.demand_copy is not None:
