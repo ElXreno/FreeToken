@@ -101,7 +101,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
         )
         if batch.phase == "verify":
             metadata.verify_scratch = pool.verify_scratch
-            metadata.verify_offset = batch.verify_row or 0
+            metadata.verify_offset = getattr(batch, "verify_row", None) or 0
         return metadata
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
