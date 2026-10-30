@@ -104,8 +104,9 @@ class Qwen3_5MTPProposer(Proposer):
         logits = self.head.forward(
             self._hidden[:n], self._tokens[:n], self._positions[:n], self._slots[:n], self.embed_tokens, self.lm_head
         )
-        conf = torch.softmax(logits.float(), dim=-1).amax(dim=-1) if self._keep_conf else None
-        self.head.remember(self._slots[:n], logits.argmax(dim=-1), conf)
+        self.head.remember(self._slots[:n], logits.argmax(dim=-1))
+        if self._keep_conf:
+            self.head.remember_confidence(self._slots[:n], torch.softmax(logits.float(), dim=-1).amax(dim=-1))
 
     def _run(self, n: int) -> None:
         graph = self.graphs.get(n)

@@ -185,18 +185,19 @@ class Qwen3_5MTPHead(BaseOP):
         self._fill.index_fill_(0, slots, 0)
         self._written.index_fill_(0, slots, 0)
 
-    def remember(self, slots: torch.Tensor, pred: torch.Tensor, conf: torch.Tensor | None = None) -> None:
+    def remember(self, slots: torch.Tensor, pred: torch.Tensor) -> None:
         # index_copy_ keeps this capturable
         self._pred.index_copy_(0, slots, pred.to(self._pred.dtype))
-        if conf is not None:
-            self._conf.index_copy_(0, slots, conf)
+
+    def remember_confidence(self, slots: torch.Tensor, conf: torch.Tensor) -> None:
+        self._conf.index_copy_(0, slots, conf)
 
     def drafts(self, slots: torch.Tensor) -> torch.Tensor:
         """The last draft remembered for each of ``slots``."""
         return self._pred.index_select(0, slots)
 
     def confidence(self, slots: torch.Tensor) -> torch.Tensor:
-        """The top softmax probability of the last draft remembered with one for each of ``slots``."""
+        """The last top softmax probability remembered for each of ``slots``."""
         return self._conf.index_select(0, slots)
 
     @property
