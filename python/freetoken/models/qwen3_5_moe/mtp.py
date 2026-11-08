@@ -312,6 +312,10 @@ class Qwen3_5MTPHead(BaseOP):
     and predicts ``x_{i+2}``. Its layer attends over a per-slot ring of the last ``mtp_window``
     tokens, so the head needs no KV-cache layer and leaves the paged cache, the prefix cache and
     the arena format untouched.
+
+    A chain of ``steps`` drafts runs the head again on its own normed output and its own draft,
+    one position on; those later steps keep their keys in scratch columns after the ring, so
+    the ring holds only what the target confirmed.
     """
 
     def __init__(self, config: ModelConfig, *, prefix: str = "mtp"):
@@ -328,34 +332,36 @@ class Qwen3_5MTPHead(BaseOP):
         # the head writes the stream too; left alone it keeps drafting what the body no longer says
         self._ablate = DirectionAblation.from_config(config)
         self._window = int(config.mtp_window)
+        # a chained step near the end of the context runs past the last position the rope table holds
+        self._last_position = config.rotary_config.table_positions - 1
         self._k_ring: torch.Tensor | None = None
         self._v_ring: torch.Tensor | None = None
         self._fill: torch.Tensor | None = None
         self._written: torch.Tensor | None = None
 
-    def alloc_rings(self, num_slots: int, device: torch.device, dtype: torch.dtype) -> None:
-        shape = (num_slots, self._window, self.layers.op_list[0].self_attn.kv_attn_dim)
+    def alloc_rings(self, num_slots: int, device: torch.device, dtype: torch.dtype, steps: int = 1) -> None:
+        shape = (num_slots, self._window + steps - 1, self.layers.op_list[0].self_attn.kv_attn_dim)
         self._k_ring = torch.zeros(shape, device=device, dtype=dtype)
         self._v_ring = torch.zeros(shape, device=device, dtype=dtype)
         self._fill = torch.zeros(num_slots, device=device, dtype=torch.int32)
         self._written = torch.zeros(num_slots, device=device, dtype=torch.int32)
-        self._pred = torch.zeros(num_slots, device=device, dtype=torch.int32)
+        self._pred = torch.zeros(steps, num_slots, device=device, dtype=torch.int32)
         self._conf = torch.ones(num_slots, device=device, dtype=torch.float32)
 
     def reset_slots(self, slots: torch.Tensor) -> None:
         self._fill.index_fill_(0, slots, 0)
         self._written.index_fill_(0, slots, 0)
 
-    def remember(self, slots: torch.Tensor, pred: torch.Tensor) -> None:
+    def remember(self, slots: torch.Tensor, pred: torch.Tensor, step: int = 0) -> None:
         # index_copy_ keeps this capturable
-        self._pred.index_copy_(0, slots, pred.to(self._pred.dtype))
+        self._pred[step].index_copy_(0, slots, pred.to(self._pred.dtype))
 
     def remember_confidence(self, slots: torch.Tensor, conf: torch.Tensor) -> None:
         self._conf.index_copy_(0, slots, conf)
 
     def drafts(self, slots: torch.Tensor) -> torch.Tensor:
-        """The last draft remembered for each of ``slots``."""
-        return self._pred.index_select(0, slots)
+        """[len(slots), steps]: the last chain of drafts remembered for each of ``slots``."""
+        return self._pred.index_select(1, slots).t()
 
     def confidence(self, slots: torch.Tensor) -> torch.Tensor:
         """The last top softmax probability remembered for each of ``slots``."""
@@ -378,10 +384,16 @@ class Qwen3_5MTPHead(BaseOP):
         slots: torch.Tensor,
         embed_tokens,
         lm_head,
-    ) -> torch.Tensor:
-        """Logits over ``x_{i+2}`` for every row, advancing each row's ring by one token."""
+        step: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(logits over ``x_{i+2}``, the normed hidden a chained step takes) for every row.
+
+        Step 0 advances each row's ring by one token; chained step ``step`` reads ``positions``
+        as step 0's and keeps its key and value in scratch column ``step - 1``."""
         layer = self.layers.op_list[0]
         attn = layer.self_attn
+        if step:
+            positions = torch.clamp(positions + step, max=self._last_position)
         e = self.pre_fc_norm_embedding.forward(embed_tokens.forward(next_ids))
         h = self.pre_fc_norm_hidden.forward(hidden)
         x = self.fc.forward(torch.cat([e, h], dim=-1))
@@ -390,26 +402,7 @@ class Qwen3_5MTPHead(BaseOP):
 
         residual = x
         q, k, v, gate = attn.project(layer.input_layernorm.forward(x), positions)
-        w = (self._written.index_select(0, slots) % self._window).to(torch.long)
-        self._k_ring[slots, w] = k.to(self._k_ring.dtype)
-        self._v_ring[slots, w] = v.to(self._v_ring.dtype)
-        self._written[slots] += 1
-        self._fill[slots] = torch.clamp(self._fill.index_select(0, slots) + 1, max=self._window)
-
-        n = q.shape[0]
-        keys = self._k_ring.index_select(0, slots).view(n, self._window, attn.num_kv, attn.head_dim)
-        values = self._v_ring.index_select(0, slots).view(n, self._window, attn.num_kv, attn.head_dim)
-        live = (
-            torch.arange(self._window, device=q.device)[None, :]
-            < self._fill.index_select(0, slots)[:, None]
-        )
-        rep = attn.num_q // attn.num_kv
-        o = torch.nn.functional.scaled_dot_product_attention(
-            q.view(n, attn.num_q, 1, attn.head_dim),
-            keys.repeat_interleave(rep, dim=2).transpose(1, 2),
-            values.repeat_interleave(rep, dim=2).transpose(1, 2),
-            attn_mask=live[:, None, None, :],
-        ).view(n, attn.qo_attn_dim)
+        o = self._attend(q, k, v, slots, step)
         x = attn.o_proj.forward(o.to(x.dtype) * torch.sigmoid(gate)) + residual
         if self._ablate is not None:
             x = self._ablate.cut_(x)
@@ -418,7 +411,36 @@ class Qwen3_5MTPHead(BaseOP):
         x = layer.mlp.forward(layer.post_attention_layernorm.forward(x)) + residual
         if self._ablate is not None:
             x = self._ablate.cut_(x)
-        return lm_head.logits(self.norm.forward(x))
+        x = self.norm.forward(x)
+        return lm_head.logits(x), x
+
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slots: torch.Tensor, step: int) -> torch.Tensor:
+        """Store this step's key and value, then attend over each row's live ring and the keys its chain wrote so far."""
+        attn = self.layers.op_list[0].self_attn
+        if step == 0:
+            w = (self._written.index_select(0, slots) % self._window).to(torch.long)
+            self._k_ring[slots, w] = k.to(self._k_ring.dtype)
+            self._v_ring[slots, w] = v.to(self._v_ring.dtype)
+            self._written[slots] += 1
+            self._fill[slots] = torch.clamp(self._fill.index_select(0, slots) + 1, max=self._window)
+        else:
+            self._k_ring[slots, self._window + step - 1] = k.to(self._k_ring.dtype)
+            self._v_ring[slots, self._window + step - 1] = v.to(self._v_ring.dtype)
+
+        n, cols = q.shape[0], self._k_ring.shape[1]
+        keys = self._k_ring.index_select(0, slots).view(n, cols, attn.num_kv, attn.head_dim)
+        values = self._v_ring.index_select(0, slots).view(n, cols, attn.num_kv, attn.head_dim)
+        col = torch.arange(cols, device=q.device)[None, :]
+        live = col < self._fill.index_select(0, slots)[:, None]
+        if step:
+            live = live | ((col >= self._window) & (col < self._window + step))
+        rep = attn.num_q // attn.num_kv
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.view(n, attn.num_q, 1, attn.head_dim),
+            keys.repeat_interleave(rep, dim=2).transpose(1, 2),
+            values.repeat_interleave(rep, dim=2).transpose(1, 2),
+            attn_mask=live[:, None, None, :],
+        ).view(n, attn.qo_attn_dim)
 
 
 __all__ = ["Qwen3_5MTPDraft", "Qwen3_5MTPHead", "Qwen3_5MTPLayer"]

@@ -8,6 +8,7 @@ import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
+from freetoken.env import ENV
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal
 from freetoken.utils import init_logger
 
@@ -37,18 +38,20 @@ class _FinalHidden:
 
 
 class Qwen3_5MTPProposer(Proposer):
-    """One draft per step from the checkpoint's MTP head, on the target's last committed row.
+    """``k`` drafts per step from the checkpoint's MTP head, on the target's last committed row.
 
     EAGLE alignment: the head takes the token ``x_{i+1}`` the target just emitted with the
     target's hidden ``h_i`` at position ``p_i`` and predicts ``x_{i+2}``. Its layer attends over a
     per-request ring of the tokens it was fed, keyed by ``table_idx``, so the paged KV cache and
-    the prefix cache stay the target's alone. A draft step reads and writes only the head's own
-    persistent buffers and replays as one captured graph per batch size.
+    the prefix cache stay the target's alone. With ``k > 1`` the head runs ``k`` times in a chain,
+    each step on the previous step's normed output and draft, as llama.cpp's draft-mtp does. A
+    draft step reads and writes only the head's own persistent buffers and replays as one
+    captured graph per batch size.
     """
 
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
-        return 1, 1
+        return 1, 8
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
@@ -57,12 +60,18 @@ class Qwen3_5MTPProposer(Proposer):
             raise ValueError("--speculative-algorithm mtp-ring needs a checkpoint with an MTP head (mtp_num_hidden_layers)")
         if getattr(config, "mixed_batch_decode", False):
             raise ValueError("--speculative-algorithm mtp-ring does not combine with --mixed-batch-decode yet")
+        if config.speculative_num_steps > 1 and ENV.STAGGER:
+            logger.warning_rank0(
+                "FREETOKEN_STAGGER splits only the two rows of a k=1 verify; "
+                f"with --speculative-num-steps {config.speculative_num_steps} every verify runs unstaggered"
+            )
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]:
         mc = config.model_config
         slots = config.max_running_req + 1
-        ring = 2 * slots * mc.mtp_window * mc.num_kv_heads * mc.head_dim * config.dtype.itemsize
+        columns = mc.mtp_window + max(config.speculative_num_steps, 1) - 1
+        ring = 2 * slots * columns * mc.num_kv_heads * mc.head_dim * config.dtype.itemsize
         feat = slots * (max(config.speculative_num_steps, 1) + 2) * mc.hidden_size * config.dtype.itemsize
         return ring + feat, 0
 
@@ -81,7 +90,7 @@ class Qwen3_5MTPProposer(Proposer):
         width = self.max_rows + 1
         dev, dtype, hidden = ctx.device, self.config.dtype, self.config.model_config.hidden_size
         if not self._rings:
-            self.head.alloc_rings(width, dev, dtype)
+            self.head.alloc_rings(width, dev, dtype, steps=self.k)
             self._rings = True
         # verify rows: k+1 per request
         self._feat = torch.zeros(width * (self.k + 1), hidden, device=dev, dtype=dtype)
@@ -102,12 +111,15 @@ class Qwen3_5MTPProposer(Proposer):
         return _FinalHidden(self, batch)
 
     def _draft(self, n: int) -> None:
-        logits = self.head.forward(
-            self._hidden[:n], self._tokens[:n], self._positions[:n], self._slots[:n], self.embed_tokens, self.lm_head
-        )
-        self.head.remember(self._slots[:n], logits.argmax(dim=-1))
-        if self._keep_conf:
-            self.head.remember_confidence(self._slots[:n], torch.softmax(logits.float(), dim=-1).amax(dim=-1))
+        hidden, tokens, slots = self._hidden[:n], self._tokens[:n], self._slots[:n]
+        for step in range(self.k):
+            logits, hidden = self.head.forward(
+                hidden, tokens, self._positions[:n], slots, self.embed_tokens, self.lm_head, step=step
+            )
+            tokens = logits.argmax(dim=-1).to(self._tokens.dtype)
+            self.head.remember(slots, tokens, step=step)
+            if step == 0 and self._keep_conf:
+                self.head.remember_confidence(slots, torch.softmax(logits.float(), dim=-1).amax(dim=-1))
 
     def _run(self, n: int) -> None:
         graph = self.graphs.get(n)
@@ -154,7 +166,7 @@ class Qwen3_5MTPProposer(Proposer):
         self._run(n)
 
     def propose(self, reqs: list[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
-        return SpecProposal(self.head.drafts(rows).unsqueeze(1).to(torch.int64))
+        return SpecProposal(self.head.drafts(rows).to(torch.int64))
 
     def track_confidence(self) -> bool:
         self._keep_conf = True

@@ -1113,7 +1113,10 @@ def parse_args(
         dest="speculative_algorithm",
         action="store_const",
         const="mtp-ring",
-        help="Speculative decoding with the checkpoint's own MTP head drafting one token per step: --speculative-algorithm mtp-ring.",
+        help=(
+            "Speculative decoding with the checkpoint's own MTP head: --speculative-algorithm mtp-ring. The head drafts "
+            "--speculative-num-steps tokens per step (1 by default, up to 8), chaining on its own output after the first."
+        ),
     )
 
     parser.add_argument(
