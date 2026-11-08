@@ -33,6 +33,7 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    _make_reasoning_parser,
     generate_events,
     generate_full,
     prerender_error,
@@ -164,11 +165,9 @@ async def handle_chat_completion(
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
-    if _response_format_unsupported(req.response_format):
-        return create_error_response(
-            "response_format json_object/json_schema is not supported (no constrained decoding)",
-            param="response_format",
-        )
+    json_schema, format_error = _response_format_schema(req.response_format)
+    if format_error is not None:
+        return create_error_response(format_error, param="response_format")
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
     # Case/whitespace and the "off" disable synonym stay accepted here because
@@ -206,6 +205,9 @@ async def handle_chat_completion(
         )
     except ValueError as exc:
         return create_error_response(str(exc))
+    if json_schema is not None:
+        spec.sampling_params.json_schema = json_schema
+        spec.sampling_params.json_schema_after = _reasoning_end_marker(spec, state)
 
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
@@ -726,8 +728,32 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
 
 
 def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
+    # Constrained decoding is wired for chat completions only.
     return response_format is not None and response_format.get("type") not in (None, "text")
+
+
+def _response_format_schema(response_format: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """``(json_schema, error)`` for a chat request's response_format; both None for plain text."""
+    kind = None if response_format is None else response_format.get("type")
+    if kind in (None, "text"):
+        return None, None
+    if kind == "json_object":
+        return json.dumps({"type": "object"}), None
+    if kind == "json_schema":
+        spec = response_format.get("json_schema")
+        schema = spec.get("schema") if isinstance(spec, dict) else None
+        if not isinstance(schema, dict):
+            return None, "response_format.json_schema.schema must be a JSON object"
+        return json.dumps(schema), None
+    return None, f"response_format type {kind!r} is not supported"
+
+
+def _reasoning_end_marker(spec: GenSpec, state: Any) -> str | None:
+    """The marker closing a reasoning block the template opens, so the schema applies after it; None when output starts with content."""
+    parser = _make_reasoning_parser(spec, state)
+    if parser is None or not parser.detector.force_reasoning:
+        return None
+    return parser.detector.think_end_token or None
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
@@ -742,7 +768,7 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if req.logit_bias is not None:
         return "logit_bias is not supported"
     if _response_format_unsupported(req.response_format):
-        return "response_format json_object/json_schema is not supported (no constrained decoding)"
+        return "response_format json_object/json_schema is supported only on /v1/chat/completions"
     return None
 
 

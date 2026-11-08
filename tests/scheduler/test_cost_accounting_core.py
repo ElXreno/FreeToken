@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from freetoken.core import SamplingParams
+from freetoken.engine.grammar import GrammarManager
 from freetoken.message import (
     AbortBackendMsg,
     BatchTokenizerMsg,
@@ -161,6 +162,7 @@ def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_manager = SimpleNamespace(abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(abort_req=lambda uid: None)
+    scheduler.grammar = GrammarManager(None, 0, ())
     scheduler._pending_abort_acks = set()
     sent = []
     scheduler.send_result = sent.extend
@@ -182,6 +184,7 @@ def test_abort_before_cross_worker_user_message_cannot_resurrect_request():
         abort_req=lambda uid: None,
     )
     scheduler.decode_manager = SimpleNamespace(abort_req=lambda uid: None)
+    scheduler.grammar = GrammarManager(None, 0, ())
     scheduler._pending_abort_acks = set()
     scheduler._abort_tombstones = {}
     sent = []
@@ -208,6 +211,7 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
+    scheduler.grammar = GrammarManager(None, 0, ())
     scheduler._pending_abort_acks = set()
     scheduler._pending_rebuild = None
     scheduler._pending_flush = None

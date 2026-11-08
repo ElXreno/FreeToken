@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 from freetoken.core import Batch, Req
+from freetoken.engine.grammar import GrammarManager
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -156,6 +157,7 @@ class Scheduler(SchedulerIOMixin):
         self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
+        self.grammar = GrammarManager(self.tokenizer, config.model_config.vocab_size, self.eos_token_ids)
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (
             self.cache_manager.is_hybrid or self.cache_manager.is_swa
@@ -305,6 +307,12 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        if last_data is not None and len(self.grammar) > 0 and self.grammar.has_any(last_data[0].batch.reqs):
+            # a grammar mask needs the previous token on the host before the next batch is built
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            last_data = self._last_data = None
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -568,6 +576,7 @@ class Scheduler(SchedulerIOMixin):
             req.append_host(tokens[j : j + 1])
             token = int(tokens[j].item())
             committed.append(token)
+            self.grammar.accept(req.uid, token)
             # EOS / stop-string -> "stop", output budget exhausted -> "length";
             # EOS and stop strings win over length.
             # Overlap can advance device_len one token ahead of this host reply.
@@ -704,6 +713,9 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if (error := self.grammar.register(msg.uid, msg.sampling_params)) is not None:
+                self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -716,6 +728,8 @@ class Scheduler(SchedulerIOMixin):
             # in-flight concurrency.
             while len(tombstones) > 65_536:
                 tombstones.pop(next(iter(tombstones)))
+            # a request still queued has no Req to free, so its matcher goes here
+            self.grammar.release(msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if (
@@ -809,6 +823,7 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        self.grammar.release(req.uid)
         if self.spec is not None:
             self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
@@ -1020,6 +1035,7 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # before the widening below, so the penalty check reads each request's real remain_len
         sample_args = self.engine.sampler.prepare(batch)
+        sample_args.grammar = self.grammar.batch(batch.reqs, ChunkedReq)
         # widened after the window free above, whose threshold reads device_len
         if batch.phase == "verify":
             for req in batch.reqs:

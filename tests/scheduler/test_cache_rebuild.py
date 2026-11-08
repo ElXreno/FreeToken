@@ -69,11 +69,13 @@ def _stub_scheduler(*, prefill_runnable: bool, decode_runnable: bool, pending: o
     rebuild-drain branch. _execute_pending_rebuild is replaced with a recorder."""
     from types import SimpleNamespace
 
+    from freetoken.engine.grammar import GrammarManager
     from freetoken.scheduler.scheduler import Scheduler
 
     sched = Scheduler.__new__(Scheduler)
     sched.prefill_manager = SimpleNamespace(runnable=prefill_runnable)
     sched.decode_manager = SimpleNamespace(runnable=decode_runnable)
+    sched.grammar = GrammarManager(None, 0, ())
     sched._pending_rebuild = pending
     sched._pending_flush = None
     sched.receive_msg = lambda blocking: []

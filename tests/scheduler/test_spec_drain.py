@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import torch
 
 from freetoken.core import Batch, Req, SamplingParams
+from freetoken.engine.grammar import GrammarManager
 from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
@@ -43,7 +44,7 @@ def _setup():
         cache_manager=cm, table_manager=tm, decode_manager=dm, prefill_manager=pm, spec=None, engine=engine,
         config=SimpleNamespace(decode_rows_per_req=K + 1), device=torch.device("cpu"),
         token_pool=torch.zeros(4, 64, dtype=torch.int32), eos_token_ids=set(), toolcall_anchor_id=None,
-        _match_stop_str=lambda _req: None,
+        _match_stop_str=lambda _req: None, grammar=GrammarManager(None, 0, ()),
     )
 
     def free(req):

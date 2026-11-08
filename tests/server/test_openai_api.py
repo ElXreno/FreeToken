@@ -342,6 +342,42 @@ def test_tool_choice_none_keeps_tool_tags_as_content():
     assert choice["message"] == {"role": "assistant", "content": output}
 
 
+_SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
+
+
+@pytest.mark.parametrize(
+    ("response_format", "reasoning_parser", "template_kwargs", "schema", "after"),
+    [
+        ({"type": "json_object"}, None, {}, {"type": "object"}, None),
+        ({"type": "json_schema", "json_schema": {"name": "x", "schema": _SCHEMA}}, None, {}, _SCHEMA, None),
+        ({"type": "json_schema", "json_schema": {"name": "x", "schema": _SCHEMA}}, "qwen3", {}, _SCHEMA, "</think>"),
+        ({"type": "json_schema", "json_schema": {"name": "x", "schema": _SCHEMA}}, "qwen3", {"enable_thinking": False}, _SCHEMA, None),
+    ],
+)
+def test_chat_response_format_reaches_sampling_params(response_format, reasoning_parser, template_kwargs, schema, after):
+    state = FakeState([UserReply(uid=42, incremental_output='{"a": 1}', finished=True)], reasoning_parser=reasoning_parser)
+    request = chat_request(response_format=response_format, chat_template_kwargs=template_kwargs, tools=None)
+
+    run(handle_chat_completion(request, request=None, state=state, model_sampling={}))
+
+    params = state.sent.sampling_params
+    assert json.loads(params.json_schema) == schema
+    assert params.json_schema_after == after
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "json_schema", "json_schema": {"name": "x"}}, {"type": "json_schema"}, {"type": "regex"}],
+)
+def test_chat_response_format_rejects_unusable_shapes(response_format):
+    state = FakeState([])
+    response = run(handle_chat_completion(chat_request(response_format=response_format), request=None, state=state, model_sampling={}))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["param"] == "response_format"
+    assert state.sent is None
+
+
 def test_completion_rejects_token_id_prompts():
     state = FakeState([])
     response = run(

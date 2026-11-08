@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import torch
 
 from freetoken.core import Batch, Req, SamplingParams
+from freetoken.engine.grammar import GrammarManager
 from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.message import AbortBackendMsg
 from freetoken.models.config import LinearGatedDeltaGroupConfig
@@ -61,6 +62,7 @@ def _setup():
         eos_token_ids=set(),
         toolcall_anchor_id=None,
         spec=None,
+        grammar=GrammarManager(None, 0, ()),
         _routing_trace=None,
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),

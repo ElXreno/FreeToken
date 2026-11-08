@@ -126,9 +126,19 @@ class SpecRunner:
         bs, width = batch.size, self.k + 1
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
+        grammar = sample_args.grammar
+        if grammar is not None:
+            # copied before the forward is queued, so the host builds the masks while it runs
+            drafts_host = torch.empty(drafts.shape, dtype=torch.int64, pin_memory=True)
+            drafts_host.copy_(drafts, non_blocking=True)
+            drafts_ready = torch.cuda.Event()
+            drafts_ready.record()
         batch.features = self.feature_sink(batch)
         gate = self._gate(batch)
         logits = engine.forward_logits(batch)[: bs * width]
+        if grammar is not None:
+            drafts_ready.synchronize()
+            logits = grammar.apply_verify(logits, drafts_host)
         proposal, self._proposal = self._proposal, None
         if proposal.draft_support_probs is not None:
             out, emitted = reject_with_draft_probs(

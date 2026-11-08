@@ -31,6 +31,10 @@ class SamplingParams:
     # Stamp the ReqStats snapshot on every reply, not just the terminal one (llama.cpp's
     # timings_per_token; the API layer has already ANDed it with --enable-timings-report).
     timings_per_token: bool = False
+    # JSON schema the output must match (response_format); None = unconstrained
+    json_schema: str | None = None
+    # token text after which json_schema applies, so a reasoning block stays free
+    json_schema_after: str | None = None
 
     @property
     def is_greedy(self) -> bool:

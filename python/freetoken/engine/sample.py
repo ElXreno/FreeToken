@@ -8,6 +8,7 @@ from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.engine.grammar import GrammarBatch
 
 
 @dataclass
@@ -18,6 +19,7 @@ class BatchSamplingArgs:
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
     min_p: torch.Tensor | None = None
+    grammar: GrammarBatch | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -121,6 +123,8 @@ class Sampler:
                 logits = logits.float().clone()
                 for row, counts, presence, frequency in args.penalties:
                     logits[row] -= frequency * counts + presence * (counts > 0)
+            if args.grammar is not None:
+                logits = args.grammar.apply(logits)
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
