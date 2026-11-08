@@ -25,6 +25,7 @@ from freetoken.utils import nvtx_annotate, torch_dtype
 
 from .ablate import DirectionAblation
 from .model import Qwen3_5DecoderLayer
+from .moe import Qwen3_5DenseMLP
 from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
@@ -167,6 +168,11 @@ class Qwen3_5MTPDraft(BaseOP):
         return hidden
 
 
+def _gguf(config: ModelConfig) -> bool:
+    """A llama.cpp GGUF stores the head in packed ggml types, the ones its own tensors carry."""
+    return config.quant is not None and config.quant.dialect == "gguf"
+
+
 class _HeadExpertQuant:
     """Quant config view binding the head's experts to the model's routed-expert scheme.
 
@@ -195,13 +201,15 @@ class _MTPMlp(BaseOP):
 
     def __init__(self, config: ModelConfig, *, prefix: str = ""):
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        # a GGUF bank layer holds the head's experts in the ggml types the file gives them
+        expert_quant = config.quant if _gguf(config) else _HeadExpertQuant(config.quant, "model.layers.0.mlp.experts")
         self.experts = (
             make_moe_layer(
                 config,
                 layer_id=config.mtp_bank_layer,
                 top_k=config.mtp_top_k,
                 renormalize=config.norm_topk_prob,
-                quant_config=_HeadExpertQuant(config.quant, "model.layers.0.mlp.experts"),
+                quant_config=expert_quant,
                 prefix=f"{prefix}.experts",
             )
             if config.num_mtp_moe_layers
@@ -288,7 +296,12 @@ class Qwen3_5MTPLayer(BaseOP):
         self.self_attn = _MTPAttention(config, prefix=f"{prefix}.self_attn")
         self.input_layernorm = GemmaPlusOneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaPlusOneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = _MTPMlp(config, prefix=f"{prefix}.mlp")
+        # the dense releases' head carries a dense SwiGLU like their decoder
+        self.mlp = (
+            _MTPMlp(config, prefix=f"{prefix}.mlp")
+            if config.moe_enabled
+            else Qwen3_5DenseMLP(config, prefix=f"{prefix}.mlp")
+        )
 
 
 class Qwen3_5MTPHead(BaseOP):
@@ -306,7 +319,10 @@ class Qwen3_5MTPHead(BaseOP):
         assert not config.mtp_dedicated_embeddings, "the head with its own embedding table is not supported"
         self.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fc = LinearReplicated(2 * config.hidden_size, config.hidden_size, has_bias=False)
+        self.fc = LinearReplicated(
+            2 * config.hidden_size, config.hidden_size, has_bias=False,
+            quant_config=config.quant if _gguf(config) else None, prefix=f"{prefix}.fc",
+        )
         self.layers = OPList([Qwen3_5MTPLayer(config, prefix=f"{prefix}.layers.0")])
         self.norm = GemmaPlusOneRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # the head writes the stream too; left alone it keeps drafting what the body no longer says

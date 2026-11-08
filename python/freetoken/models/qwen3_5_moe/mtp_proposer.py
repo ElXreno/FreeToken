@@ -186,7 +186,7 @@ class Qwen3_5MTPProposer(Proposer):
             cache.reset()
 
     def _head_cache(self):
-        experts = self.head.layers.op_list[0].mlp.experts
+        experts = getattr(self.head.layers.op_list[0].mlp, "experts", None)
         return None if experts is None else getattr(experts, "offload_cache", None)
 
     def release(self, req: Req) -> None:

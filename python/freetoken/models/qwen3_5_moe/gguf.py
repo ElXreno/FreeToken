@@ -102,7 +102,8 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
     head_dim = int(kv("attention.key_length"))
     n_v = int(kv("ssm.time_step_rank"))
     # block_count also counts the MTP layers a GGUF may carry after the decoder
-    num_layers = int(kv("block_count")) - int(md.get(f"{arch}.nextn_predict_layers", 0))
+    mtp_layers = int(md.get(f"{arch}.nextn_predict_layers", 0))
+    num_layers = int(kv("block_count")) - mtp_layers
     recurrent = md.get(f"{arch}.attention.recurrent_layers")
     if recurrent is not None:
         layer_types = ["linear_attention" if r else "full_attention" for r in list(recurrent)[:num_layers]]
@@ -139,6 +140,8 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         linear_key_head_dim=int(kv("ssm.state_size")),
         linear_value_head_dim=int(kv("ssm.inner_size")) // n_v,
         linear_conv_kernel_dim=int(kv("ssm.conv_kernel")),
+        mtp_num_hidden_layers=mtp_layers,
+        mtp_use_dedicated_embeddings=f"blk.{num_layers}.nextn.embed_tokens.weight" in gguf_tensor_index(shim.model_path),
     )
     hf_like = SimpleNamespace(
         text_config=text,
@@ -227,8 +230,9 @@ def iter_gguf_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_vision: bool = True,
+    include_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """The dense state dict from the GGUF; the routed experts load as offload banks (``freetoken.models.gguf.experts``)."""
+    """The dense state dict from the GGUF, the MTP head's (``mtp.*``) only with ``include_mtp``; the routed experts load as offload banks (``freetoken.models.gguf.experts``)."""
     if not include_non_moe:
         return
     from freetoken.utils import cached_load_hf_config
@@ -252,6 +256,28 @@ def iter_gguf_weights(
 
     for layer in range(config.num_layers):
         yield from _iter_block(t, norm, f"blk.{layer}", f"model.layers.{layer}", config, layer)
+
+    if include_mtp and config.mtp_num_layers:
+        from .mtp import draft_config
+
+        base = config.num_layers
+        if _nextn_blk(index) != f"blk.{base}":
+            raise ValueError(
+                f"{model_path}: nextn_predict_layers is {config.mtp_num_layers} but blk.{base}.nextn.eh_proj is missing; "
+                "the file was converted without its MTP head"
+            )
+        if f"blk.{base}.nextn.shared_head_head.weight" in index:
+            raise NotImplementedError(f"{model_path}: an MTP head with its own LM head (blk.{base}.nextn.shared_head_head) is not supported")
+        fc = t(f"blk.{base}.nextn.eh_proj")
+        yield from fused("mtp.fc", [fc], [matrix(fc)], 2 * hidden)
+        yield "mtp.pre_fc_norm_embedding.weight", norm(f"blk.{base}.nextn.enorm")
+        yield "mtp.pre_fc_norm_hidden.weight", norm(f"blk.{base}.nextn.hnorm")
+        # llama.cpp falls back to the decoder's final norm without one
+        head_norm = f"blk.{base}.nextn.shared_head_norm.weight"
+        yield "mtp.norm.weight", norm(head_norm if head_norm in index else "output_norm")
+        head = draft_config(config)
+        for i in range(config.mtp_num_layers):
+            yield from _iter_block(t, norm, f"blk.{base + i}", f"mtp.layers.{i}", head, i)
 
     if vision:
         yield from iter_mmproj_weights(find_mmproj(model_path))
