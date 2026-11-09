@@ -202,14 +202,25 @@ def convert_anthropic_prompt(
             )
 
     other: list[dict[str, Any]] = []
+    user_at: int | None = None
     for msg in req.messages:
         if msg.role == "system":
             text = _content_text(msg.content)
             if not other:
                 system_texts.append(text)
             elif text:
-                other.append({"role": "system", "content": text})
+                late = {"role": "system", "content": text}
+                if user_at is not None:
+                    other.insert(user_at, late)
+                    user_at += 1
+                else:
+                    other.append(late)
             continue
+
+        plain_user = msg.role == "user" and (
+            isinstance(msg.content, str) or all(block.type != "tool_result" for block in msg.content)
+        )
+        user_at = len(other) if plain_user else None
 
         if isinstance(msg.content, str):
             other.append({"role": msg.role, "content": msg.content})

@@ -231,7 +231,7 @@ def test_convert_thinking_replay_in_tool_loop():
     assert spec.messages[2]["role"] == "tool"
 
 
-def test_convert_preserves_mid_conversation_system_reminders():
+def test_convert_moves_reminder_after_the_first_user_turn_into_the_head():
     req = AnthropicMessagesRequest.model_validate(
         {
             "model": "claude-x",
@@ -247,9 +247,8 @@ def test_convert_preserves_mid_conversation_system_reminders():
     original = req.model_dump()
     spec = A.convert_anthropic_to_genspec(req, {})
     assert spec.messages == [
-        {"role": "system", "content": "top-level sys"},
+        {"role": "system", "content": "top-level sys\n\nmid-stream sys"},
         {"role": "user", "content": "hello"},
-        {"role": "system", "content": "mid-stream sys"},
         {"role": "assistant", "content": "hi"},
     ]
     assert req.model_dump() == original
@@ -272,13 +271,53 @@ def test_convert_merges_only_leading_system_messages():
     original = req.model_dump()
     spec = A.convert_anthropic_to_genspec(req, {})
     assert spec.messages == [
-        {"role": "system", "content": "top-level sys\n\nleading sys\n\nsecond sys"},
+        {"role": "system", "content": "top-level sys\n\nleading sys\n\nsecond sys\n\nturn reminder"},
         {"role": "user", "content": "hello"},
-        {"role": "system", "content": "turn reminder"},
         {"role": "assistant", "content": "hi"},
         {"role": "system", "content": "next reminder"},
     ]
     assert req.model_dump() == original
+
+
+def test_convert_moves_late_system_before_the_user_turn_it_follows():
+    turns = [
+        {"role": "user", "content": "q1"},
+        {"role": "system", "content": "ctx1"},
+        {"role": "system", "content": "ctx2"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "file body"},
+        ]},
+        {"role": "system", "content": "after tool"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": [{"type": "text", "text": "q2"}]},
+        {"role": "system", "content": "ctx3"},
+    ]
+
+    def convert(messages):
+        req = AnthropicMessagesRequest.model_validate(
+            {"model": "claude-x", "max_tokens": 64, "system": "S", "messages": messages}
+        )
+        return A.convert_anthropic_to_genspec(req, {}).messages
+
+    full = convert(turns)
+    assert [(m["role"], m.get("content")) for m in full] == [
+        ("system", "S\n\nctx1\n\nctx2"),
+        ("user", "q1"),
+        ("assistant", None),
+        ("tool", "file body"),
+        ("system", "after tool"),
+        ("assistant", "a1"),
+        ("system", "ctx3"),
+        ("user", "q2"),
+    ]
+    earlier = convert(turns[:7])
+    assert full[: len(earlier)] == earlier
+    from freetoken.tokenizer.inline_system import normalize_inline_system
+
+    assert normalize_inline_system(full, "fold")[-1] == {"role": "user", "content": "ctx3\n\nq2"}
 
 
 @pytest.mark.parametrize("system", [None, "stable instructions"])
@@ -743,7 +782,8 @@ def test_inline_system_override_reaches_counting_and_generation(policy):
     fake.send_one = record
     client = _client(fake)
     body = {**_COUNT_BODY, "messages": [
-        {"role": "user", "content": "question"}, {"role": "system", "content": "instruction"}]}
+        {"role": "user", "content": "question"}, {"role": "assistant", "content": "answer"},
+        {"role": "system", "content": "instruction"}]}
     assert client.post("/v1/messages/count_tokens", json=body).status_code == 200
     assert client.post("/v1/messages", json={**body, "max_tokens": 32}).status_code == 200
     assert manager.msgs[0].inline_system_policy == submitted[0].inline_system_policy == policy
