@@ -28,6 +28,11 @@ _HYBRID_SPLIT = os.getenv("FREETOKEN_HYBRID_SPLIT_GEMM", "0")
 _HYBRID_SPLIT_GEMM = _HYBRID_SPLIT in ("1", "copy")
 
 
+def _active_batch():
+    ctx = maybe_global_ctx()
+    return None if ctx is None else ctx._batch
+
+
 class MoELayer(BaseOP):
     """Resident routed experts.
 
@@ -427,7 +432,7 @@ class OffloadMoELayer(MoELayer):
     @staticmethod
     def _route_src(cache: OffloadMoeCache) -> torch.Tensor | None:
         """The rows' source rows of a gated verify (all its rows in one call), else None."""
-        batch = getattr(maybe_global_ctx(), "batch", None)
+        batch = _active_batch()
         if cache.route_src is None or getattr(batch, "phase", None) != "verify" or getattr(batch, "verify_row", None) is not None:
             return None
         return cache.route_src
@@ -435,7 +440,7 @@ class OffloadMoELayer(MoELayer):
     @staticmethod
     def _prefetch(cache: OffloadMoeCache):
         """The next-layer prefetch, run by a staggered verify's first row only: one row predicts for both."""
-        batch = getattr(maybe_global_ctx(), "batch", None)
+        batch = _active_batch()
         return cache.expert_prefetch if not getattr(batch, "verify_row", None) else None
 
     def _split_hybrid_gemm(self, cache, hidden_states, gpu_w, gpu_slots, prefetch, hole=0, staged=None, gemm_after=None):
@@ -452,7 +457,7 @@ class OffloadMoELayer(MoELayer):
         main = torch.cuda.current_stream()
         demand = getattr(cache, "demand_copy", None)
         if _HYBRID_SPLIT == "copy" and demand is not None and demand.serves(self.layer_id):
-            lane = getattr(getattr(maybe_global_ctx(), "batch", None), "verify_row", None) or 0
+            lane = getattr(_active_batch(), "verify_row", None) or 0
             demand.publish(self.layer_id, lane)
             if staged is not None:
                 staged.record()
